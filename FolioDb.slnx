@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/bench/">
+    <Project Path="bench/FolioDb.Bench/FolioDb.Bench.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/FolioDb.Cli/FolioDb.Cli.csproj" />
+    <Project Path="src/FolioDb.Generators/FolioDb.Generators.csproj" />
+    <Project Path="src/FolioDb/FolioDb.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/FolioDb.AotSmoke/FolioDb.AotSmoke.csproj" />
+    <Project Path="tests/FolioDb.Tests/FolioDb.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,126 @@
+using System.Diagnostics;
+using FolioDb;
+
+// Native AOT smoke test: exercises the whole stack (storage, WAL, indexes, queries, generated mappers)
+// without reflection. Exit code 0 = success.
+//
+//   FolioDb.AotSmoke                     run the end-to-end scenario
+//   FolioDb.AotSmoke crash-writer <path> insert forever, printing "committed N" after each durable commit
+
+if (args is ["crash-writer", var crashPath])
+{
+    using var db = FolioDatabase.Open(crashPath, new FolioOptions { AutoCheckpointFrames = 200 });
+    var col = db.GetCollection("events");
+    long start = col.Count();
+    for (long n = start; ; n++)
+    {
+        col.Insert(new Document { ["_id"] = n, ["payload"] = new string('x', (int)(n % 300)) });
+        Console.WriteLine($"committed {n + 1}");
+    }
+}
+
+var path = Path.Combine(Path.GetTempPath(), $"folio-smoke-{Environment.ProcessId}.folio");
+try
+{
+    Run(path);
+    Console.WriteLine("AOT smoke test passed.");
+    return 0;
+}
+catch (Exception e)
+{
+    Console.Error.WriteLine($"AOT smoke test FAILED: {e}");
+    return 1;
+}
+finally
+{
+    File.Delete(path);
+    File.Delete(path + "-wal");
+}
+
+static void Check(bool condition, string what)
+{
+    if (!condition) throw new Exception("Check failed: " + what);
+}
+
+static void Run(string path)
+{
+    var sw = Stopwatch.StartNew();
+    using (var db = FolioDatabase.Open(path))
+    {
+        // Untyped API with JSON filters.
+        var users = db.GetCollection("users");
+        users.CreateIndex("email", unique: true);
+        users.CreateIndex("age");
+        for (int i = 0; i < 2000; i++)
+            users.Insert(new Document { ["email"] = $"u{i}@x.io", ["age"] = i % 90, ["tags"] = new DocArray { "a", i % 2 == 0 ? "even" : "odd" } });
+
+        Check(users.Count() == 2000, "count");
+        Check(users.Count("{ age: { $gte: 30, $lt: 40 } }") == 2000 / 90 * 10 + Math.Min(2000 % 90, 40) - Math.Min(2000 % 90, 30), "range count");
+        Check(users.Explain("{ email: 'u5@x.io' }").Contains("email"), "index plan");
+        Check(users.FindOne("{ email: 'u5@x.io' }")?["age"].AsInt32 == 5, "findOne");
+        Check(users.Find("{ tags: 'even' }", new FindOptions { Sort = Document.Parse("{ age: -1 }"), Limit = 3 })[0]["age"].AsInt32 == 88, "sort");
+
+        var upd = users.UpdateMany("{ age: { $lt: 10 } }", "{ $inc: { age: 100 }, $set: { young: true } }");
+        Check(upd.ModifiedCount == users.Count("{ young: true }"), "updateMany");
+        try
+        {
+            users.Insert("{ email: 'u1@x.io' }");
+            Check(false, "unique violation expected");
+        }
+        catch (DuplicateKeyException) { }
+
+        using (var tx = db.BeginTransaction())
+        {
+            tx.GetCollection("users").DeleteMany("{ age: { $gte: 100 } }");
+            tx.Rollback();
+        }
+        Check(users.Count("{ age: { $gte: 100 } }") > 0, "rollback");
+
+        // Typed API via the source generator.
+        var orders = db.GetCollection<Order>("orders");
+        orders.CreateIndex("customer");
+        var id = orders.Insert(new Order
+        {
+            Customer = "ana",
+            Total = 12.5m,
+            Status = OrderStatus.Paid,
+            CreatedAt = new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc),
+            Lines = [new OrderLine("pen", 2), new OrderLine("ink", 1)],
+            Notes = null,
+        });
+        var back = orders.FindById(id)!;
+        Check(back.Customer == "ana" && back.Total == 12.5m && back.Status == OrderStatus.Paid, "typed scalars");
+        Check(back.Lines.Count == 2 && back.Lines[1].Sku == "ink" && back.Lines[0].Qty == 2, "typed nested list");
+        Check(back.CreatedAt == new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc), "typed date");
+        Check(back.Id == id.AsObjectId, "typed id");
+        Check(orders.Find("{ 'lines.sku': 'pen' }").Count == 1, "typed query");
+        db.CheckIntegrity();
+    }
+
+    // Reopen: durability through checkpoint on close.
+    using (var db = FolioDatabase.Open(path))
+    {
+        Check(db.GetCollection("users").Count() == 2000, "reopen count");
+        Check(db.GetCollection<Order>("orders").FindOne("{ customer: 'ana' }")?.Lines.Count == 2, "reopen typed");
+        db.CheckIntegrity();
+    }
+    Console.WriteLine($"Scenario completed in {sw.ElapsedMilliseconds} ms.");
+}
+
+[FolioDocument]
+public partial class Order
+{
+    public ObjectId Id { get; set; }
+    public string Customer { get; set; } = "";
+    public decimal Total { get; set; }
+    public OrderStatus Status { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public List<OrderLine> Lines { get; set; } = [];
+    public string? Notes { get; set; }
+    public int LineCount => Lines.Count;
+}
+
+[FolioDocument]
+public partial record OrderLine(string Sku, int Qty);
+
+public enum OrderStatus { Pending, Paid, Shipped }
