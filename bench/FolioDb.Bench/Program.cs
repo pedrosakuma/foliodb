@@ -11,6 +11,8 @@ else if (args.Length > 0 && args[0] == "--sharding")
     ConcurrentWorkload.Run(args[1..], sharding: true);
 else if (args.Length > 0 && args[0] == "--batching")
     ConcurrentWorkload.Run(args[1..], batching: true);
+else if (args.Length > 0 && args[0] == "--fairness")
+    ConcurrentWorkload.Run(args[1..], fairness: true);
 else
     BenchmarkSwitcher.FromAssembly(typeof(Workload).Assembly).Run(args);
 

@@ -437,6 +437,67 @@ It is **not automatic group commit** of independently submitted transactions and
 For unrelated requests, fair writer admission and eventual group commit remain separate research directions;
 these results do not justify silently merging requests into one transaction or weakening durability.
 
+### Experimental FIFO writer admission
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --fairness 3 3
+```
+
+This compares direct `BeginTransaction()` with a **benchmark-only external FIFO gate**, on one file, `Full`
+durability and one update per transaction. Scenarios use 1, 4 or 16 writers, each with 0 or 4 readers. The engine
+and its `SemaphoreSlim` are unchanged. Baseline and FIFO are interleaved with reversed order between repetitions;
+the other data, warmup, correctness checks and closed-loop limitations above still apply.
+
+FIFO order is established when each caller appends to a linked list under a monitor, not at request-generation
+time. Only the head may acquire an idle gate; expired waiters are removed. Release uses `Monitor.PulseAll`, so this
+prototype includes wake-up contention and scheduler overhead. All writers participate in the gate and hold the
+lease through transaction disposal; readers bypass it. A lease is released even on failure. Startup verification
+checks ordered admission, expiration of head/tail waiters, progress after expiration and idempotent release.
+
+The experimental timeout is one second for the direct engine write lock or the FIFO queue. Under FIFO the engine
+write lock should be uncontended; an unexpected engine-lock timeout aborts the run rather than receiving another
+reported admission timeout. Acquiring the engine snapshot can still wait for internal pager synchronization.
+In-flight requests drain on stop in both variants. `wait_*` includes external admission plus `BeginTransaction`;
+`service_*` and `write_*` include FIFO release, but `commit_*` stops immediately after transaction disposal and
+excludes external release. Additional CSV columns are `admission`, successful acquisition `wait_max`, and semicolon-
+separated per-writer successful transaction counts (`writer_counts`). Failed waits remain separately reported.
+
+Final repeated run on the shared Linux/ext4 host (.NET 10 JIT): medians of three 3-second trials; acquisition
+percentiles/maxima below include **successful acquisitions only**, while timeout totals cover all three trials.
+
+| Writers / readers | Admission | Updates/s | Acquire p50 | Acquire p95 | Acquire p99 | Acquire max (median of trial maxima) | Timeouts |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 1 / 0 | Direct | 251 | 3.9 us | 6.0 us | 9.0 us | 52 us | 0 |
+| 1 / 0 | FIFO | 268 | 4.4 us | 7.2 us | 21.9 us | 88 us | 0 |
+| 1 / 4 | Direct | 288 | 2.2 us | 3.8 us | 6.8 us | 208 us | 0 |
+| 1 / 4 | FIFO | 274 | 2.8 us | 5.3 us | 12.9 us | 281 us | 0 |
+| 4 / 0 | Direct | 306 | 2.2 us | 5.1 us | 22.0 ms | 857 ms | 14 |
+| 4 / 0 | FIFO | 384 | 6.7 ms | 14.8 ms | 23.4 ms | 35 ms | 0 |
+| 4 / 4 | Direct | 131 | 2.8 us | 0.56 ms | 626 ms | 965 ms | 5 |
+| 4 / 4 | FIFO | 134 | 21.2 ms | 41.5 ms | 55.9 ms | 67 ms | 0 |
+| 16 / 0 | Direct | 338 | 1.8 us | 4.6 us | 39.9 ms | 900 ms | 117 |
+| 16 / 0 | FIFO | 245 | 55.9 ms | 83.0 ms | 109.6 ms | 111 ms | 0 |
+| 16 / 4 | Direct | 367 | 2.2 us | 78.6 us | 691 ms | 1,003 ms | 93 |
+| 16 / 4 | FIFO | 235 | 62.9 ms | 76.7 ms | 83.0 ms | 86 ms | 0 |
+
+Distribution matters more than the direct path's tiny median wait: one writer can repeatedly win while others
+time out. In one direct 16-writer/no-reader trial, per-writer completed operations ranged from **1 to 474**;
+in one FIFO trial, **all 16 completed 47 each**. The final FIFO run recorded no acquisition timeouts across all
+scenarios. That is an observation, not a guarantee: a slow holder or scheduler stall can still cause FIFO timeouts.
+
+With 16 writers/4 readers, median total successful transaction p99 fell from **691 ms to 88 ms**, but throughput
+fell from **367 to 235 updates/s** (about 36%). Reads continued at approximately 571k versus 518k/s, with p99
+46.5 versus 50.5 us. With 4 writers/4 readers, read rates were 408k versus 421k/s and p99 63.0 versus 59.3 us.
+FIFO raises the typical writer's wait because it no longer lets a recent winner bypass older callers.
+
+Do not infer a throughput improvement from the 4-writer/no-reader row: measured ranges overlap (direct 275–406,
+FIFO 328–437 updates/s), and an earlier matrix showed FIFO slower there. The host/storage varied substantially
+despite interleaving; the 4-writer/mixed scenario was particularly slow in the final run. The repeatable result
+was more even progress and removal of observed one-second starvation timeouts, not a universal throughput gain.
+The chosen monitor/PulseAll implementation is not a lower bound on FIFO overhead, nor does this experiment
+separate wake-up costs from handoff, scheduling, cache locality and storage latency. No production admission
+policy, group commit, batching, acknowledgment semantics or durability setting was changed.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

@@ -51,40 +51,46 @@ public static class ConcurrentWorkload
         public Histogram TimeoutWait { get; } = new();
     }
 
-    public static void Run(string[] args, bool sharding = false, bool batching = false)
+    public static void Run(string[] args, bool sharding = false, bool batching = false, bool fairness = false)
     {
-        if (sharding && batching) throw new ArgumentException("Batching and sharding are separate experiments.");
+        if ((sharding ? 1 : 0) + (batching ? 1 : 0) + (fairness ? 1 : 0) > 1)
+            throw new ArgumentException("Sharding, batching and fairness are separate experiments.");
         int seconds = args.Length > 0 ? int.Parse(args[0], CultureInfo.InvariantCulture) : 3;
         int repeats = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 3;
         if (args.Length > 2 || seconds is < 1 or > 60 || repeats is < 1 or > 10)
-            throw new ArgumentException("Usage: --concurrency | --sharding | --batching [seconds:1..60] [repeats:1..10]");
+            throw new ArgumentException("Usage: --concurrency | --sharding | --batching | --fairness [seconds:1..60] [repeats:1..10]");
+        if (fairness) FifoAdmission.Verify();
         Console.WriteLine("# Closed-loop; dedicated threads; 10k docs; 1KB payload; hot 256 IDs; $inc one Int64, no secondary index.");
         Console.WriteLine("# AutoCheckpointFrames=1000; BusyTimeout=1s; sampled WAL peak every 50ms; fresh DB per trial.");
         Console.WriteLine("# Latency in microseconds; histogram upper bounds <=2% plus 0.02us; service includes commit/checkpoint.");
         if (sharding) Console.WriteLine("# Experimental integer-only id % shards routing; 1/2/4 independent files on same device; total cache=4096 pages; no cross-shard guarantees.");
         if (batching) Console.WriteLine("# Explicit batches of 1/8/32 updates per atomic transaction, single file; no request-arrival/batch-fill delay modeled.");
+        if (fairness) Console.WriteLine("# Full only; direct vs external FIFO admission, 1s queue deadline; lease held through transaction disposal; no engine change.");
         Console.WriteLine("# writes_s and writer_min/max count successful transactions; updates_s counts committed increments; write_* latency is per whole transaction.");
         Console.WriteLine("# " + System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription
             + "; CPUs=" + Environment.ProcessorCount + "; temp=" + Path.GetTempPath());
-        Console.WriteLine("mode,writers,readers,snapshot_ms,trial,seconds,reads_s,writes_s,timeouts,writer_min,writer_max,wal_peak_mb,wal_end_mb,read_p50,read_p95,read_p99,wait_p50,wait_p95,wait_p99,service_p50,service_p95,service_p99,write_p50,write_p95,write_p99,write_max,commit_p50,commit_p95,commit_p99,timeout_wait_max,shards,batch_size,updates_s");
-        Scenario[] scenarios = batching ? [new(1, 0), new(4, 0), new(4, 4)] : sharding ? [new(4, 0), new(4, 4)]
+        Console.WriteLine("mode,writers,readers,snapshot_ms,trial,seconds,reads_s,writes_s,timeouts,writer_min,writer_max,wal_peak_mb,wal_end_mb,read_p50,read_p95,read_p99,wait_p50,wait_p95,wait_p99,service_p50,service_p95,service_p99,write_p50,write_p95,write_p99,write_max,commit_p50,commit_p95,commit_p99,timeout_wait_max,shards,batch_size,updates_s,admission,wait_max,writer_counts");
+        Scenario[] scenarios = fairness ? [new(1, 0), new(1, 4), new(4, 0), new(4, 4), new(16, 0), new(16, 4)]
+            : batching ? [new(1, 0), new(4, 0), new(4, 4)] : sharding ? [new(4, 0), new(4, 4)]
             : [new(0, 4), new(1, 0), new(4, 0), new(1, 4), new(4, 4), new(4, 4, 100)];
         foreach (var scenario in scenarios)
         {
             int[] shardCounts = sharding ? [1, 2, 4] : [1];
             int[] batchSizes = batching ? [1, 8, 32] : [1];
+            SynchronousMode[] modes = fairness ? [SynchronousMode.Full] : [SynchronousMode.Full, SynchronousMode.Normal];
+            bool[] admissions = fairness ? [false, true] : [false];
             var configurations = shardCounts.SelectMany(shards => batchSizes.SelectMany(batchSize =>
-                new[] { SynchronousMode.Full, SynchronousMode.Normal }.Select(mode => (mode, shards, batchSize)))).ToArray();
-            foreach (var (mode, shards, batchSize) in configurations) Trial(mode, scenario, 1, 0, print: false, shards, batchSize);
+                modes.SelectMany(mode => admissions.Select(fifo => (mode, shards, batchSize, fifo))))).ToArray();
+            foreach (var (mode, shards, batchSize, fifo) in configurations) Trial(mode, scenario, 1, 0, print: false, shards, batchSize, fifo);
             for (int trial = 1; trial <= repeats; trial++)
             {
-                foreach (var (mode, shards, batchSize) in configurations) Trial(mode, scenario, seconds, trial, print: true, shards, batchSize);
+                foreach (var (mode, shards, batchSize, fifo) in configurations) Trial(mode, scenario, seconds, trial, print: true, shards, batchSize, fifo);
                 Array.Reverse(configurations);
             }
         }
     }
 
-    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize)
+    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize, bool fifo)
     {
         var paths = Enumerable.Range(0, shards).Select(_ => Workload.TempFile(".folio")).ToArray();
         var databases = new List<FolioDatabase>();
@@ -110,6 +116,7 @@ public static class ConcurrentWorkload
             using var ready = new CountdownEvent(scenario.Readers + scenario.Writers);
             using var start = new ManualResetEventSlim();
             var errors = new ConcurrentQueue<Exception>();
+            var admission = fifo ? new FifoAdmission() : null;
             var workers = Enumerable.Range(0, scenario.Readers + scenario.Writers).Select(_ => new Worker()).ToArray();
             var threads = workers.Select((worker, index) => new Thread(() =>
             {
@@ -117,7 +124,7 @@ public static class ConcurrentWorkload
                 start.Wait();
                 try
                 {
-                    if (index < scenario.Writers) WriteLoop(databases, worker, index, batchSize, stop.Token);
+                    if (index < scenario.Writers) WriteLoop(databases, worker, index, batchSize, admission, stop.Token);
                     else ReadLoop(databases, worker, index, scenario.SnapshotMs, stop.Token);
                 }
                 catch (Exception e) { errors.Enqueue(e); stop.Cancel(); }
@@ -188,7 +195,8 @@ public static class ConcurrentWorkload
             values.Add(F(total.Write.Max));
             values.AddRange(new[] { F(total.Commit.Percentile(.50)), F(total.Commit.Percentile(.95)),
                 F(total.Commit.Percentile(.99)), F(total.TimeoutWait.Max), shards.ToString(), batchSize.ToString(),
-                F(expectedUpdates / elapsed.Elapsed.TotalSeconds) });
+                F(expectedUpdates / elapsed.Elapsed.TotalSeconds), fifo ? "fifo" : "direct", F(total.Wait.Max),
+                string.Join(';', workers.Take(scenario.Writers).Select(w => w.Write.Count)) });
             Console.WriteLine(string.Join(',', values));
         }
         finally
@@ -198,7 +206,7 @@ public static class ConcurrentWorkload
         }
     }
 
-    private static void WriteLoop(IReadOnlyList<FolioDatabase> databases, Worker worker, int seed, int batchSize, CancellationToken stop)
+    private static void WriteLoop(IReadOnlyList<FolioDatabase> databases, Worker worker, int seed, int batchSize, FifoAdmission? admission, CancellationToken stop)
     {
         var random = new Random(seed);
         var update = new Document { ["$inc"] = new Document { ["n"] = 1L } };
@@ -213,31 +221,41 @@ public static class ConcurrentWorkload
             }
             long before = Stopwatch.GetTimestamp();
             var db = databases[ids[0] % databases.Count];
-            Transaction tx;
-            try { tx = db.BeginTransaction(); }
-            catch (FolioException e) when (e.Message == "The database is busy (timed out waiting for the write lock).")
+            long acquired, commitStart, transactionFinished, after;
+            using (var lease = admission?.Enter(TimeSpan.FromSeconds(1)))
             {
-                worker.TimeoutWait.Add(Us(before, Stopwatch.GetTimestamp()));
-                continue;
-            }
-            long acquired = Stopwatch.GetTimestamp(), commitStart;
-            using (tx)
-            {
-                var collection = tx.GetCollection("items");
-                foreach (var filter in filters)
+                if (admission is not null && lease is null)
                 {
-                    var result = collection.UpdateOne(filter, update);
-                    if (result.ModifiedCount != 1) throw new InvalidOperationException("Update did not modify one document.");
+                    worker.TimeoutWait.Add(Us(before, Stopwatch.GetTimestamp()));
+                    continue;
                 }
-                commitStart = Stopwatch.GetTimestamp();
-                tx.Commit();
+                Transaction tx;
+                try { tx = db.BeginTransaction(); }
+                catch (FolioException e) when (admission is null && e.Message == "The database is busy (timed out waiting for the write lock).")
+                {
+                    worker.TimeoutWait.Add(Us(before, Stopwatch.GetTimestamp()));
+                    continue;
+                }
+                acquired = Stopwatch.GetTimestamp();
+                using (tx)
+                {
+                    var collection = tx.GetCollection("items");
+                    foreach (var filter in filters)
+                    {
+                        var result = collection.UpdateOne(filter, update);
+                        if (result.ModifiedCount != 1) throw new InvalidOperationException("Update did not modify one document.");
+                    }
+                    commitStart = Stopwatch.GetTimestamp();
+                    tx.Commit();
+                }
+                transactionFinished = Stopwatch.GetTimestamp();
             }
-            long after = Stopwatch.GetTimestamp();
+            after = Stopwatch.GetTimestamp();
             foreach (int id in ids) worker.Increments[id]++;
             worker.Wait.Add(Us(before, acquired));
             worker.Service.Add(Us(acquired, after));
             worker.Write.Add(Us(before, after));
-            worker.Commit.Add(Us(commitStart, after));
+            worker.Commit.Add(Us(commitStart, transactionFinished));
         }
     }
 
