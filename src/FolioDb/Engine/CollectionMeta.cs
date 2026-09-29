@@ -9,6 +9,10 @@ internal sealed class IndexMeta
     /// <summary>True once any indexed document produced more than one key (array value).</summary>
     public bool MultiKey { get; set; }
 
+    private byte[]? _topLevelField;
+    /// <summary>UTF-8 name of the first path segment: index keys depend only on this top-level field.</summary>
+    public byte[] TopLevelField => _topLevelField ??= System.Text.Encoding.UTF8.GetBytes(Field.Split('.')[0]);
+
     public Document ToDocument() => new()
     {
         ["name"] = Name,

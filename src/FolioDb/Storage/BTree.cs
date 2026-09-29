@@ -310,7 +310,21 @@ internal readonly struct BTree
         }
     }
 
-    public bool ContainsKey(ReadOnlySpan<byte> key) => TryGet(key, out _);
+    /// <summary>Key lookup that never reads the value (no overflow chain traversal).</summary>
+    public bool ContainsKey(ReadOnlySpan<byte> key)
+    {
+        uint pg = Root;
+        while (true)
+        {
+            var page = _tx.ReadPage(pg);
+            if (IsLeaf(page))
+            {
+                LowerBound(page, key, out bool found);
+                return found;
+            }
+            pg = ChildAt(page, ChildIndex(page, key));
+        }
+    }
 
     /// <summary>
     /// Replaces the value of <paramref name="key"/>. A value of the same size as the stored one is overwritten in place,

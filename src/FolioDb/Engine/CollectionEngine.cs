@@ -165,6 +165,7 @@ internal static class CollectionEngine
         var changes = new List<(IndexMeta Index, List<byte[]> Removed, List<byte[]> Added, bool Multi)>();
         foreach (var index in meta.Indexes)
         {
+            if (SameField(oldBytes, newBytes, index.TopLevelField)) continue;
             var oldKeys = ExtractIndexKeys(oldBytes, index.Field, out _);
             var newKeys = ExtractIndexKeys(newBytes, index.Field, out bool multi);
             var removed = oldKeys.Where(k => !newKeys.Contains(k, ByteArrayComparer.Instance)).ToList();
@@ -193,6 +194,14 @@ internal static class CollectionEngine
         new BTree(tx.Storage, meta.PrimaryRoot).Update(idKey, newBytes);
         if (metaChanged) tx.SaveCollection(meta);
         return true;
+    }
+
+    /// <summary>True when the first occurrence of a top-level field is byte-identical (or absent) in both documents.</summary>
+    private static bool SameField(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, ReadOnlySpan<byte> name)
+    {
+        bool inA = new RawDocument(a).TryGetField(name, out var va);
+        bool inB = new RawDocument(b).TryGetField(name, out var vb);
+        return inA == inB && (!inA || (va.Type == vb.Type && va.Data.SequenceEqual(vb.Data)));
     }
 
     // ------------------------------------------------------------------ reads
@@ -224,6 +233,15 @@ internal static class CollectionEngine
         if (meta is null) return 0;
         long n = 0;
         var plan = QueryPlanner.Plan(meta, filter);
+        if (plan.Covered)
+        {
+            QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (_, _) =>
+            {
+                n++;
+                return true;
+            });
+            return n;
+        }
         QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
         {
             if (filter.Matches(new RawDocument(doc))) n++;
@@ -239,7 +257,14 @@ internal static class CollectionEngine
         int skip = options?.Skip ?? 0;
         int limit = options?.Limit is int l and > 0 ? l : int.MaxValue;
         var sort = SortSpec.Parse(options?.Sort);
+        var projection = Projection.Parse(options?.Projection);
         var plan = QueryPlanner.Plan(meta, filter);
+
+        if (sort is null && plan.Covered && projection is not null && projection.OnlyIncludes(plan.KeyField))
+        {
+            FindCovered(tx, meta, plan, projection, skip, limit, result);
+            return result;
+        }
 
         if (sort is null)
         {
@@ -253,28 +278,62 @@ internal static class CollectionEngine
                     skipped++;
                     return true;
                 }
-                result.Add(raw.ToDocument());
+                result.Add(projection is null ? raw.ToDocument() : projection.Apply(raw));
                 return result.Count < limit;
             });
-        }
-        else
-        {
-            var rows = new List<(byte[][] Keys, int Seq, Document Doc)>();
-            QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
-            {
-                var raw = new RawDocument(doc);
-                if (filter.Matches(raw)) rows.Add((sort.KeysFor(raw), rows.Count, raw.ToDocument()));
-                return true;
-            });
-            // Stable: ties keep scan order.
-            rows.Sort((a, b) => sort.Compare(a.Keys, b.Keys) is var c and not 0 ? c : a.Seq.CompareTo(b.Seq));
-            for (int i = skip; i < rows.Count && result.Count < limit; i++) result.Add(rows[i].Doc);
+            return result;
         }
 
-        var projection = Projection.Parse(options?.Projection);
-        if (projection is not null)
-            for (int i = 0; i < result.Count; i++) result[i] = projection.Apply(result[i]);
+        var rows = new List<(byte[][] Keys, int Seq, byte[] Bytes)>();
+        QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
+        {
+            var raw = new RawDocument(doc);
+            if (filter.Matches(raw)) rows.Add((sort.KeysFor(raw), rows.Count, raw.Data.ToArray()));
+            return true;
+        });
+        // Stable: ties keep scan order. Only the returned window is materialized.
+        rows.Sort((a, b) => sort.Compare(a.Keys, b.Keys) is var c and not 0 ? c : a.Seq.CompareTo(b.Seq));
+        for (int i = skip; i < rows.Count && result.Count < limit; i++)
+        {
+            var raw = new RawDocument(rows[i].Bytes);
+            result.Add(projection is null ? raw.ToDocument() : projection.Apply(raw));
+        }
         return result;
+    }
+
+    /// <summary>
+    /// Inclusion projection of the scan key field (and/or _id) answered from index keys. Keys whose decoded type is
+    /// ambiguous (numbers share one encoding across int32/int64/double/decimal; nested values contain numbers) fall
+    /// back to reading that document, so results are identical to the non-covered path.
+    /// </summary>
+    private static void FindCovered(EngineTx tx, CollectionMeta meta, QueryPlan plan, Projection projection, int skip, int limit, List<Document> result)
+    {
+        var primary = new BTree(tx.Storage, meta.PrimaryRoot);
+        string field = plan.KeyField;
+        bool includeField = field != "_id" && projection.HasPaths;
+        bool includeId = projection.IncludesId;
+        int skipped = 0;
+        QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (idKey, valueKey) =>
+        {
+            if (skipped < skip)
+            {
+                skipped++;
+                return true;
+            }
+            if ((includeId && !KeyEncoder.DecodesExactly(idKey)) || (includeField && !KeyEncoder.DecodesExactly(valueKey)))
+            {
+                if (!primary.TryGet(idKey, out var bytes)) throw new CorruptDatabaseException("Index references a missing document.");
+                result.Add(projection.Apply(new RawDocument(bytes)));
+            }
+            else
+            {
+                var doc = new Document();
+                if (includeId) doc.Set("_id", KeyEncoder.Decode(idKey, out _));
+                if (includeField) doc.SetPath(field, KeyEncoder.Decode(valueKey, out _));
+                result.Add(doc);
+            }
+            return result.Count < limit;
+        });
     }
 
     // ------------------------------------------------------------------ indexes
@@ -418,6 +477,30 @@ internal sealed class Projection
             paths.Add(k);
         }
         return new Projection(paths, include ?? false, includeId);
+    }
+
+    public bool IsInclusion => _include;
+    public bool IncludesId => _includeId;
+    public bool HasPaths => _paths.Count > 0;
+
+    /// <summary>True when every included path is <paramref name="field"/> (so the result can be built from its index key).</summary>
+    public bool OnlyIncludes(string field) => _include && _paths.TrueForAll(p => p == field);
+
+    /// <summary>Projects straight from the serialized document, materializing only the selected values.</summary>
+    public Document Apply(RawDocument raw)
+    {
+        if (!_include)
+        {
+            var doc = raw.ToDocument();
+            foreach (var p in _paths) doc.RemovePath(p);
+            if (!_includeId) doc.Remove("_id");
+            return doc;
+        }
+        var result = new Document();
+        if (_includeId && raw.TryGetField("_id"u8, out var id)) result.Set("_id", id.ToDocValue());
+        foreach (var p in _paths)
+            if (raw.TryGetPath(p, out var v)) result.SetPath(p, v.ToDocValue());
+        return result;
     }
 
     public Document Apply(Document doc)

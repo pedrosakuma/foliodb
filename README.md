@@ -19,6 +19,8 @@ no reflection — typed mapping is done by a source generator).
   (`5 == 5L == 5.0 == 5m`, `0.1m < 0.1`). Arithmetic (`$inc`/`$mul`) promotes int32 → int64 → double → decimal.
 - **B+Tree** primary index on `_id` (auto-generated `ObjectId` when missing) and **secondary indexes** (single field, dotted paths, unique, multikey on arrays).
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
+  **Covered queries**: counts and index-field/`_id` projections are answered from index keys alone when the index is exact
+  (not multikey, single predicate or same-field range); projections are otherwise applied on raw bytes.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Source generator** for typed POCOs/records (`[FolioDocument]`), with compile-time diagnostics.
 - **`folio` CLI shell** (like `sqlite3`): REPL, scripts, `.dump`/`.import`/`.export`, `.integrity`, `.timer`.
@@ -179,13 +181,26 @@ The string representation is only shown for cost comparison: it sorts lexicograp
 Update rewrite cost (`UpdateRewriteBenchmarks`, one `$inc` per document). When an operator update only overwrites existing
 scalars with values of the same encoded size (`$inc`/`$mul`/`$min`/`$max`/`$set` without type growth, `$currentDate`), the
 stored bytes are patched in place and only the B+Tree leaf or the overflow pages that actually changed are written to the WAL.
-Anything else (new fields, growing strings, int32 → int64 promotion, array operators) re-serializes the whole document:
+Anything else (new fields, growing strings, int32 → int64 promotion, array operators) re-serializes the whole document,
+and a secondary index is only touched when its top-level field actually changed:
 
 | Document size | Full rewrite | In-place patch |
 |---|---:|---:|
 | 200 B | 3.7 µs | 3.5 µs |
 | 4 KB (overflow) | 27.7 µs | 20.5 µs |
 | 64 KB (overflow) | 442 µs | 72 µs |
+
+Read path (`ReadPathBenchmarks`; 10k docs, indexes on `city` and `age`; 100 hits per `city`, ~1,100 per age range):
+
+| Operation | Before | Covered / pushdown |
+|---|---:|---:|
+| `count({city})` | 126 µs | **4.2 µs** |
+| `count({age: {$gte, $lt}})` | 1,035 µs | **27 µs** |
+| `find({city}, {city: 1, _id: 0})` | 422 µs | **26 µs** |
+| `find({city}, {_id: 1})` (numeric `_id` → fetch + raw projection) | 318 µs | 163 µs |
+
+Numeric keys share one encoding across `int32`/`int64`/`double`/`decimal`, so a covered projection of a numeric field falls
+back to reading the document to preserve the stored type; strings, `ObjectId`, dates, booleans and binaries decode exactly.
 
 ## Limitations
 

@@ -18,8 +18,17 @@ internal sealed class QueryPlan
     public bool LowerInclusive { get; init; }
     public byte[]? Upper { get; init; }
     public bool UpperInclusive { get; init; }
+    /// <summary>
+    /// The access path alone decides the result: the filter never needs to be evaluated on the document, so
+    /// counts (and projections of the key fields) can be answered from keys only.
+    /// </summary>
+    public bool Covered { get; init; }
+    /// <summary>Field whose value is the scan key (<c>_id</c> for primary plans).</summary>
+    public string KeyField => Kind is PlanKind.IndexEq or PlanKind.IndexRange ? Field! : "_id";
 
-    public override string ToString() => Kind switch
+    public override string ToString() => Describe() + (Covered ? " covered" : "");
+
+    private string Describe() => Kind switch
     {
         PlanKind.FullScan => "COLLSCAN",
         PlanKind.PrimaryEq => $"IDHACK _id ({Keys!.Count} key{(Keys.Count == 1 ? "" : "s")})",
@@ -38,6 +47,7 @@ internal sealed class QueryPlan
 }
 
 internal delegate bool DocVisitor(ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> document);
+internal delegate bool KeyVisitor(ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> valueKey);
 
 internal static class QueryPlanner
 {
@@ -56,14 +66,16 @@ internal static class QueryPlanner
 
             QueryPlan? plan = null;
             int score = 0;
+            // Without arrays on the path (not multikey), index keys and filter evaluation see exactly the same value.
+            bool exact = primary || !index!.MultiKey;
             if (f.Op == FieldOp.Eq && Indexable(f.Value))
             {
-                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = [f.Key!] };
+                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = [f.Key!], Covered = exact && conjuncts.Length == 1 };
                 score = primary ? 100 : index!.Unique ? 90 : 80;
             }
             else if (f.Op == FieldOp.In && f.Values!.Count > 0 && f.Values.All(Indexable))
             {
-                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = f.Keys!.Distinct(ByteArrayComparer.Instance).ToList() };
+                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = f.Keys!.Distinct(ByteArrayComparer.Instance).ToList(), Covered = exact && conjuncts.Length == 1 };
                 score = primary ? 95 : 70;
             }
             else if (f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte && Indexable(f.Value))
@@ -78,7 +90,7 @@ internal static class QueryPlanner
                 bestScore = score;
             }
         }
-        return best ?? new QueryPlan { Kind = PlanKind.FullScan };
+        return best ?? new QueryPlan { Kind = PlanKind.FullScan, Covered = ReferenceEquals(filter, Filter.All) };
     }
 
     private static bool Indexable(DocValue v) => v.Type is not (DocType.Null or DocType.Array);
@@ -116,8 +128,12 @@ internal static class QueryPlanner
             }
         }
 
+        // Covered when every conjunct is a same-type bound on this field, i.e. all of them were folded into [lower, upper].
+        bool covered = combine && conjuncts.All(c => c is FieldFilter f && f.Path == first.Path && f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte
+                                                     && f.Key is not null && f.Key[0] == tag && Indexable(f.Value));
         return new QueryPlan
         {
+            Covered = covered,
             Kind = primary ? PlanKind.PrimaryRange : PlanKind.IndexRange,
             Index = index,
             Field = first.Path,
@@ -191,6 +207,63 @@ internal static class QueryPlanner
                     if (seen is not null && !seen.Add(idKey.ToArray())) continue;
                     if (!primary.TryGet(idKey, out var doc)) throw new CorruptDatabaseException($"Index {plan.Index.Name} references a missing document.");
                     if (!visitor(idKey, doc)) return;
+                }
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Streams (idKey, scan key) pairs of a <see cref="QueryPlan.Covered"/> plan without reading documents.
+    /// For primary plans the scan key is the id key itself. Visitor returns false to stop.
+    /// </summary>
+    public static void ExecuteKeys(StorageTx tx, CollectionMeta meta, QueryPlan plan, KeyVisitor visitor)
+    {
+        if (!plan.Covered) throw new InvalidOperationException("Plan is not covered.");
+        var primary = new BTree(tx, meta.PrimaryRoot);
+        switch (plan.Kind)
+        {
+            case PlanKind.FullScan:
+            {
+                var cur = primary.CreateCursor();
+                for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
+                    if (!visitor(cur.Key, cur.Key)) return;
+                return;
+            }
+            case PlanKind.PrimaryEq:
+                foreach (var key in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                    if (primary.ContainsKey(key) && !visitor(key, key)) return;
+                return;
+            case PlanKind.PrimaryRange:
+            {
+                var cur = primary.CreateCursor();
+                for (bool ok = cur.Seek(plan.Lower ?? [plan.TypeTag]); ok; ok = cur.MoveNext())
+                {
+                    var key = cur.Key;
+                    int state = RangeState(plan, key);
+                    if (state > 0) return;
+                    if (state == 0 && !visitor(key, key)) return;
+                }
+                return;
+            }
+            case PlanKind.IndexEq:
+            {
+                var cur = new BTree(tx, plan.Index!.Root).CreateCursor();
+                foreach (var prefix in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                    for (bool ok = cur.Seek(prefix); ok && cur.Key.StartsWith(prefix); ok = cur.MoveNext())
+                        if (!visitor(cur.Key[prefix.Length..], prefix)) return;
+                return;
+            }
+            case PlanKind.IndexRange:
+            {
+                var cur = new BTree(tx, plan.Index!.Root).CreateCursor();
+                for (bool ok = cur.Seek(plan.Lower ?? [plan.TypeTag]); ok; ok = cur.MoveNext())
+                {
+                    var entry = cur.Key;
+                    int valueLen = KeyEncoder.EncodedLength(entry);
+                    int state = RangeState(plan, entry[..valueLen]);
+                    if (state > 0) return;
+                    if (state == 0 && !visitor(entry[valueLen..], entry[..valueLen])) return;
                 }
                 return;
             }
