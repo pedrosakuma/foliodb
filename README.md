@@ -373,6 +373,70 @@ change with partitioning; these numbers do not isolate writer-lock contention al
 These results establish potential for independent writers, not justification for transparent production sharding.
 Cross-shard correctness and non-ID workloads remain unmeasured.
 
+### Explicit transaction batching
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --batching 3 3
+```
+
+This experiment keeps one database file and compares **1, 8 and 32 updates per explicit atomic transaction**.
+Scenarios use 1 writer/no readers, 4 writers/no readers, and 4 writers/4 readers, with the same data, cache,
+durability modes, one-second acquisition timeout, warmup and alternating configuration order as above.
+Batching cannot be combined with the multi-file experiment. This uses existing transactions; the engine is unchanged.
+
+IDs and reusable filters are prepared before timing each transaction; repeated IDs within a batch are allowed.
+Every update must modify exactly one document. After workers drain, every document's counter is compared to
+per-worker counts of committed increments, in addition to total increments, document count and integrity checks.
+No partially completed batch counts as success. There is no modeled request arrival rate or time waiting to fill
+a batch: the caller already has all operations ready.
+
+CSV columns `writes_s` and `writer_min`/`writer_max` remain **successful transaction counts**, preserving their
+meaning in previous modes. New columns `batch_size` and `updates_s` distinguish committed document updates from
+transactions. All acquisition, service, commit and `write_*` percentiles describe **whole transactions**; never
+divide a percentile by batch size and label it request latency. Timeouts count rejected transaction acquisitions,
+not individual updates, and are excluded from successful-transaction percentiles.
+
+Initial shared-host run on 2026-09-29, .NET 10 JIT, same-device ext4, medians of three 3-second trials:
+
+| Mode | Writers / readers | Updates/transaction | Updates/s | Transactions/s | Successful transaction p99 | Timeouts (3 trials) |
+|---|---:|---:|---:|---:|---:|---:|
+| Full | 1 / 0 | 1 | 509 | 509 | 5.29 ms | 0 |
+| Full | 1 / 0 | 8 | 3,311 | 414 | 9.98 ms | 0 |
+| Full | 1 / 0 | 32 | 9,076 | 284 | 14.25 ms | 0 |
+| Normal | 1 / 0 | 1 | 29,522 | 29,522 | 0.074 ms | 0 |
+| Normal | 1 / 0 | 8 | 58,026 | 7,253 | 1.61 ms | 0 |
+| Normal | 1 / 0 | 32 | 59,067 | 1,846 | 6.71 ms | 0 |
+| Full | 4 / 0 | 1 | 330 | 330 | 34.1 ms | 15 |
+| Full | 4 / 0 | 8 | 2,594 | 324 | 14.8 ms | 19 |
+| Full | 4 / 0 | 32 | 9,214 | 288 | 72.3 ms | 14 |
+| Normal | 4 / 0 | 1 | 12,278 | 12,278 | 1.55 ms | 0 |
+| Normal | 4 / 0 | 8 | 37,122 | 4,640 | 6.85 ms | 1 |
+| Normal | 4 / 0 | 32 | 48,009 | 1,500 | 8.35 ms | 11 |
+| Full | 4 / 4 | 1 | 333 | 333 | 223.5 ms | 11 |
+| Full | 4 / 4 | 8 | 2,478 | 310 | 241.9 ms | 13 |
+| Full | 4 / 4 | 32 | 9,024 | 282 | 105.3 ms | 18 |
+| Normal | 4 / 4 | 1 | 7,817 | 7,817 | 11.02 ms | 0 |
+| Normal | 4 / 4 | 8 | 25,491 | 3,186 | 5.51 ms | 0 |
+| Normal | 4 / 4 | 32 | 34,442 | 1,076 | 11.69 ms | 5 |
+
+For 4 writers/4 readers, Full read throughput was approximately 564k/583k/547k reads/s for batches 1/8/32;
+read p99 was 50.5/43.8/50.5 us. Normal was 415k/407k/406k reads/s, with read p99 54.7/50.5/56.9 us.
+Median sampled WAL peaks rose from 6.2 to 72.3 MiB in Full and 74.3 to 263.3 MiB in Normal between batches 1 and 32.
+This is a higher-throughput experiment, not equal completed-work volume: larger WAL peaks are not a measurement
+of WAL bytes per update. The hot working set also allows multiple updates to share dirty pages within a transaction.
+
+Batching amortizes transaction/WAL confirmation overhead but does **not** fix writer fairness. Timeout counts and
+successful-operation tails must be read together: long waits ending in a timeout disappear from those percentiles.
+In uncontended Normal mode, moving from 8 to 32 operations barely improved median throughput while transaction
+tail latency increased. Full mixed throughput with batch 32 ranged from 6,244 to 9,368 updates/s across trials;
+shared-host variability and the closed-loop limitations still apply.
+
+Explicit batching changes the atomicity unit: all updates commit or roll back together, and results should only
+be acknowledged after `Commit()` succeeds. It is suitable when the application already has a natural batch.
+It is **not automatic group commit** of independently submitted transactions and does not measure that mechanism.
+For unrelated requests, fair writer admission and eventual group commit remain separate research directions;
+these results do not justify silently merging requests into one transaction or weakening durability.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

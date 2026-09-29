@@ -9,6 +9,8 @@ if (args.Length > 0 && args[0] == "--concurrency")
     ConcurrentWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--sharding")
     ConcurrentWorkload.Run(args[1..], sharding: true);
+else if (args.Length > 0 && args[0] == "--batching")
+    ConcurrentWorkload.Run(args[1..], batching: true);
 else
     BenchmarkSwitcher.FromAssembly(typeof(Workload).Assembly).Run(args);
 
