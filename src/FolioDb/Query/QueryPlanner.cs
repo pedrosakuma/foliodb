@@ -3,7 +3,7 @@ using FolioDb.Storage;
 
 namespace FolioDb.Query;
 
-internal enum PlanKind { FullScan, PrimaryEq, PrimaryRange, IndexEq, IndexRange }
+internal enum PlanKind { FullScan, PrimaryEq, PrimaryRange, IndexEq, IndexRange, CompoundScan }
 
 /// <summary>Access path chosen by the planner. The full filter is always re-applied to fetched documents.</summary>
 internal sealed class QueryPlan
@@ -23,6 +23,9 @@ internal sealed class QueryPlan
     /// counts (and projections of the key fields) can be answered from keys only.
     /// </summary>
     public bool Covered { get; init; }
+    public byte[] Prefix { get; init; } = [];
+    public int PrefixFields { get; init; }
+    public QueryPlan? ComponentRange { get; init; }
     /// <summary>Field whose value is the scan key (<c>_id</c> for primary plans).</summary>
     public string KeyField => Kind is PlanKind.IndexEq or PlanKind.IndexRange ? Field! : "_id";
 
@@ -35,6 +38,7 @@ internal sealed class QueryPlan
         PlanKind.PrimaryRange => $"IXSCAN _id {RangeText()}",
         PlanKind.IndexEq => $"IXSCAN {Index!.Name} ({Keys!.Count} key{(Keys.Count == 1 ? "" : "s")}){(Index.MultiKey ? " multikey" : "")}",
         PlanKind.IndexRange => $"IXSCAN {Index!.Name} {RangeText()}{(Index.MultiKey ? " multikey" : "")}",
+        PlanKind.CompoundScan => $"IXSCAN {Index!.Name} (equality prefix: {PrefixFields}{(ComponentRange is null ? "" : ", range")}){(Index.MultiKey ? " multikey" : "")}",
         _ => Kind.ToString(),
     };
 
@@ -62,7 +66,7 @@ internal static class QueryPlanner
         {
             if (c is not FieldFilter f) continue;
             bool primary = f.Path == "_id";
-            var index = primary ? null : meta.FindIndexByField(f.Path);
+            var index = primary ? null : meta.Indexes.FirstOrDefault(i => i.IsSimple && i.Field == f.Path);
             if (!primary && index is null) continue;
 
             QueryPlan? plan = null;
@@ -91,7 +95,81 @@ internal static class QueryPlanner
                 bestScore = score;
             }
         }
+        foreach (var index in meta.Indexes.Where(i => !i.IsSimple))
+        {
+            var plan = BuildCompound(conjuncts, index, out int score);
+            if (plan is not null && score > bestScore) { best = plan; bestScore = score; }
+        }
         return best ?? new QueryPlan { Kind = PlanKind.FullScan, Covered = ReferenceEquals(filter, Filter.All) };
+    }
+
+    private static QueryPlan? BuildCompound(Filter[] conjuncts, IndexMeta index, out int score)
+    {
+        byte[] prefix = [];
+        int count = 0;
+        var consumed = new HashSet<Filter>();
+        QueryPlan? range = null;
+        foreach (var field in index.Fields)
+        {
+            var conditions = conjuncts.OfType<FieldFilter>().Where(f => f.Path == field.Path).ToArray();
+            var eq = conditions.FirstOrDefault(f => f.Op == FieldOp.Eq && Indexable(f.Value));
+            if (eq is not null)
+            {
+                prefix = [.. prefix, .. field.Descending ? IndexMeta.Inverted(eq.Key!) : eq.Key!];
+                consumed.Add(eq);
+                count++;
+                continue;
+            }
+            var bound = conditions.FirstOrDefault(f => f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte && Indexable(f.Value));
+            if (bound is not null)
+            {
+                range = BuildRange(conjuncts, bound, index, false);
+                foreach (var f in conditions)
+                    if ((ReferenceEquals(f, bound) || !index.MultiKey) && f.Key is not null
+                        && f.Key[0] == range.TypeTag && Indexable(f.Value)
+                        && f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte) consumed.Add(f);
+            }
+            break;
+        }
+        score = Math.Min(94, (count > 0 ? 75 + count * 3 : 50) + (range is null ? 0 : 5));
+        if (count == 0 && range is null) return null;
+        return new QueryPlan
+        {
+            Kind = PlanKind.CompoundScan, Index = index, Prefix = prefix, PrefixFields = count,
+            ComponentRange = range, Covered = !index.MultiKey && conjuncts.All(consumed.Contains),
+        };
+    }
+
+    private static void ScanCompound(StorageTx tx, QueryPlan plan, KeyVisitor visitor, bool withHints)
+    {
+        var index = plan.Index!;
+        var range = plan.ComponentRange;
+        bool descending = range is not null && index.Fields[plan.PrefixFields].Descending;
+        byte[] start = plan.Prefix;
+        if (range is not null)
+        {
+            var lower = descending ? range.Upper : range.Lower;
+            start = [.. start, .. lower is null ? new byte[] { descending ? (byte)~range.TypeTag : range.TypeTag }
+                : descending ? IndexMeta.Inverted(lower) : lower];
+        }
+        var seen = index.MultiKey ? new HashSet<byte[]>(ByteArrayComparer.Instance) : null;
+        var cur = new BTree(tx, index.Root).CreateCursor();
+        for (bool ok = cur.Seek(start); ok && cur.Key.StartsWith(plan.Prefix); ok = cur.MoveNext())
+        {
+            var key = cur.Key;
+            if (range is not null)
+            {
+                int len = IndexMeta.ComponentLength(key[plan.Prefix.Length..], descending);
+                var component = key.Slice(plan.Prefix.Length, len);
+                int state = descending ? -RangeState(range, IndexMeta.Inverted(component)) : RangeState(range, component);
+                if (state > 0) break;
+                if (state < 0) continue;
+            }
+            int valueLength = index.ValueLength(key, plan.PrefixFields, plan.Prefix.Length);
+            var id = key[valueLength..];
+            if (seen is not null && !seen.Add(id.ToArray())) continue;
+            if (!visitor(id, key[..valueLength], withHints ? cur.Value : default)) return;
+        }
     }
 
     private static bool Indexable(DocValue v) => v.Type is not (DocType.Null or DocType.Array);
@@ -152,6 +230,16 @@ internal static class QueryPlanner
         var primary = new BTree(tx, meta.PrimaryRoot);
         switch (plan.Kind)
         {
+            case PlanKind.CompoundScan:
+            {
+                var seek = primary.CreateCursor();
+                ScanCompound(tx, plan, (id, _, _) =>
+                {
+                    if (!seek.SeekExact(id)) throw new CorruptDatabaseException($"Index {plan.Index!.Name} references a missing document.");
+                    return visitor(id, seek.Value);
+                }, false);
+                return;
+            }
             case PlanKind.FullScan:
             {
                 var cur = primary.CreateCursor();
@@ -229,6 +317,9 @@ internal static class QueryPlanner
         var primary = new BTree(tx, meta.PrimaryRoot);
         switch (plan.Kind)
         {
+            case PlanKind.CompoundScan:
+                ScanCompound(tx, plan, visitor, withHints);
+                return;
             case PlanKind.FullScan:
             {
                 var cur = primary.CreateCursor();

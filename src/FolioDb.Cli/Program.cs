@@ -364,15 +364,13 @@ internal sealed class Shell : IDisposable
             case "createIndex" or "ensureIndex":
             {
                 var keys = RequiredDoc(call, 0);
-                if (keys.Count != 1) throw new FormatException("Only single-field indexes are supported: createIndex({ field: 1 }).");
-                _out.WriteLine(col.CreateIndex(keys.Keys.First(), Option(call, 1, "unique")));
+                _out.WriteLine(col.CreateIndex(keys, Option(call, 1, "unique")));
                 break;
             }
             case "dropIndex":
             {
                 var v = Arg(call, 0);
-                string name = v.Type == DocType.Document ? v.AsDocument.Keys.First() : v.AsString;
-                _out.WriteLine(col.DropIndex(name));
+                _out.WriteLine(v.Type == DocType.Document ? col.DropIndex(v.AsDocument) : col.DropIndex(v.AsString));
                 break;
             }
             case "getIndexes": ListIndexes(col); break;
@@ -466,7 +464,7 @@ internal sealed class Shell : IDisposable
     private void ListIndexes(Collection col)
     {
         foreach (var i in col.GetIndexes())
-            _out.WriteLine($"  {i.Name,-24} {i.Field}{(i.Unique ? " unique" : "")}{(i.MultiKey ? " multikey" : "")}");
+            _out.WriteLine($"  {i.Name,-24} {i.Keys.ToJson()}{(i.Unique ? " unique" : "")}{(i.MultiKey ? " multikey" : "")}");
     }
 
     private void Stats()
@@ -504,7 +502,7 @@ internal sealed class Shell : IDisposable
             var col = snap.GetCollection(name);
             string target = IsIdentifier(name) ? "db." + name : $"db.getCollection({DocJson.WriteValue(name)})";
             foreach (var i in col.GetIndexes().Where(i => i.Field != "_id"))
-                w.WriteLine($"{target}.createIndex({{ {DocJson.WriteValue(i.Field)}: 1 }}{(i.Unique ? ", { unique: true }" : "")})");
+                w.WriteLine($"{target}.createIndex({i.Keys.ToJson()}{(i.Unique ? ", { unique: true }" : "")})");
             foreach (var d in col.Find()) w.WriteLine($"{target}.insert({DocJson.Write(d)})");
         }
         w.WriteLine("commit");

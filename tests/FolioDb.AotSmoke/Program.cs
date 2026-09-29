@@ -94,6 +94,10 @@ static void Run(string path)
         Check(back.CreatedAt == new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc), "typed date");
         Check(back.Id == id.AsObjectId, "typed id");
         Check(orders.Find("{ 'lines.sku': 'pen' }").Count == 1, "typed query");
+        users.CreateIndex(Document.Parse("{age:1,email:-1}"));
+        Check(users.Count("{age:30,email:{$gte:'u'}}") == users.Find("{age:30}").Count, "compound count");
+        Check(users.Find("{age:30}", new FindOptions { Projection = Document.Parse("{age:1,email:1}") }).Count > 0, "compound projection");
+        Check(users.FindOne("{email:'u5@x.io'}", new FindOptions { Projection = Document.Parse("{tags:{$slice:1}}") })!["tags"].AsArray.Count == 1, "slice projection");
         db.CheckIntegrity();
     }
 
@@ -101,6 +105,7 @@ static void Run(string path)
     using (var db = FolioDatabase.Open(path))
     {
         Check(db.GetCollection("users").Count() == 2000, "reopen count");
+        Check(db.GetCollection("users").GetIndexes().Any(i => i.Keys.Count == 2), "reopen compound");
         Check(db.GetCollection<Order>("orders").FindOne("{ customer: 'ana' }")?.Lines.Count == 2, "reopen typed");
         db.CheckIntegrity();
     }

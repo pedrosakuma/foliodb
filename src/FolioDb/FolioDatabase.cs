@@ -127,7 +127,7 @@ public sealed class FolioDatabase : IDisposable
                 var entries = new BTree(tx.Storage, index.Root).CreateCursor();
                 for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
                 {
-                    var keys = CollectionEngine.ExtractIndexKeys(cur.Value, index.Field, out _);
+                    var keys = CollectionEngine.ExtractIndexKeys(cur.Value, index, out _);
                     var idHint = IndexHint.ForId(cur.Value);
                     foreach (var (k, hint) in keys)
                     {

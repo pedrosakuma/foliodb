@@ -12,7 +12,10 @@ public sealed class FindOptions
 
 public readonly record struct UpdateResult(long MatchedCount, long ModifiedCount, DocValue? UpsertedId);
 
-public sealed record IndexInfo(string Name, string Field, bool Unique, bool MultiKey);
+public sealed record IndexInfo(string Name, string Field, bool Unique, bool MultiKey)
+{
+    public Document Keys { get; init; } = new() { [Field] = 1 };
+}
 
 public sealed record DatabaseStats(
     int PageSize,

@@ -31,6 +31,78 @@ internal static class CollectionEngine
         return keys;
     }
 
+    /// <summary>Upper bound of keys one document may produce in a compound index (cartesian product of array fields).</summary>
+    public const int MaxCompoundKeysPerDocument = 1000;
+
+    private static readonly IndexKey s_missing = new([KeyEncoder.TagNull], [IndexHint.Unknown]);
+
+    /// <summary>Distinct entries (value part) of <paramref name="index"/> for a document. See <see cref="IndexMeta.IsSimple"/>.</summary>
+    /// <remarks>Compound hints are the component hints followed by the <see cref="IndexHint.InOrder"/> flag.</remarks>
+    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, IndexMeta index, out bool multiKey)
+    {
+        if (index.IsSimple) return ExtractIndexKeys(doc, index.Fields[0].Path, out multiKey);
+        multiKey = false;
+        var fields = index.Fields;
+        var parts = new List<IndexKey>[fields.Length];
+        bool any = false;
+        long product = 1;
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var keys = ExtractIndexKeys(doc, fields[i].Path, out bool multi);
+            multiKey |= multi;
+            if (keys.Count == 0) keys.Add(s_missing);
+            else any = true;
+            if (fields[i].Descending)
+                for (int j = 0; j < keys.Count; j++) keys[j] = keys[j] with { Key = IndexMeta.Inverted(keys[j].Key) };
+            parts[i] = keys;
+            product *= keys.Count;
+            if (product > MaxCompoundKeysPerDocument)
+                throw new FolioException($"Document produces more than {MaxCompoundKeysPerDocument} keys for compound index '{index.Name}' (several array fields).");
+        }
+        if (!any) return [];
+
+        byte[] flag = fields.Length == 1 ? [] : [!multiKey && FieldsInOrder(doc, fields) ? IndexHint.InOrder : IndexHint.OutOfOrder];
+        var result = new List<IndexKey>((int)product);
+        Combine(parts, 0, [], [], result, flag);
+        return result;
+    }
+
+    private static void Combine(List<IndexKey>[] parts, int i, byte[] key, byte[] hint, List<IndexKey> result, byte[] flag)
+    {
+        if (i == parts.Length)
+        {
+            result.Add(new(key, [.. hint, .. flag]));
+            return;
+        }
+        foreach (var (k, h) in parts[i]) Combine(parts, i + 1, [.. key, .. k], [.. hint, .. h], result, flag);
+    }
+
+    /// <summary>True when the present index fields appear in the document (depth-first) in index order.</summary>
+    private static bool FieldsInOrder(ReadOnlySpan<byte> doc, IndexField[] fields)
+    {
+        var raw = new RawDocument(doc);
+        int last = -1;
+        foreach (var f in fields)
+        {
+            var current = new RawValue(DocType.Document, raw.Data);
+            bool found = true;
+            foreach (var segment in f.Path.Split('.'))
+            {
+                if (current.Type != DocType.Document || !current.AsDocument.TryGetField(Encoding.UTF8.GetBytes(segment), out current))
+                {
+                    found = false;
+                    break;
+                }
+            }
+            // Values are slices of the document, so their offsets give the depth-first order. Missing (or empty)
+            // values cannot be rebuilt from keys anyway (their hint is Unknown), so they do not constrain the order.
+            if (!found || !raw.Data.Overlaps(current.Data, out int offset)) continue;
+            if (offset <= last) return false;
+            last = offset;
+        }
+        return true;
+    }
+
     private static void Collect(RawValue v, byte[][] segments, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
     {
         if (seg == segments.Length)
@@ -56,6 +128,17 @@ internal static class CollectionEngine
         else if (v.Type == DocType.Array)
         {
             multiKey = true;
+            if (int.TryParse(Encoding.UTF8.GetString(segments[seg]), out int position) && position >= 0)
+            {
+                int i = 0;
+                foreach (var item in v.AsArray)
+                    if (i++ == position)
+                    {
+                        Collect(item, segments, seg + 1, keys, buf, ref multiKey);
+                        break;
+                    }
+                return;
+            }
             foreach (var item in v.AsArray)
                 if (item.Type == DocType.Document) Collect(item, segments, seg, keys, buf, ref multiKey);
         }
@@ -90,7 +173,7 @@ internal static class CollectionEngine
         if (size > max)
             throw new FolioException(index is null
                 ? $"_id value is too large ({size} bytes encoded, max {max})."
-                : $"Value for indexed field '{index.Field}' is too large ({size} bytes encoded, max {max}).");
+                : $"Value for index '{index.Name}' ({index.Field}) is too large ({size} bytes encoded, max {max}).");
     }
 
     // ------------------------------------------------------------------ writes
@@ -117,12 +200,12 @@ internal static class CollectionEngine
         var perIndex = new List<(IndexMeta Index, List<IndexKey> Keys, bool Multi)>(meta.Indexes.Count);
         foreach (var index in meta.Indexes)
         {
-            var keys = ExtractIndexKeys(bytes, index.Field, out bool multi);
+            var keys = ExtractIndexKeys(bytes, index, out bool multi);
             foreach (var (k, _) in keys)
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
-                    throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {DocJson.WriteValue(KeyEncoder.Decode(k, out _))}.");
+                    throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {index.DescribeKey(k)}.");
             }
             perIndex.Add((index, keys, multi));
         }
@@ -149,7 +232,7 @@ internal static class CollectionEngine
         foreach (var index in meta.Indexes)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var (k, _) in ExtractIndexKeys(docBytes, index.Field, out _)) tree.Delete(Concat(k, idKey));
+            foreach (var (k, _) in ExtractIndexKeys(docBytes, index, out _)) tree.Delete(Concat(k, idKey));
         }
         new BTree(tx.Storage, meta.PrimaryRoot).Delete(idKey);
     }
@@ -174,9 +257,11 @@ internal static class CollectionEngine
         }
         foreach (var index in meta.Indexes)
         {
-            if (!idHintChanged && SameField(oldBytes, newBytes, index.TopLevelField)) continue;
-            var oldKeys = ExtractIndexKeys(oldBytes, index.Field, out _);
-            var newKeys = ExtractIndexKeys(newBytes, index.Field, out bool multi);
+            // Compound hints also record whether the fields are in index order, which a reorder can change.
+            if (!idHintChanged && SameFields(oldBytes, newBytes, index.TopLevelFields)
+                && (index.Fields.Length == 1 || FieldsInOrder(oldBytes, index.Fields) == FieldsInOrder(newBytes, index.Fields))) continue;
+            var oldKeys = ExtractIndexKeys(oldBytes, index, out _);
+            var newKeys = ExtractIndexKeys(newBytes, index, out bool multi);
             var removed = oldKeys.Where(o => !newKeys.Exists(n => n.Key.AsSpan().SequenceEqual(o.Key))).Select(o => o.Key).ToList();
             var added = newKeys.Where(n => !oldKeys.Exists(o => o.Key.AsSpan().SequenceEqual(n.Key))).ToList();
             // Same key but a different type (5 -> 5L) or _id type: the entry is rewritten with the new hint.
@@ -185,7 +270,7 @@ internal static class CollectionEngine
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
-                    throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {DocJson.WriteValue(KeyEncoder.Decode(k, out _))}.");
+                    throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {index.DescribeKey(k)}.");
             }
             changes.Add((index, removed, [.. added, .. rehinted], multi));
         }
@@ -204,6 +289,13 @@ internal static class CollectionEngine
         }
         new BTree(tx.Storage, meta.PrimaryRoot).Update(idKey, newBytes);
         if (metaChanged) tx.SaveCollection(meta);
+        return true;
+    }
+
+    private static bool SameFields(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, byte[][] names)
+    {
+        foreach (var name in names)
+            if (!SameField(a, b, name)) return false;
         return true;
     }
 
@@ -271,7 +363,13 @@ internal static class CollectionEngine
         var projection = Projection.Parse(options?.Projection);
         var plan = QueryPlanner.Plan(meta, filter);
 
-        if (sort is null && plan.Covered && projection is not null && projection.OnlyIncludes(plan.KeyField))
+        if (sort is null && plan.Covered && projection is not null && plan.Kind == PlanKind.CompoundScan
+            && projection.OnlyIncludes(plan.Index!.Fields.Select(f => f.Path)))
+        {
+            FindCompoundCovered(tx, meta, plan, projection, skip, limit, result);
+            return result;
+        }
+        if (sort is null && plan.Kind != PlanKind.CompoundScan && plan.Covered && projection is not null && projection.OnlyIncludes(plan.KeyField))
         {
             FindCovered(tx, meta, plan, projection, skip, limit, result);
             return result;
@@ -352,20 +450,67 @@ internal static class CollectionEngine
 
     // ------------------------------------------------------------------ indexes
 
+    private static void FindCompoundCovered(EngineTx tx, CollectionMeta meta, QueryPlan plan, Projection projection, int skip, int limit, List<Document> result)
+    {
+        var index = plan.Index!;
+        var fetch = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
+        int skipped = 0;
+        QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (idKey, valueKey, hints) =>
+        {
+            if (skipped++ < skip) return true;
+            Span<Range> ranges = stackalloc Range[index.Fields.Length];
+            bool exact = IndexHint.TrySplit(hints, index.Fields.Length, out var idRange, ranges, out bool inOrder)
+                         && inOrder && index.Fields.All(f => !f.Path.Contains('.'));
+            var doc = new Document();
+            if (exact && projection.IncludesId)
+            {
+                exact = IndexHint.TryDecode(idKey, hints[idRange], out var id);
+                if (exact) doc["_id"] = id;
+            }
+            int pos = 0;
+            for (int i = 0; exact && i < index.Fields.Length; i++)
+            {
+                int len = IndexMeta.ComponentLength(valueKey[pos..], index.Fields[i].Descending);
+                if (projection.IncludesPath(index.Fields[i].Path))
+                {
+                    exact = IndexHint.TryDecode(index.Original(valueKey.Slice(pos, len), i), hints[ranges[i]], out var value);
+                    if (exact) doc[index.Fields[i].Path] = value;
+                }
+                pos += len;
+            }
+            if (!exact)
+            {
+                if (!fetch.SeekExact(idKey)) throw new CorruptDatabaseException("Index references a missing document.");
+                doc = projection.Apply(new RawDocument(fetch.Value));
+            }
+            result.Add(doc);
+            return result.Count < limit;
+        }, withHints: true);
+    }
+
     public static string CreateIndex(EngineTx tx, CollectionMeta meta, string field, bool unique)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(field);
-        if (field == "_id") return "_id_";
-        if (field.StartsWith('$') || field.Contains("..") || field.EndsWith('.')) throw new FolioException($"Invalid index field '{field}'.");
+        return CreateIndex(tx, meta, new Document { [field] = 1 }, unique);
+    }
 
-        var existing = meta.FindIndexByField(field);
+    public static string CreateIndex(EngineTx tx, CollectionMeta meta, Document keys, bool unique)
+    {
+        var fields = IndexMeta.ParsePattern(keys);
+        if (fields.Length == 1 && fields[0].Path == "_id") return "_id_";
+        if (fields.Select(f => f.Path).Distinct().Count() != fields.Length) throw new FolioException("An index cannot contain the same field twice.");
+
+        var existing = meta.Indexes.FirstOrDefault(i => i.SameFields(fields));
         if (existing is not null)
         {
-            if (existing.Unique != unique) throw new FolioException($"An index on '{field}' already exists with different options.");
+            if (existing.Unique != unique) throw new FolioException($"Index '{existing.Name}' already exists with different options.");
             return existing.Name;
         }
+        string name = IndexMeta.DefaultName(fields);
+        string baseName = name;
+        for (int suffix = 2; meta.Indexes.Exists(i => i.Name == name); suffix++) name = baseName + "_" + suffix;
 
-        var index = new IndexMeta { Name = field + "_1", Field = field, Unique = unique, Root = BTree.Create(tx.Storage) };
+        var index = new IndexMeta { Name = name, Fields = fields, Unique = unique, Root = BTree.Create(tx.Storage) };
         var tree = new BTree(tx.Storage, index.Root);
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
         var cur = primary.CreateCursor();
@@ -374,11 +519,11 @@ internal static class CollectionEngine
             var idKey = cur.Key.ToArray();
             var docBytes = cur.Value;
             var idHint = IndexHint.ForId(docBytes);
-            foreach (var (k, hint) in ExtractIndexKeys(docBytes, field, out bool multi))
+            foreach (var (k, hint) in ExtractIndexKeys(docBytes, index, out bool multi))
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (unique && ConflictsInUniqueIndex(tree, k, idKey))
-                    throw new DuplicateKeyException($"Cannot create unique index on '{field}': duplicate value {DocJson.WriteValue(KeyEncoder.Decode(k, out _))}.");
+                    throw new DuplicateKeyException($"Cannot create unique index '{name}': duplicate value {index.DescribeKey(k)}.");
                 tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
                 if (multi) index.MultiKey = true;
             }
@@ -390,12 +535,19 @@ internal static class CollectionEngine
 
     public static bool DropIndex(EngineTx tx, CollectionMeta meta, string nameOrField)
     {
-        var index = meta.Indexes.FirstOrDefault(i => i.Name == nameOrField || i.Field == nameOrField);
+        var index = meta.Indexes.FirstOrDefault(i => i.Name == nameOrField) ?? meta.Indexes.FirstOrDefault(i => i.IsSimple && i.Field == nameOrField);
         if (index is null) return false;
         new BTree(tx.Storage, index.Root).Drop();
         meta.Indexes.Remove(index);
         tx.SaveCollection(meta);
         return true;
+    }
+
+    public static bool DropIndex(EngineTx tx, CollectionMeta meta, Document keys)
+    {
+        var fields = IndexMeta.ParsePattern(keys);
+        var index = meta.Indexes.FirstOrDefault(i => i.SameFields(fields));
+        return index is not null && DropIndex(tx, meta, index.Name);
     }
 }
 
@@ -646,6 +798,8 @@ internal sealed class Projection
 
     /// <summary>True when every included path is <paramref name="field"/> (so the result can be built from its index key).</summary>
     public bool OnlyIncludes(string field) => _include && !_idInTree && !_hasOperators && _paths.TrueForAll(p => p == field);
+    public bool OnlyIncludes(IEnumerable<string> fields) => _include && !_idInTree && !_hasOperators && _paths.All(fields.Contains);
+    public bool IncludesPath(string path) => _paths.Contains(path);
 
     /// <summary>Projects straight from the serialized document, materializing only the selected values.</summary>
     public Document Apply(RawDocument raw)

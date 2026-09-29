@@ -222,16 +222,26 @@ public sealed class Collection
     public string CreateIndex(string field, bool unique = false) =>
         Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), field, unique), atomic: false);
 
+    /// <summary>Creates an ordered index key pattern, e.g. <c>{ customer: 1, total: -1 }</c>.</summary>
+    public string CreateIndex(Document keys, bool unique = false) =>
+        Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), keys, unique), atomic: false);
+
     public bool DropIndex(string nameOrField) => Write(tx =>
     {
         var meta = tx.GetCollection(Name);
         return meta is not null && CollectionEngine.DropIndex(tx, meta, nameOrField);
     }, atomic: true);
 
+    public bool DropIndex(Document keys) => Write(tx =>
+    {
+        var meta = tx.GetCollection(Name);
+        return meta is not null && CollectionEngine.DropIndex(tx, meta, keys);
+    }, atomic: true);
+
     public IReadOnlyList<IndexInfo> GetIndexes() => Read((_, meta) =>
     {
         var list = new List<IndexInfo> { new("_id_", "_id", true, false) };
-        if (meta is not null) list.AddRange(meta.Indexes.Select(i => new IndexInfo(i.Name, i.Field, i.Unique, i.MultiKey)));
+        if (meta is not null) list.AddRange(meta.Indexes.Select(i => new IndexInfo(i.Name, i.Field, i.Unique, i.MultiKey) { Keys = i.KeyPattern() }));
         return (IReadOnlyList<IndexInfo>)list;
     });
 

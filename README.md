@@ -17,10 +17,19 @@ no reflection — typed mapping is done by a source generator).
 - **Numbers**: `int32`, `int64`, `double` and native 128-bit `decimal` (`NumberDecimal('0.1')` / `{"$numberDecimal":"0.1"}`, `$type: 'decimal'`).
   Each value keeps its type, but comparisons, indexes and sort use the exact numeric value across types
   (`5 == 5L == 5.0 == 5m`, `0.1m < 0.1`). Arithmetic (`$inc`/`$mul`) promotes int32 → int64 → double → decimal.
-- **B+Tree** primary index on `_id` (auto-generated `ObjectId` when missing) and **secondary indexes** (single field, dotted paths, unique, multikey on arrays).
+- **B+Tree** primary index on `_id` (auto-generated `ObjectId` when missing) and **secondary indexes** (single/compound fields, ascending/descending, dotted paths, unique, multikey on arrays).
+  `CreateIndex(Document.Parse("{city:1, age:-1}"))` / `db.users.createIndex({city:1, age:-1})` stores an ordered tuple.
+  The planner uses an equality prefix plus a range on the next component; sorting still uses the explicit sort stage.
+  Compound indexes include documents with at least one indexed field, encoding missing components as null. Uniqueness
+  applies to the complete tuple (missing and explicit null compare equal). Multiple array fields form a Cartesian
+  product, limited to 1,000 keys per document; multikey queries always recheck the document. Patterns allow at most
+  32 fields and do not allow `_id` as a compound component. `GetIndexes().Keys` retains the full ordered pattern;
+  `DropIndex(pattern)` matches normalized directions. Generated names gain a numeric suffix on collisions.
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
   **Covered queries**: counts and index-field/`_id` projections are answered from index keys alone when the index is exact
-  (not multikey, single predicate or same-field range); projections are otherwise applied on raw bytes.
+  (not multikey, single predicate, same-field range, or a compound prefix/range covering every predicate).
+  Compound projections preserve stored numeric types and field order; nested paths, missing fields and incompatible
+  stored field order fall back to reading the document. Other projections are applied on raw bytes.
   **Nested projection** uses the same path rules as filters and `$set`, with no ambiguity: on a document a segment is a
   field name; on an array a numeric segment is a position (`{'tags.0': 1}` → `tags: ['x']`) and any other segment
   applies to every element (`{'itens.nome': 1}` → `itens: [{nome: 'a'}, {nome: 'b'}]`). Arrays stay arrays. Specs that
@@ -70,6 +79,9 @@ long total = snap.GetCollection("accounts").Count();
 
 Writers are serialized by an in-process lock; a writer waiting longer than `BusyTimeout` gets
 `"database is busy"`. Readers never block and never see uncommitted data.
+
+The current file format is version 3. Version 2 databases remain readable and are upgraded on the next header write;
+after that, older binaries reject them. Keep a backup before upgrading if you need to return to an older binary.
 
 ### Typed documents (source generator, AOT-safe)
 
@@ -214,10 +226,20 @@ integers, the raw 8/16-byte payload for doubles/decimals. Covered projections re
 entries without hints (written by older versions) fall back to reading the document. Documents fetched through an index
 reuse a B+Tree cursor path instead of descending from the root for every lookup.
 
+Compound read path (`CompoundIndexBenchmarks`; 10k docs, 512-byte payload, 100 candidates per city,
+10 matches for `{city:42, age:{$gte:30,$lt:40}}`; five measured iterations on a shared host):
+
+| Operation | Single `{city:1}` | Compound `{city:1,age:-1}` |
+|---|---:|---:|
+| Count | 65.7 µs / 5.13 KB | 5.9 µs / 6.29 KB |
+| Project city + age | 70.2 µs / 8.21 KB | 8.7 µs / 10.62 KB |
+
+The compound path avoids fetching 100 candidate documents, at the cost of higher allocation in tuple planning/decoding.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
-- Single-field indexes only (no compound indexes); no aggregation pipeline, no full-text search.
+- No aggregation pipeline or full-text search.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

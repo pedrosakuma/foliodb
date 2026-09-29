@@ -54,6 +54,38 @@ internal static class IndexHint
         return true;
     }
 
+    /// <summary>Last byte of compound entries: the indexed fields appear in the document in index order.</summary>
+    public const byte InOrder = 0x01;
+    public const byte OutOfOrder = 0x00;
+
+    /// <summary>
+    /// Splits the value of an index entry with <paramref name="components"/> fields (<c>idHint ++ hint₁ … hintₙ</c>,
+    /// plus the order flag when n &gt; 1) into ranges; false for legacy or malformed entries.
+    /// </summary>
+    public static bool TrySplit(ReadOnlySpan<byte> entry, int components, out Range idHint, Span<Range> valueHints, out bool inOrder)
+    {
+        idHint = default;
+        inOrder = components == 1;
+        if (entry.IsEmpty) return false;
+        int pos = 0;
+        for (int i = -1; i < components; i++)
+        {
+            if (pos >= entry.Length) return false;
+            int n = Length(entry[pos..]);
+            if (pos + n > entry.Length) return false;
+            if (i < 0) idHint = pos..(pos + n);
+            else valueHints[i] = pos..(pos + n);
+            pos += n;
+        }
+        if (components > 1)
+        {
+            if (pos + 1 != entry.Length) return false;
+            inOrder = entry[pos] == InOrder;
+            return true;
+        }
+        return pos == entry.Length;
+    }
+
     /// <summary>Decodes <paramref name="key"/> with its hint; false when the stored value cannot be rebuilt exactly.</summary>
     public static bool TryDecode(ReadOnlySpan<byte> key, ReadOnlySpan<byte> hint, out DocValue value)
     {

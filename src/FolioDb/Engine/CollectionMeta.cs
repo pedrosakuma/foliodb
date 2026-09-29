@@ -1,31 +1,144 @@
+using FolioDb.Query;
+
 namespace FolioDb.Engine;
+
+/// <summary>One component of an index key pattern.</summary>
+internal readonly record struct IndexField(string Path, bool Descending);
 
 internal sealed class IndexMeta
 {
+    public const int MaxFields = 32;
+
     public required string Name { get; init; }
-    public required string Field { get; init; }
+    public required IndexField[] Fields { get; init; }
     public required bool Unique { get; init; }
     public required uint Root { get; init; }
     /// <summary>True once any indexed document produced more than one key (array value).</summary>
     public bool MultiKey { get; set; }
 
-    private byte[]? _topLevelField;
-    /// <summary>UTF-8 name of the first path segment: index keys depend only on this top-level field.</summary>
-    public byte[] TopLevelField => _topLevelField ??= System.Text.Encoding.UTF8.GetBytes(Field.Split('.')[0]);
+    /// <summary>
+    /// A plain ascending single-field index. Its entries are <c>value ++ idKey</c> and documents missing the field are
+    /// not indexed. Other (compound or descending) indexes store one component per field (descending components have
+    /// their bytes inverted, which reverses their order because encodings are prefix-free), and index a document when
+    /// at least one field is present (missing ones as null).
+    /// </summary>
+    public bool IsSimple => Fields.Length == 1 && !Fields[0].Descending;
 
-    public Document ToDocument() => new()
+    /// <summary>Indexed path for single-field indexes, comma-separated paths for compound ones.</summary>
+    public string Field => Fields.Length == 1 ? Fields[0].Path : string.Join(",", Fields.Select(f => f.Path));
+
+    private byte[][]? _topLevelFields;
+    /// <summary>UTF-8 names of the first path segments: index keys depend only on these top-level fields.</summary>
+    public byte[][] TopLevelFields => _topLevelFields ??= Fields.Select(f => System.Text.Encoding.UTF8.GetBytes(f.Path.Split('.')[0])).Distinct(ByteArrayComparer.Instance).ToArray();
+
+    public bool SameFields(IndexField[] fields) => Fields.AsSpan().SequenceEqual(fields);
+
+    public Document KeyPattern()
     {
-        ["name"] = Name,
-        ["field"] = Field,
-        ["unique"] = Unique,
-        ["root"] = (long)Root,
-        ["multiKey"] = MultiKey,
-    };
+        var d = new Document();
+        foreach (var f in Fields) d[f.Path] = f.Descending ? -1 : 1;
+        return d;
+    }
+
+    public static string DefaultName(IndexField[] fields) => string.Join("_", fields.Select(f => f.Path + (f.Descending ? "_-1" : "_1")));
+
+    /// <summary>Validates a key pattern such as <c>{ a: 1, b: -1 }</c>.</summary>
+    public static IndexField[] ParsePattern(Document keys)
+    {
+        ArgumentNullException.ThrowIfNull(keys);
+        if (keys.Count == 0) throw new FolioException("An index needs at least one field.");
+        if (keys.Count > MaxFields) throw new FolioException($"An index can have at most {MaxFields} fields.");
+        var fields = new IndexField[keys.Count];
+        int i = 0;
+        foreach (var (path, dir) in keys)
+        {
+            ValidatePath(path);
+            if (keys.Count > 1 && path == "_id") throw new FolioException("_id cannot be part of a compound index.");
+            if (!dir.IsNumber || (KeyEncoder.Compare(dir, 1) != 0 && KeyEncoder.Compare(dir, -1) != 0)) throw new FolioException($"Index direction for '{path}' must be 1 or -1.");
+            fields[i++] = new IndexField(path, dir.AsDouble < 0);
+        }
+        return fields;
+    }
+
+    public static void ValidatePath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) throw new FolioException("Index field names cannot be empty.");
+        if (path.StartsWith('$') || path.StartsWith('.') || path.Contains("..") || path.EndsWith('.')) throw new FolioException($"Invalid index field '{path}'.");
+    }
+
+    // ------------------------------------------------------------------ key layout
+
+    /// <summary>Length of the component at the start of <paramref name="key"/>.</summary>
+    public static int ComponentLength(ReadOnlySpan<byte> key, bool descending)
+    {
+        if (!descending) return KeyEncoder.EncodedLength(key);
+        // Lengths are computed on the original bytes; keys are small (bounded by the page size).
+        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(key.Length);
+        try
+        {
+            var span = rented.AsSpan(0, key.Length);
+            Invert(key, span);
+            return KeyEncoder.EncodedLength(span);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
+    }
+
+    public static void Invert(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        for (int i = 0; i < source.Length; i++) destination[i] = (byte)~source[i];
+    }
+
+    public static byte[] Inverted(ReadOnlySpan<byte> source)
+    {
+        var r = new byte[source.Length];
+        Invert(source, r);
+        return r;
+    }
+
+    /// <summary>Byte length of the value part (all components) at the start of an index entry.</summary>
+    public int ValueLength(ReadOnlySpan<byte> entry, int fromComponent = 0, int offset = 0)
+    {
+        int pos = offset;
+        for (int i = fromComponent; i < Fields.Length; i++) pos += ComponentLength(entry[pos..], Fields[i].Descending);
+        return pos;
+    }
+
+    /// <summary>Decodes component <paramref name="i"/> (already sliced to its bytes) to its original, non-inverted encoding.</summary>
+    public byte[] Original(ReadOnlySpan<byte> component, int i) => Fields[i].Descending ? Inverted(component) : component.ToArray();
+
+    /// <summary>Human-readable value of an encoded key (for error messages).</summary>
+    public string DescribeKey(ReadOnlySpan<byte> valueKey)
+    {
+        if (Fields.Length == 1) return DocJson.WriteValue(KeyEncoder.Decode(Original(valueKey, 0), out _));
+        var d = new Document();
+        int pos = 0;
+        for (int i = 0; i < Fields.Length; i++)
+        {
+            int len = ComponentLength(valueKey[pos..], Fields[i].Descending);
+            d[Fields[i].Path] = KeyEncoder.Decode(Original(valueKey.Slice(pos, len), i), out _);
+            pos += len;
+        }
+        return DocJson.WriteValue(d);
+    }
+
+    // ------------------------------------------------------------------ catalog
+
+    public Document ToDocument()
+    {
+        var d = new Document { ["name"] = Name };
+        // Simple indexes keep the original catalog shape.
+        if (IsSimple) d["field"] = Fields[0].Path;
+        else d["keys"] = KeyPattern();
+        d["unique"] = Unique;
+        d["root"] = (long)Root;
+        d["multiKey"] = MultiKey;
+        return d;
+    }
 
     public static IndexMeta FromDocument(Document d) => new()
     {
         Name = d["name"].AsString,
-        Field = d["field"].AsString,
+        Fields = d.TryGetValue("keys", out var keys) ? ParsePattern(keys.AsDocument) : [new IndexField(d["field"].AsString, false)],
         Unique = d["unique"].AsBoolean,
         Root = (uint)d["root"].AsInt64,
         MultiKey = d["multiKey"].AsBoolean,
@@ -37,13 +150,6 @@ internal sealed class CollectionMeta
     public required string Name { get; init; }
     public required uint PrimaryRoot { get; init; }
     public List<IndexMeta> Indexes { get; } = new();
-
-    public IndexMeta? FindIndexByField(string field)
-    {
-        foreach (var i in Indexes)
-            if (i.Field == field) return i;
-        return null;
-    }
 
     public Document ToDocument()
     {
