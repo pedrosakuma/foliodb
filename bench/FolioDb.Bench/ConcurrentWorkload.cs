@@ -90,7 +90,17 @@ public static class ConcurrentWorkload
         }
     }
 
-    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize, string fifo)
+    public static void Profile(string[] args)
+    {
+        if (args.Length != 2 || args[0] is not ("direct" or "integrated")
+            || !int.TryParse(args[1], out int seconds) || seconds is < 5 or > 300)
+            throw new ArgumentException("Usage: --profile-writers direct|integrated seconds:5..300");
+        Console.WriteLine($"# PROFILE pid={Environment.ProcessId} admission={args[0]} Full 16 writers 4 readers");
+        Trial(SynchronousMode.Full, new(16, 4), 3, 0, false, 1, 1, args[0]);
+        Trial(SynchronousMode.Full, new(16, 4), seconds, 1, true, 1, 1, args[0], profile: true);
+    }
+
+    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize, string fifo, bool profile = false)
     {
         var paths = Enumerable.Range(0, shards).Select(_ => Workload.TempFile(".folio")).ToArray();
         var databases = new List<FolioDatabase>();
@@ -136,6 +146,7 @@ public static class ConcurrentWorkload
             var wals = paths.Select(path => new FileInfo(path + "-wal")).ToArray();
             long peak = 0;
             start.Set();
+            if (profile) Console.WriteLine($"# LOAD_START pid={Environment.ProcessId} utc={DateTime.UtcNow:O} seconds={seconds}");
             try
             {
                 while (elapsed.Elapsed.TotalSeconds < seconds && !stop.IsCancellationRequested)
@@ -152,6 +163,7 @@ public static class ConcurrentWorkload
                 foreach (var thread in threads) thread.Join();
                 elapsed.Stop();
             }
+            if (profile) Console.WriteLine($"# LOAD_END utc={DateTime.UtcNow:O}");
             if (!errors.IsEmpty) throw new AggregateException(errors);
             var total = new Worker();
             foreach (var w in workers)

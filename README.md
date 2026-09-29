@@ -558,6 +558,71 @@ similar under contention, but shared-host variation remains substantial (includi
 these results do not establish exact overhead or a universal latency improvement. Default admission is unchanged
 unless the caller explicitly opts in.
 
+### Diagnostic captures of writer admission
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-writers direct 120
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-writers integrated 120
+```
+
+Run these **sequentially**, not together. This bounded profiling entry point selects Full, 16 writers, 4 readers,
+one file and one update per transaction. It performs a discarded three-second warmup, creates a fresh database,
+then prints the actual managed PID and UTC `LOAD_START`/`LOAD_END` markers. The trailing row uses the same CSV
+column order as `--fairness`. Durations from 5 to 300 seconds are accepted; use 15 seconds for an uninstrumented
+reference and a longer run to allow attachment. Attach only to the printed PID, after `LOAD_START` and a few
+seconds of settling; keep the entire capture before `LOAD_END`. Setup and final integrity scans must not be
+mistaken for workload activity. The counters/latencies in the trailing row span the entire run, not just capture
+windows, and should not be used to estimate profiling overhead from runs of different duration.
+
+On 2026-09-29, `dotnet-diagnostics` MCP captured counters, GC, CPU samples and managed contention concurrently
+in one ten-second batch per policy, followed by separate ten-second allocation samples. A further FIFO
+counters+GC-only capture cross-checked allocation/GC without simultaneous CPU/contention sampling.
+Only synthetic benchmark data was used; no dumps, heap walks, method parameters or process suspension were requested.
+The target advertised no off-CPU/native-lock sampling capability, so no OS scheduler/I/O wait decomposition was
+attempted. All runs completed their per-document counter and integrity checks.
+
+| Evidence in ten-second batched window | Default | Integrated FIFO |
+|---|---:|---:|
+| UTC window start | 23:42:28 | 23:44:20 |
+| GC collections | 1,171 | 1,326 |
+| Gen2 collections | 6 | 5 |
+| Collector-reported total GC pause | 988.6 ms | 817.7 ms |
+| Maximum GC pause | 16.2 ms | 9.4 ms |
+| Managed contention events | 13,079 | 45,404 |
+| Summed contention durations across threads | 4.219 s | 39.729 s |
+| Last allocation-rate counter interval (~1 s) | ~1.87 GB/s | ~2.04 GB/s |
+
+Contention duration sums can exceed wall time because multiple threads wait concurrently. They do not measure
+whole writer-queue residence time and cannot be compared directly to our acquisition histograms. Call-site
+drilldowns returned `(unknown)` and retained only the first 200 detailed rows, so these captures cannot attribute
+the increase specifically to `WriterLock`, pager or cache. More contention is consistent with FIFO's PulseAll
+handoff, but is not proof that PulseAll alone explains its throughput cost.
+
+CPU-sample summaries attributed roughly 65% of Default samples to `SemaphoreSlim.WaitUntilCountOrTimeout` and 66%
+of FIFO samples to `WriterLock.Wait`. The latter resolved to the `Monitor.Wait` line. The tool labeled these as
+running/self CPU and produced a "cpu-bound" verdict, but that classification is insufficient to distinguish
+blocked managed frames from actual on-CPU work here. **These percentages must not be reported as CPU consumed by
+the locks.** FSync also appeared in Default stacks, without establishing how much wall time disk synchronization
+consumed. CPU usage counters were only ~18%/~21% of the reported 16-processor capacity in the final intervals.
+
+AllocationTick sampling highlighted `Byte[]`, `String`, read delegates and paths through `BTree.TryGet`,
+`RawDocument.ToDocument` and the benchmark's `ReadLoop` in both variants. These are sampled allocation weights,
+not an exact object census or trustworthy exact byte totals per type; inlining and allocation-tick attribution
+can skew type/site shares. Runtime allocation-rate counters independently support heavy allocation pressure.
+The FIFO counters+GC-only window reported ~2.59 GB in its last ~1-second interval and 1,049.8 ms summed GC pause
+over ten seconds (maximum 4.9 ms), supporting the signal without simultaneous CPU/contention sampling.
+This is allocation **turnover**, not evidence of a memory leak; the workload materializes full 1 KiB documents.
+
+Uninstrumented 15-second references gave Default 436 updates/s, 588k reads/s and 178 one-second acquisition
+timeouts; FIFO gave 220 updates/s, 534k reads/s and zero timeouts. The separate 120-second processes that hosted
+captures gave Default 296 updates/s and 1,538 timeouts, versus FIFO 284 updates/s and zero timeouts. These are
+single runs on a variable shared host with different durations and collector schedules, not a controlled estimate
+of profiler overhead or a reversal of the earlier throughput comparison.
+
+Next evidence-backed candidates are reducing full-read allocation/copying and experimenting with targeted FIFO
+wakeups instead of PulseAll. Neither was changed by this diagnostic task. Quantifying fsync versus scheduler
+waiting still requires a suitable off-CPU capture; these results alone do not justify changing durability.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

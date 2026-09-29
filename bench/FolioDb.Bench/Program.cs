@@ -5,7 +5,9 @@ using FolioDb;
 using LiteDB;
 using Microsoft.Data.Sqlite;
 
-if (args.Length > 0 && args[0] == "--concurrency")
+if (args.Length > 0 && args[0] == "--profile-writers")
+    ConcurrentWorkload.Profile(args[1..]);
+else if (args.Length > 0 && args[0] == "--concurrency")
     ConcurrentWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--sharding")
     ConcurrentWorkload.Run(args[1..], sharding: true);
