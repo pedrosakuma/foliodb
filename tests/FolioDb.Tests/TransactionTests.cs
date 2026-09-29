@@ -90,11 +90,13 @@ public class TransactionTests
         Assert.Contains("busy", ex.Message);
     }
 
-    [Fact]
-    public async Task Concurrent_readers_and_writers_keep_consistent_invariants()
+    [Theory]
+    [InlineData(WriterAdmissionMode.Default)]
+    [InlineData(WriterAdmissionMode.Fifo)]
+    public async Task Concurrent_readers_and_writers_keep_consistent_invariants(WriterAdmissionMode admission)
     {
         using var tmp = new TempDb();
-        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 100, Synchronous = SynchronousMode.Off });
+        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 100, Synchronous = SynchronousMode.Off, WriterAdmission = admission });
         var accounts = db.GetCollection("accounts");
         accounts.CreateIndex("balance");
         for (int i = 0; i < 20; i++) accounts.Insert(new Document { ["_id"] = i, ["balance"] = 100 });

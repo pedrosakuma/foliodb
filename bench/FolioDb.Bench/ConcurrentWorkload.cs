@@ -65,7 +65,7 @@ public static class ConcurrentWorkload
         Console.WriteLine("# Latency in microseconds; histogram upper bounds <=2% plus 0.02us; service includes commit/checkpoint.");
         if (sharding) Console.WriteLine("# Experimental integer-only id % shards routing; 1/2/4 independent files on same device; total cache=4096 pages; no cross-shard guarantees.");
         if (batching) Console.WriteLine("# Explicit batches of 1/8/32 updates per atomic transaction, single file; no request-arrival/batch-fill delay modeled.");
-        if (fairness) Console.WriteLine("# Full only; direct vs external FIFO admission, 1s queue deadline; lease held through transaction disposal; no engine change.");
+        if (fairness) Console.WriteLine("# Full only; direct vs external FIFO vs integrated FIFO admission; 1s admission timeout.");
         Console.WriteLine("# writes_s and writer_min/max count successful transactions; updates_s counts committed increments; write_* latency is per whole transaction.");
         Console.WriteLine("# " + System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription
             + "; CPUs=" + Environment.ProcessorCount + "; temp=" + Path.GetTempPath());
@@ -78,7 +78,7 @@ public static class ConcurrentWorkload
             int[] shardCounts = sharding ? [1, 2, 4] : [1];
             int[] batchSizes = batching ? [1, 8, 32] : [1];
             SynchronousMode[] modes = fairness ? [SynchronousMode.Full] : [SynchronousMode.Full, SynchronousMode.Normal];
-            bool[] admissions = fairness ? [false, true] : [false];
+            string[] admissions = fairness ? ["direct", "fifo", "integrated"] : ["direct"];
             var configurations = shardCounts.SelectMany(shards => batchSizes.SelectMany(batchSize =>
                 modes.SelectMany(mode => admissions.Select(fifo => (mode, shards, batchSize, fifo))))).ToArray();
             foreach (var (mode, shards, batchSize, fifo) in configurations) Trial(mode, scenario, 1, 0, print: false, shards, batchSize, fifo);
@@ -90,7 +90,7 @@ public static class ConcurrentWorkload
         }
     }
 
-    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize, bool fifo)
+    private static void Trial(SynchronousMode mode, Scenario scenario, int seconds, int trial, bool print, int shards, int batchSize, string fifo)
     {
         var paths = Enumerable.Range(0, shards).Select(_ => Workload.TempFile(".folio")).ToArray();
         var databases = new List<FolioDatabase>();
@@ -100,6 +100,7 @@ public static class ConcurrentWorkload
             {
                 Synchronous = mode, AutoCheckpointFrames = 1000, BusyTimeout = TimeSpan.FromSeconds(1),
                 CacheSizePages = 4096 / shards,
+                WriterAdmission = fifo == "integrated" ? WriterAdmissionMode.Fifo : WriterAdmissionMode.Default,
             }));
             for (int shard = 0; shard < shards; shard++)
             {
@@ -116,7 +117,7 @@ public static class ConcurrentWorkload
             using var ready = new CountdownEvent(scenario.Readers + scenario.Writers);
             using var start = new ManualResetEventSlim();
             var errors = new ConcurrentQueue<Exception>();
-            var admission = fifo ? new FifoAdmission() : null;
+            var admission = fifo == "fifo" ? new FifoAdmission() : null;
             var workers = Enumerable.Range(0, scenario.Readers + scenario.Writers).Select(_ => new Worker()).ToArray();
             var threads = workers.Select((worker, index) => new Thread(() =>
             {
@@ -195,7 +196,7 @@ public static class ConcurrentWorkload
             values.Add(F(total.Write.Max));
             values.AddRange(new[] { F(total.Commit.Percentile(.50)), F(total.Commit.Percentile(.95)),
                 F(total.Commit.Percentile(.99)), F(total.TimeoutWait.Max), shards.ToString(), batchSize.ToString(),
-                F(expectedUpdates / elapsed.Elapsed.TotalSeconds), fifo ? "fifo" : "direct", F(total.Wait.Max),
+                F(expectedUpdates / elapsed.Elapsed.TotalSeconds), fifo, F(total.Wait.Max),
                 string.Join(';', workers.Take(scenario.Writers).Select(w => w.Write.Count)) });
             Console.WriteLine(string.Join(',', values));
         }

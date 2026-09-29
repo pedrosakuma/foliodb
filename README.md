@@ -82,6 +82,39 @@ long total = snap.GetCollection("accounts").Count();
 Writers are serialized by an in-process lock; a writer waiting longer than `BusyTimeout` gets
 `"database is busy"`. Readers never block and never see uncommitted data.
 
+#### Optional FIFO writer admission
+
+```csharp
+using var db = FolioDatabase.Open("app.folio", new FolioOptions
+{
+    WriterAdmission = WriterAdmissionMode.Fifo,
+    BusyTimeout = TimeSpan.FromSeconds(30),
+});
+```
+
+`WriterAdmissionMode.Default` retains the original semaphore policy (no ordering guarantee) and remains the
+default. `Fifo` admits pending callers in the order they enqueue under the admission monitor. It can improve
+per-writer progress under contention, at a possible throughput cost. This is per opened database, not persisted
+in the file, and works with every durability mode.
+
+Automatic writes, explicit transactions, explicit `Checkpoint()` and `Dispose()` share the selected admission
+policy. An explicit transaction holds admission through commit or rollback/disposal, including any automatic
+checkpoint; automatic checkpoints do not enqueue a second time. Readers do not join this queue, although internal
+pager/cache locks and I/O can still cause contention. Atomicity, WAL confirmation and durability are unchanged.
+
+FIFO uses one `BusyTimeout` budget for admission, including entering the queue monitor, rather than an external
+queue followed by a second contended semaphore. Zero means a non-blocking attempt that cannot bypass queued callers;
+`Timeout.InfiniteTimeSpan` waits indefinitely. Other values must be nonnegative and at most `int.MaxValue`
+milliseconds; invalid values fail at open. This is **not** a deadline for transaction execution, snapshot setup,
+disk I/O or commit. FIFO cannot guarantee maximum latency or prevent timeouts caused by a slow holder or scheduling.
+Timed-out/interrupted waiters are unlinked so they cannot obstruct the next caller.
+
+Writes throw the existing busy exception on admission timeout; explicit checkpoints return false. Disposal marks
+the handle closing before waiting; queued writes/checkpoints recheck that state after admission and fail with
+`ObjectDisposedException` instead of starting new work. If disposal cannot acquire admission, or its wait is
+interrupted, the handle becomes usable again. Active transactions still complete through the existing transaction
+handle. Do not use a concurrent call to `Dispose()` as a synchronization barrier.
+
 The current file format is version 3. Version 2 databases remain readable and are upgraded on the next header write;
 after that, older binaries reject them. Keep a backup before upgrading if you need to return to an older binary.
 
@@ -497,6 +530,33 @@ was more even progress and removal of observed one-second starvation timeouts, n
 The chosen monitor/PulseAll implementation is not a lower bound on FIFO overhead, nor does this experiment
 separate wake-up costs from handoff, scheduling, cache locality and storage latency. No production admission
 policy, group commit, batching, acknowledgment semantics or durability setting was changed.
+
+#### Integrated FIFO comparison
+
+FIFO is now available via `FolioOptions.WriterAdmission`; the benchmark above retains the external prototype
+as a reference and adds a third CSV admission label, `integrated`, alongside `direct` and `fifo`.
+The production implementation still uses monitor/PulseAll admission, not a different targeted-wakeup algorithm.
+It additionally handles zero/infinite timeouts and interrupted waiters and replaces the engine semaphore rather
+than wrapping it. Existing measurements above are historical external-gate results.
+
+Promotion run, same Full/single-update workload and three interleaved 3-second repetitions on the shared host:
+
+| Writers / readers | Admission | Updates/s | Successful update p99 | Timeouts (3 trials) |
+|---|---|---:|---:|---:|
+| 4 / 4 | Default | 436 | 251.7 ms | 8 |
+| 4 / 4 | External FIFO | 418 | 26.3 ms | 0 |
+| 4 / 4 | Integrated FIFO | 435 | 17.7 ms | 0 |
+| 16 / 4 | Default | 357 | 73.7 ms | 119 |
+| 16 / 4 | External FIFO | 283 | 105.3 ms | 0 |
+| 16 / 4 | Integrated FIFO | 279 | 128.4 ms | 0 |
+
+Integrated FIFO had zero admission timeouts in all measured scenarios; default had 269 across the complete
+matrix. In the 16-writer/mixed scenario, median per-trial writer min/max counts were 1/439 for default and
+53/54 for integrated FIFO. The successful-operation p99 alone is misleading when stalled default writers
+end in a timeout and are excluded from that percentile. The integrated and external throughput medians were
+similar under contention, but shared-host variation remains substantial (including uncontended runs);
+these results do not establish exact overhead or a universal latency improvement. Default admission is unchanged
+unless the caller explicitly opts in.
 
 ## Limitations
 

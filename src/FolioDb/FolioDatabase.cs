@@ -10,7 +10,7 @@ namespace FolioDb;
 public sealed class FolioDatabase : IDisposable
 {
     private readonly Pager _pager;
-    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly WriterLock _writeLock;
     private readonly FolioOptions _options;
     private int _disposed;
 
@@ -18,6 +18,7 @@ public sealed class FolioDatabase : IDisposable
     {
         _pager = pager;
         _options = options;
+        _writeLock = new WriterLock(options.WriterAdmission);
     }
 
     public string Path => _pager.Path;
@@ -31,6 +32,7 @@ public sealed class FolioDatabase : IDisposable
     }
 
     internal Pager Pager => _pager;
+    internal int WaitingWriters => _writeLock.WaitingCount;
 
     internal EngineTx BeginRead()
     {
@@ -45,6 +47,7 @@ public sealed class FolioDatabase : IDisposable
             throw new FolioException("The database is busy (timed out waiting for the write lock).");
         try
         {
+            ThrowIfDisposed();
             return new EngineTx(new StorageTx(_pager, writable: true, onDispose: () => _writeLock.Release()));
         }
         catch
@@ -86,13 +89,14 @@ public sealed class FolioDatabase : IDisposable
 
     public bool DropCollection(string name) => Write(tx => tx.DropCollection(name));
 
-    /// <summary>Copies the WAL into the main file. Returns false if readers are currently active.</summary>
+    /// <summary>Copies the WAL into the main file. Returns false if readers are active or writer admission times out.</summary>
     public bool Checkpoint()
     {
         ThrowIfDisposed();
         if (!_writeLock.Wait(_options.BusyTimeout)) return false;
         try
         {
+            ThrowIfDisposed();
             return _pager.TryCheckpoint();
         }
         finally
@@ -160,7 +164,14 @@ public sealed class FolioDatabase : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        if (!_writeLock.Wait(_options.BusyTimeout))
+        bool acquired;
+        try { acquired = _writeLock.Wait(_options.BusyTimeout); }
+        catch
+        {
+            Volatile.Write(ref _disposed, 0);
+            throw;
+        }
+        if (!acquired)
         {
             Volatile.Write(ref _disposed, 0);
             throw new FolioException("database is busy: cannot close while a write transaction is active.");

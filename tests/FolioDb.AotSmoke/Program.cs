@@ -45,10 +45,18 @@ static void Check(bool condition, string what)
 static void Run(string path)
 {
     var sw = Stopwatch.StartNew();
-    using (var db = FolioDatabase.Open(path))
+    using (var db = FolioDatabase.Open(path, new FolioOptions { WriterAdmission = WriterAdmissionMode.Fifo }))
     {
         // Untyped API with JSON filters.
         var users = db.GetCollection("users");
+        var concurrent = db.GetCollection("fifo");
+        concurrent.Insert("{_id:1,n:0}");
+        Task.WaitAll(Enumerable.Range(0, 4).Select(_ => Task.Factory.StartNew(() =>
+        {
+            for (int i = 0; i < 20; i++) concurrent.UpdateOne("{_id:1}", "{$inc:{n:1}}");
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray());
+        Check(concurrent.FindById(1)!["n"].AsInt32 == 80, "FIFO concurrent updates");
+        concurrent.Drop();
         users.CreateIndex("email", unique: true);
         users.CreateIndex("age");
         for (int i = 0; i < 2000; i++)

@@ -11,6 +11,15 @@ public enum SynchronousMode
     Off,
 }
 
+/// <summary>Admission policy for writers, explicit checkpoints and database disposal.</summary>
+public enum WriterAdmissionMode
+{
+    /// <summary>Existing semaphore-based admission; ordering is not guaranteed.</summary>
+    Default,
+    /// <summary>Admit queued callers in FIFO order. May trade throughput for more even progress.</summary>
+    Fifo,
+}
+
 public sealed class FolioOptions
 {
     /// <summary>Page size for new databases (power of two, 1024..32768). Existing databases keep their page size.</summary>
@@ -24,7 +33,10 @@ public sealed class FolioOptions
 
     public SynchronousMode Synchronous { get; init; } = SynchronousMode.Full;
 
-    /// <summary>How long a writer waits for the write lock before failing with "database is busy".</summary>
+    /// <summary>Writer admission order. Default preserves semaphore behavior; FIFO is opt-in.</summary>
+    public WriterAdmissionMode WriterAdmission { get; init; } = WriterAdmissionMode.Default;
+
+    /// <summary>Admission timeout shared by writers, checkpoints and disposal. Zero tries immediately; -1 ms waits indefinitely.</summary>
     public TimeSpan BusyTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
     internal void Validate()
@@ -33,5 +45,9 @@ public sealed class FolioOptions
             throw new ArgumentOutOfRangeException(nameof(PageSize), "Page size must be a power of two between 1024 and 32768.");
         if (CacheSizePages < 16) throw new ArgumentOutOfRangeException(nameof(CacheSizePages), "Cache must hold at least 16 pages.");
         if (AutoCheckpointFrames < 0) throw new ArgumentOutOfRangeException(nameof(AutoCheckpointFrames));
+        if (WriterAdmission is not (WriterAdmissionMode.Default or WriterAdmissionMode.Fifo))
+            throw new ArgumentOutOfRangeException(nameof(WriterAdmission));
+        if (BusyTimeout != Timeout.InfiniteTimeSpan && (BusyTimeout < TimeSpan.Zero || BusyTimeout.TotalMilliseconds > int.MaxValue))
+            throw new ArgumentOutOfRangeException(nameof(BusyTimeout));
     }
 }
