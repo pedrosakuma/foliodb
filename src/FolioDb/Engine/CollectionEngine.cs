@@ -461,17 +461,52 @@ internal sealed class SortSpec
 }
 
 /// <summary>Field projection: inclusion ({a: 1, "b.c": 1}) or exclusion ({a: 0}); _id is included unless excluded.</summary>
+/// <summary>
+/// Field projection applied directly to serialized documents. Paths follow the same rules as filters and updates:
+/// on a document a segment is a field name; on an array a numeric segment selects that element (positional) and any
+/// other segment applies to every element. Inclusion keeps the first occurrence of each field, emits <c>_id</c> first,
+/// keeps matched sub-documents (possibly empty) and drops array elements that are not documents/arrays; exclusion
+/// copies everything else unchanged. Ambiguous specifications are rejected: a path and one of its prefixes
+/// (<c>{ a: 1, 'a.b': 1 }</c>), or positional and field segments under the same parent (<c>{ 'a.0': 1, 'a.b': 1 }</c>).
+/// </summary>
 internal sealed class Projection
 {
+    private sealed class Node
+    {
+        public readonly List<(string Name, byte[] Utf8, int Position, Node Child)> Children = [];
+        public bool Positional;
+        public bool IsLeaf => Children.Count == 0;
+
+        public int Find(ReadOnlySpan<byte> utf8)
+        {
+            for (int i = 0; i < Children.Count; i++)
+                if (utf8.SequenceEqual(Children[i].Utf8)) return i;
+            return -1;
+        }
+
+        public int FindPosition(int position)
+        {
+            for (int i = 0; i < Children.Count; i++)
+                if (Children[i].Position == position) return i;
+            return -1;
+        }
+    }
+
+    private static readonly UTF8Encoding s_strictUtf8 = new(false, true);
+
+    private readonly Node _root;
     private readonly List<string> _paths;
     private readonly bool _include;
     private readonly bool _includeId;
+    private readonly bool _idInTree; // a sub-path of _id ('_id.x') was given: the tree decides what of _id is kept
 
-    private Projection(List<string> paths, bool include, bool includeId)
+    private Projection(Node root, List<string> paths, bool include, bool includeId, bool idInTree)
     {
+        _root = root;
         _paths = paths;
         _include = include;
         _includeId = includeId;
+        _idInTree = idInTree;
     }
 
     public static Projection? Parse(Document? spec)
@@ -480,6 +515,7 @@ internal sealed class Projection
         bool? include = null;
         bool includeId = true, idSpecified = false;
         var paths = new List<string>();
+        var root = new Node();
         foreach (var (k, v) in spec)
         {
             bool on = v.Type == DocType.Boolean ? v.AsBoolean : v.IsNumber && v.AsDouble != 0;
@@ -491,49 +527,166 @@ internal sealed class Projection
             }
             if (include is null) include = on;
             else if (include != on) throw new FolioException("Projection cannot mix inclusion and exclusion (except for _id).");
+            AddPath(root, k);
             paths.Add(k);
         }
+        bool idInTree = root.Find("_id"u8) >= 0;
+        if (idInTree && idSpecified) throw new FolioException("Projection path collision at '_id'.");
+        foreach (var c in root.Children) Validate(c.Child, c.Name); // the root is always a document: no positions
         // { _id: 1 } alone is an inclusion of _id only; { _id: 0 } alone excludes it.
-        return new Projection(paths, include ?? (idSpecified && includeId), includeId);
+        return new Projection(root, paths, include ?? (idSpecified && includeId), includeId, idInTree);
+    }
+
+    private static void AddPath(Node root, string path)
+    {
+        var segments = path.Split('.');
+        if (segments.Length > DocumentSerializer.MaxDepth) throw new FolioException($"Projection path '{path}' is too deep.");
+        var node = root;
+        for (int i = 0; i < segments.Length; i++)
+        {
+            string seg = segments[i];
+            if (seg.Length == 0 || seg[0] == '$') throw new FolioException($"Invalid projection path '{path}'.");
+            byte[] utf8;
+            try { utf8 = s_strictUtf8.GetBytes(seg); }
+            catch (ArgumentException) { throw new FolioException($"Invalid projection path '{path}'."); }
+            int ci = node.Find(utf8);
+            bool last = i == segments.Length - 1;
+            if (ci >= 0 && (last || node.Children[ci].Child.IsLeaf))
+                throw new FolioException($"Projection path collision at '{string.Join('.', segments[..(i + 1)])}'.");
+            if (ci < 0)
+            {
+                int position = int.TryParse(seg, out int p) && p >= 0 ? p : -1;
+                // Below the root a segment may address an array, where '1' and '01' are the same position.
+                if (position >= 0 && node != root && node.FindPosition(position) >= 0)
+                    throw new FolioException($"Projection path collision at '{string.Join('.', segments[..(i + 1)])}'.");
+                node.Children.Add((seg, utf8, position, new Node()));
+                ci = node.Children.Count - 1;
+            }
+            node = node.Children[ci].Child;
+        }
+    }
+
+    private static void Validate(Node node, string prefix)
+    {
+        if (node.IsLeaf) return;
+        int positional = node.Children.Count(c => c.Position >= 0);
+        if (positional > 0 && positional < node.Children.Count)
+            throw new FolioException($"Ambiguous projection under '{prefix}': cannot mix array positions and field names.");
+        node.Positional = positional > 0;
+        foreach (var c in node.Children) Validate(c.Child, prefix.Length == 0 ? c.Name : prefix + "." + c.Name);
     }
 
     public bool IsInclusion => _include;
-    public bool IncludesId => _includeId;
+    public bool IncludesId => _includeId && !_idInTree;
     public bool HasPaths => _paths.Count > 0;
 
     /// <summary>True when every included path is <paramref name="field"/> (so the result can be built from its index key).</summary>
-    public bool OnlyIncludes(string field) => _include && _paths.TrueForAll(p => p == field);
+    public bool OnlyIncludes(string field) => _include && !_idInTree && _paths.TrueForAll(p => p == field);
 
     /// <summary>Projects straight from the serialized document, materializing only the selected values.</summary>
     public Document Apply(RawDocument raw)
     {
-        if (!_include)
-        {
-            var doc = raw.ToDocument();
-            foreach (var p in _paths) doc.RemovePath(p);
-            if (!_includeId) doc.Remove("_id");
-            return doc;
-        }
         var result = new Document();
-        if (_includeId && raw.TryGetField("_id"u8, out var id)) result.Set("_id", id.ToDocValue());
-        foreach (var p in _paths)
-            if (raw.TryGetPath(p, out var v)) result.SetPath(p, v.ToDocValue());
+        if (_include)
+        {
+            if (_includeId && !_idInTree && raw.TryGetField("_id"u8, out var id)) result.AddUnchecked("_id", id.ToDocValue());
+            IncludeFields(raw, _root, result, top: !_idInTree);
+        }
+        else ExcludeFields(raw, _root, result, dropId: !_includeId);
         return result;
     }
 
-    public Document Apply(Document doc)
+    private static void IncludeFields(RawDocument doc, Node node, Document into, bool top)
     {
-        if (_include)
+        int n = node.Children.Count;
+        Span<bool> seen = n <= 64 ? stackalloc bool[64] : new bool[n];
+        foreach (var f in doc)
         {
-            var result = new Document();
-            if (_includeId && doc.TryGetValue("_id", out var id)) result.Set("_id", id);
-            foreach (var p in _paths)
-                if (doc.TryGetPath(p, out var v)) result.SetPath(p, v);
-            return result;
+            if (top && f.Name.SequenceEqual("_id"u8)) continue;
+            int ci = node.Find(f.Name);
+            if (ci < 0 || seen[ci]) continue; // first occurrence only, as filters and indexes see it
+            seen[ci] = true;
+            var (name, _, _, child) = node.Children[ci];
+            if (child.IsLeaf) into.AddUnchecked(name, f.Value.ToDocValue());
+            else if (TryInclude(f.Value, child, out var v)) into.AddUnchecked(name, v);
         }
-        var clone = doc.Clone();
-        foreach (var p in _paths) clone.RemovePath(p);
-        if (!_includeId) clone.Remove("_id");
-        return clone;
+    }
+
+    private static bool TryInclude(RawValue v, Node node, out DocValue result)
+    {
+        switch (v.Type)
+        {
+            case DocType.Document:
+            {
+                var d = new Document();
+                IncludeFields(v.AsDocument, node, d, top: false);
+                result = d;
+                return true;
+            }
+            case DocType.Array:
+            {
+                var arr = new DocArray();
+                int i = 0;
+                foreach (var item in v.AsArray)
+                {
+                    if (node.Positional)
+                    {
+                        int ci = node.FindPosition(i++);
+                        if (ci < 0) continue;
+                        var child = node.Children[ci].Child;
+                        if (child.IsLeaf) arr.Add(item.ToDocValue());
+                        else if (TryInclude(item, child, out var x)) arr.Add(x);
+                    }
+                    else if (item.Type is DocType.Document or DocType.Array && TryInclude(item, node, out var x)) arr.Add(x);
+                }
+                result = arr;
+                return true;
+            }
+            default:
+                result = default;
+                return false;
+        }
+    }
+
+    private static void ExcludeFields(RawDocument doc, Node node, Document into, bool dropId)
+    {
+        foreach (var f in doc)
+        {
+            if (dropId && f.Name.SequenceEqual("_id"u8)) continue;
+            int ci = node.Find(f.Name);
+            if (ci < 0) into.AddUnchecked(Encoding.UTF8.GetString(f.Name), f.Value.ToDocValue());
+            else if (!node.Children[ci].Child.IsLeaf) into.AddUnchecked(node.Children[ci].Name, Exclude(f.Value, node.Children[ci].Child));
+        }
+    }
+
+    private static DocValue Exclude(RawValue v, Node node)
+    {
+        switch (v.Type)
+        {
+            case DocType.Document:
+            {
+                var d = new Document();
+                ExcludeFields(v.AsDocument, node, d, dropId: false);
+                return d;
+            }
+            case DocType.Array:
+            {
+                var arr = new DocArray();
+                int i = 0;
+                foreach (var item in v.AsArray)
+                {
+                    if (node.Positional)
+                    {
+                        int ci = node.FindPosition(i++);
+                        if (ci < 0) arr.Add(item.ToDocValue());
+                        else if (!node.Children[ci].Child.IsLeaf) arr.Add(Exclude(item, node.Children[ci].Child));
+                    }
+                    else arr.Add(item.Type is DocType.Document or DocType.Array ? Exclude(item, node) : item.ToDocValue());
+                }
+                return arr;
+            }
+            default:
+                return v.ToDocValue();
+        }
     }
 }

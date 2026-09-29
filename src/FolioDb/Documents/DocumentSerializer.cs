@@ -226,45 +226,6 @@ internal readonly ref struct RawDocument
         return false;
     }
 
-    private static readonly UTF8Encoding s_strictUtf8 = new(false, true);
-
-    /// <summary>Resolves a dotted path with the same rules as <see cref="Document.TryGetPath"/> (first field occurrence, numeric array indexes).</summary>
-    public bool TryGetPath(string path, out RawValue value)
-    {
-        value = new RawValue(DocType.Document, Data);
-        Span<byte> name = stackalloc byte[DocumentSerializer.MaxNameBytes];
-        foreach (var segment in path.Split('.'))
-        {
-            if (value.Type == DocType.Document)
-            {
-                int n;
-                try
-                {
-                    if (s_strictUtf8.GetByteCount(segment) > name.Length) return false;
-                    n = s_strictUtf8.GetBytes(segment, name);
-                }
-                catch (ArgumentException) { return false; }
-                if (!value.AsDocument.TryGetField(name[..n], out value)) return false;
-            }
-            else if (value.Type == DocType.Array && int.TryParse(segment, out int idx) && idx >= 0)
-            {
-                bool found = false;
-                foreach (var item in value.AsArray)
-                {
-                    if (idx-- == 0)
-                    {
-                        value = item;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
-            }
-            else return false;
-        }
-        return true;
-    }
-
     public Document ToDocument()
     {
         var doc = new Document();

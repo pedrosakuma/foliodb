@@ -21,6 +21,11 @@ no reflection — typed mapping is done by a source generator).
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
   **Covered queries**: counts and index-field/`_id` projections are answered from index keys alone when the index is exact
   (not multikey, single predicate or same-field range); projections are otherwise applied on raw bytes.
+  **Nested projection** uses the same path rules as filters and `$set`, with no ambiguity: on a document a segment is a
+  field name; on an array a numeric segment is a position (`{'tags.0': 1}` → `tags: ['x']`) and any other segment
+  applies to every element (`{'itens.nome': 1}` → `itens: [{nome: 'a'}, {nome: 'b'}]`). Arrays stay arrays. Specs that
+  would be ambiguous are rejected: a path together with its prefix (`{end: 1, 'end.cep': 1}`) or positions mixed with
+  field names under the same parent (`{'itens.0': 1, 'itens.nome': 1}`).
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Source generator** for typed POCOs/records (`[FolioDocument]`), with compile-time diagnostics.
 - **`folio` CLI shell** (like `sqlite3`): REPL, scripts, `.dump`/`.import`/`.export`, `.integrity`, `.timer`.
