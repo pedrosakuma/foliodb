@@ -197,10 +197,14 @@ Read path (`ReadPathBenchmarks`; 10k docs, indexes on `city` and `age`; 100 hits
 | `count({city})` | 126 µs | **4.2 µs** |
 | `count({age: {$gte, $lt}})` | 1,035 µs | **27 µs** |
 | `find({city}, {city: 1, _id: 0})` | 422 µs | **26 µs** |
-| `find({city}, {_id: 1})` (numeric `_id` → fetch + raw projection) | 318 µs | 163 µs |
+| `find({city}, {_id: 1})` (numeric `_id`) | 318 µs | **14 µs** |
+| `find({city})` (full documents) | 160 µs | 121 µs |
 
-Numeric keys share one encoding across `int32`/`int64`/`double`/`decimal`, so a covered projection of a numeric field falls
-back to reading the document to preserve the stored type; strings, `ObjectId`, dates, booleans and binaries decode exactly.
+Numeric keys share one encoding across `int32`/`int64`/`double`/`decimal` (and normalize `-0.0` and decimal scale), so each
+secondary index entry stores a small type hint for its value and `_id`, like MongoDB's KeyString TypeBits: 1 byte for
+integers, the raw 8/16-byte payload for doubles/decimals. Covered projections rebuild the exact stored types from it;
+entries without hints (written by older versions) fall back to reading the document. Documents fetched through an index
+reuse a B+Tree cursor path instead of descending from the root for every lookup.
 
 ## Limitations
 

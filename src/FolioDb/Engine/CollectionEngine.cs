@@ -12,25 +12,26 @@ internal static class CollectionEngine
     // ------------------------------------------------------------------ index key extraction
 
     /// <summary>Distinct encoded index values for <paramref name="field"/> (arrays expand to their elements). Missing fields produce no keys.</summary>
-    internal static List<byte[]> ExtractIndexKeys(ReadOnlySpan<byte> doc, string field, out bool multiKey)
+    /// <remarks>Each key carries the <see cref="IndexHint"/> of its value; for duplicates the first occurrence wins.</remarks>
+    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, string field, out bool multiKey)
     {
         var segments = field.Split('.').Select(Encoding.UTF8.GetBytes).ToArray();
-        var keys = new List<byte[]>(1);
+        var keys = new List<IndexKey>(1);
         multiKey = false;
         using var buf = new ByteBuffer(64);
         Collect(new RawValue(DocType.Document, new RawDocument(doc).Data), segments, 0, keys, buf, ref multiKey);
         if (keys.Count > 1)
         {
-            keys.Sort(ByteArrayComparer.Instance);
-            int w = 1;
-            for (int r = 1; r < keys.Count; r++)
-                if (!keys[r].AsSpan().SequenceEqual(keys[w - 1])) keys[w++] = keys[r];
-            keys.RemoveRange(w, keys.Count - w);
+            // Stable sort keeps the first occurrence of equal keys first.
+            var sorted = keys.Select((k, i) => (k, i)).OrderBy(x => x.k.Key, ByteArrayComparer.Instance).ThenBy(x => x.i).Select(x => x.k).ToList();
+            keys.Clear();
+            foreach (var k in sorted)
+                if (keys.Count == 0 || !k.Key.AsSpan().SequenceEqual(keys[^1].Key)) keys.Add(k);
         }
         return keys;
     }
 
-    private static void Collect(RawValue v, byte[][] segments, int seg, List<byte[]> keys, ByteBuffer buf, ref bool multiKey)
+    private static void Collect(RawValue v, byte[][] segments, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
     {
         if (seg == segments.Length)
         {
@@ -41,11 +42,11 @@ internal static class CollectionEngine
                 foreach (var item in v.AsArray)
                 {
                     any = true;
-                    keys.Add(Encode(buf, item));
+                    keys.Add(new(Encode(buf, item), IndexHint.For(item)));
                 }
-                if (!any) keys.Add(Encode(buf, v)); // empty array is indexed as []
+                if (!any) keys.Add(new(Encode(buf, v), IndexHint.For(v))); // empty array is indexed as []
             }
-            else keys.Add(Encode(buf, v));
+            else keys.Add(new(Encode(buf, v), IndexHint.For(v)));
             return;
         }
         if (v.Type == DocType.Document)
@@ -113,11 +114,11 @@ internal static class CollectionEngine
             throw new DuplicateKeyException($"Duplicate key in collection '{meta.Name}': _id {DocJson.WriteValue(id)}.");
 
         // Validate every index before mutating anything, so a failed insert leaves the transaction untouched.
-        var perIndex = new List<(IndexMeta Index, List<byte[]> Keys, bool Multi)>(meta.Indexes.Count);
+        var perIndex = new List<(IndexMeta Index, List<IndexKey> Keys, bool Multi)>(meta.Indexes.Count);
         foreach (var index in meta.Indexes)
         {
             var keys = ExtractIndexKeys(bytes, index.Field, out bool multi);
-            foreach (var k in keys)
+            foreach (var (k, _) in keys)
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
@@ -127,11 +128,12 @@ internal static class CollectionEngine
         }
 
         primary.Insert(idKey, bytes, overwrite: false);
+        var idHint = perIndex.Count > 0 ? IndexHint.ForId(bytes) : [];
         bool metaChanged = false;
         foreach (var (index, keys, multi) in perIndex)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var k in keys) tree.Insert(Concat(k, idKey), [], overwrite: true);
+            foreach (var (k, hint) in keys) tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
             if (multi && !index.MultiKey)
             {
                 index.MultiKey = true;
@@ -147,7 +149,7 @@ internal static class CollectionEngine
         foreach (var index in meta.Indexes)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var k in ExtractIndexKeys(docBytes, index.Field, out _)) tree.Delete(Concat(k, idKey));
+            foreach (var (k, _) in ExtractIndexKeys(docBytes, index.Field, out _)) tree.Delete(Concat(k, idKey));
         }
         new BTree(tx.Storage, meta.PrimaryRoot).Delete(idKey);
     }
@@ -162,29 +164,38 @@ internal static class CollectionEngine
         if (newBytes.AsSpan().SequenceEqual(oldBytes)) return false;
         if (newBytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
 
-        var changes = new List<(IndexMeta Index, List<byte[]> Removed, List<byte[]> Added, bool Multi)>();
+        var changes = new List<(IndexMeta Index, List<byte[]> Removed, List<IndexKey> Written, bool Multi)>();
+        byte[] idHint = [];
+        bool idHintChanged = false;
+        if (meta.Indexes.Count > 0)
+        {
+            idHint = IndexHint.ForId(newBytes);
+            idHintChanged = !idHint.AsSpan().SequenceEqual(IndexHint.ForId(oldBytes));
+        }
         foreach (var index in meta.Indexes)
         {
-            if (SameField(oldBytes, newBytes, index.TopLevelField)) continue;
+            if (!idHintChanged && SameField(oldBytes, newBytes, index.TopLevelField)) continue;
             var oldKeys = ExtractIndexKeys(oldBytes, index.Field, out _);
             var newKeys = ExtractIndexKeys(newBytes, index.Field, out bool multi);
-            var removed = oldKeys.Where(k => !newKeys.Contains(k, ByteArrayComparer.Instance)).ToList();
-            var added = newKeys.Where(k => !oldKeys.Contains(k, ByteArrayComparer.Instance)).ToList();
-            foreach (var k in added)
+            var removed = oldKeys.Where(o => !newKeys.Exists(n => n.Key.AsSpan().SequenceEqual(o.Key))).Select(o => o.Key).ToList();
+            var added = newKeys.Where(n => !oldKeys.Exists(o => o.Key.AsSpan().SequenceEqual(n.Key))).ToList();
+            // Same key but a different type (5 -> 5L) or _id type: the entry is rewritten with the new hint.
+            var rehinted = newKeys.Where(n => oldKeys.Exists(o => o.Key.AsSpan().SequenceEqual(n.Key) && (idHintChanged || !o.Hint.AsSpan().SequenceEqual(n.Hint)))).ToList();
+            foreach (var (k, _) in added)
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
                     throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {DocJson.WriteValue(KeyEncoder.Decode(k, out _))}.");
             }
-            changes.Add((index, removed, added, multi));
+            changes.Add((index, removed, [.. added, .. rehinted], multi));
         }
 
         bool metaChanged = false;
-        foreach (var (index, removed, added, multi) in changes)
+        foreach (var (index, removed, written, multi) in changes)
         {
             var tree = new BTree(tx.Storage, index.Root);
             foreach (var k in removed) tree.Delete(Concat(k, idKey));
-            foreach (var k in added) tree.Insert(Concat(k, idKey), [], overwrite: true);
+            foreach (var (k, hint) in written) tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
             if (multi && !index.MultiKey)
             {
                 index.MultiKey = true;
@@ -235,7 +246,7 @@ internal static class CollectionEngine
         var plan = QueryPlanner.Plan(meta, filter);
         if (plan.Covered)
         {
-            QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (_, _) =>
+            QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (_, _, _) =>
             {
                 n++;
                 return true;
@@ -308,32 +319,35 @@ internal static class CollectionEngine
     /// </summary>
     private static void FindCovered(EngineTx tx, CollectionMeta meta, QueryPlan plan, Projection projection, int skip, int limit, List<Document> result)
     {
-        var primary = new BTree(tx.Storage, meta.PrimaryRoot);
+        var fetch = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
         string field = plan.KeyField;
         bool includeField = field != "_id" && projection.HasPaths;
         bool includeId = projection.IncludesId;
         int skipped = 0;
-        QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (idKey, valueKey) =>
+        QueryPlanner.ExecuteKeys(tx.Storage, meta, plan, (idKey, valueKey, hints) =>
         {
             if (skipped < skip)
             {
                 skipped++;
                 return true;
             }
-            if ((includeId && !KeyEncoder.DecodesExactly(idKey)) || (includeField && !KeyEncoder.DecodesExactly(valueKey)))
+            ReadOnlySpan<byte> idHint = default, valueHint = default;
+            if (!hints.IsEmpty && !IndexHint.TrySplit(hints, out idHint, out valueHint)) idHint = valueHint = [IndexHint.Unknown];
+            DocValue id = default, value = default;
+            if ((includeId && !IndexHint.TryDecode(idKey, idHint, out id)) || (includeField && !IndexHint.TryDecode(valueKey, valueHint, out value)))
             {
-                if (!primary.TryGet(idKey, out var bytes)) throw new CorruptDatabaseException("Index references a missing document.");
-                result.Add(projection.Apply(new RawDocument(bytes)));
+                if (!fetch.SeekExact(idKey)) throw new CorruptDatabaseException("Index references a missing document.");
+                result.Add(projection.Apply(new RawDocument(fetch.Value)));
             }
             else
             {
                 var doc = new Document();
-                if (includeId) doc.Set("_id", KeyEncoder.Decode(idKey, out _));
-                if (includeField) doc.SetPath(field, KeyEncoder.Decode(valueKey, out _));
+                if (includeId) doc.Set("_id", id);
+                if (includeField) doc.SetPath(field, value);
                 result.Add(doc);
             }
             return result.Count < limit;
-        });
+        }, withHints: includeId || includeField);
     }
 
     // ------------------------------------------------------------------ indexes
@@ -358,12 +372,14 @@ internal static class CollectionEngine
         for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
         {
             var idKey = cur.Key.ToArray();
-            foreach (var k in ExtractIndexKeys(cur.Value, field, out bool multi))
+            var docBytes = cur.Value;
+            var idHint = IndexHint.ForId(docBytes);
+            foreach (var (k, hint) in ExtractIndexKeys(docBytes, field, out bool multi))
             {
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (unique && ConflictsInUniqueIndex(tree, k, idKey))
                     throw new DuplicateKeyException($"Cannot create unique index on '{field}': duplicate value {DocJson.WriteValue(KeyEncoder.Decode(k, out _))}.");
-                tree.Insert(Concat(k, idKey), [], overwrite: true);
+                tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
                 if (multi) index.MultiKey = true;
             }
         }
@@ -462,7 +478,7 @@ internal sealed class Projection
     {
         if (spec is null || spec.Count == 0) return null;
         bool? include = null;
-        bool includeId = true;
+        bool includeId = true, idSpecified = false;
         var paths = new List<string>();
         foreach (var (k, v) in spec)
         {
@@ -470,13 +486,15 @@ internal sealed class Projection
             if (k == "_id")
             {
                 includeId = on;
+                idSpecified = true;
                 continue;
             }
             if (include is null) include = on;
             else if (include != on) throw new FolioException("Projection cannot mix inclusion and exclusion (except for _id).");
             paths.Add(k);
         }
-        return new Projection(paths, include ?? false, includeId);
+        // { _id: 1 } alone is an inclusion of _id only; { _id: 0 } alone excludes it.
+        return new Projection(paths, include ?? (idSpecified && includeId), includeId);
     }
 
     public bool IsInclusion => _include;

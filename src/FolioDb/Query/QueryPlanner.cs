@@ -47,7 +47,8 @@ internal sealed class QueryPlan
 }
 
 internal delegate bool DocVisitor(ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> document);
-internal delegate bool KeyVisitor(ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> valueKey);
+// hints: index entry value (see Engine.IndexHint); empty for primary plans and legacy entries.
+internal delegate bool KeyVisitor(ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> valueKey, ReadOnlySpan<byte> hints);
 
 internal static class QueryPlanner
 {
@@ -159,9 +160,12 @@ internal static class QueryPlanner
                 return;
             }
             case PlanKind.PrimaryEq:
+            {
+                var seek = primary.CreateCursor();
                 foreach (var key in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
-                    if (primary.TryGet(key, out var doc) && !visitor(key, doc)) return;
+                    if (seek.SeekExact(key) && !visitor(key, seek.Value)) return;
                 return;
+            }
             case PlanKind.PrimaryRange:
             {
                 var cur = primary.CreateCursor();
@@ -179,14 +183,15 @@ internal static class QueryPlanner
                 var index = new BTree(tx, plan.Index!.Root);
                 var seen = plan.Index.MultiKey && plan.Keys!.Count > 1 ? new HashSet<byte[]>(ByteArrayComparer.Instance) : null;
                 var cur = index.CreateCursor();
+                var seek = primary.CreateCursor();
                 foreach (var prefix in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
                 {
                     for (bool ok = cur.Seek(prefix); ok && cur.Key.StartsWith(prefix); ok = cur.MoveNext())
                     {
                         var idKey = cur.Key[prefix.Length..];
                         if (seen is not null && !seen.Add(idKey.ToArray())) continue;
-                        if (!primary.TryGet(idKey, out var doc)) throw new CorruptDatabaseException($"Index {plan.Index.Name} references a missing document.");
-                        if (!visitor(idKey, doc)) return;
+                        if (!seek.SeekExact(idKey)) throw new CorruptDatabaseException($"Index {plan.Index.Name} references a missing document.");
+                        if (!visitor(idKey, seek.Value)) return;
                     }
                 }
                 return;
@@ -196,6 +201,7 @@ internal static class QueryPlanner
                 var index = new BTree(tx, plan.Index!.Root);
                 var seen = plan.Index.MultiKey ? new HashSet<byte[]>(ByteArrayComparer.Instance) : null;
                 var cur = index.CreateCursor();
+                var seek = primary.CreateCursor();
                 for (bool ok = cur.Seek(plan.Lower ?? [plan.TypeTag]); ok; ok = cur.MoveNext())
                 {
                     var entry = cur.Key;
@@ -205,8 +211,8 @@ internal static class QueryPlanner
                     if (state < 0) continue;
                     var idKey = entry[valueLen..];
                     if (seen is not null && !seen.Add(idKey.ToArray())) continue;
-                    if (!primary.TryGet(idKey, out var doc)) throw new CorruptDatabaseException($"Index {plan.Index.Name} references a missing document.");
-                    if (!visitor(idKey, doc)) return;
+                    if (!seek.SeekExact(idKey)) throw new CorruptDatabaseException($"Index {plan.Index.Name} references a missing document.");
+                    if (!visitor(idKey, seek.Value)) return;
                 }
                 return;
             }
@@ -217,7 +223,7 @@ internal static class QueryPlanner
     /// Streams (idKey, scan key) pairs of a <see cref="QueryPlan.Covered"/> plan without reading documents.
     /// For primary plans the scan key is the id key itself. Visitor returns false to stop.
     /// </summary>
-    public static void ExecuteKeys(StorageTx tx, CollectionMeta meta, QueryPlan plan, KeyVisitor visitor)
+    public static void ExecuteKeys(StorageTx tx, CollectionMeta meta, QueryPlan plan, KeyVisitor visitor, bool withHints = false)
     {
         if (!plan.Covered) throw new InvalidOperationException("Plan is not covered.");
         var primary = new BTree(tx, meta.PrimaryRoot);
@@ -227,12 +233,12 @@ internal static class QueryPlanner
             {
                 var cur = primary.CreateCursor();
                 for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
-                    if (!visitor(cur.Key, cur.Key)) return;
+                    if (!visitor(cur.Key, cur.Key, default)) return;
                 return;
             }
             case PlanKind.PrimaryEq:
                 foreach (var key in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
-                    if (primary.ContainsKey(key) && !visitor(key, key)) return;
+                    if (primary.ContainsKey(key) && !visitor(key, key, default)) return;
                 return;
             case PlanKind.PrimaryRange:
             {
@@ -242,7 +248,7 @@ internal static class QueryPlanner
                     var key = cur.Key;
                     int state = RangeState(plan, key);
                     if (state > 0) return;
-                    if (state == 0 && !visitor(key, key)) return;
+                    if (state == 0 && !visitor(key, key, default)) return;
                 }
                 return;
             }
@@ -251,7 +257,7 @@ internal static class QueryPlanner
                 var cur = new BTree(tx, plan.Index!.Root).CreateCursor();
                 foreach (var prefix in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
                     for (bool ok = cur.Seek(prefix); ok && cur.Key.StartsWith(prefix); ok = cur.MoveNext())
-                        if (!visitor(cur.Key[prefix.Length..], prefix)) return;
+                        if (!visitor(cur.Key[prefix.Length..], prefix, withHints ? cur.Value : default)) return;
                 return;
             }
             case PlanKind.IndexRange:
@@ -263,7 +269,7 @@ internal static class QueryPlanner
                     int valueLen = KeyEncoder.EncodedLength(entry);
                     int state = RangeState(plan, entry[..valueLen]);
                     if (state > 0) return;
-                    if (state == 0 && !visitor(entry[valueLen..], entry[..valueLen])) return;
+                    if (state == 0 && !visitor(entry[valueLen..], entry[..valueLen], withHints ? cur.Value : default)) return;
                 }
                 return;
             }

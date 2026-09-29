@@ -15,7 +15,14 @@ public sealed class CoveredQueryTests : IDisposable
         var docs = new List<Document>();
         for (int i = 0; i < 300; i++)
         {
-            DocValue num = (i % 4) switch { 0 => i % 17, 1 => (long)(i % 17), 2 => (double)(i % 17), _ => (decimal)(i % 17) };
+            // Same numeric values in every type, decimals with a non-zero scale (5.0m) and -0.0: only type hints rebuild them.
+            DocValue num = (i % 4) switch
+            {
+                0 => i % 17,
+                1 => (long)(i % 17),
+                2 => i % 17 == 0 ? -0.0 : (double)(i % 17),
+                _ => decimal.Parse($"{i % 17}.0", System.Globalization.CultureInfo.InvariantCulture),
+            };
             docs.Add(new Document
             {
                 ["_id"] = i,
@@ -100,6 +107,85 @@ public sealed class CoveredQueryTests : IDisposable
         var docs = _idx.Find("{ num: 4 }", new FindOptions { Projection = Document.Parse("{ num: 1, _id: 0 }") });
         Assert.Contains(docs, d => d["num"].Type == DocType.Int64);
         Assert.Contains(docs, d => d["num"].Type == DocType.Decimal);
+    }
+
+    [Fact]
+    public void IdOnlyProjectionFollowsMongoSemantics()
+    {
+        var only = _idx.Find("{ city: 'c1' }", new FindOptions { Projection = Document.Parse("{ _id: 1 }") });
+        Assert.All(only, d => Assert.Equal(["_id"], d.Select(f => f.Key)));
+        var without = _idx.Find("{ city: 'c1' }", new FindOptions { Projection = Document.Parse("{ _id: 0 }") });
+        Assert.All(without, d => Assert.False(d.ContainsKey("_id")));
+        Assert.All(without, d => Assert.True(d.ContainsKey("city")));
+    }
+
+    [Fact]
+    public void CoveredProjectionRebuildsExactTypesFromHints()
+    {
+        foreach (var n in new[] { 0, 4, 5 })
+        {
+            var proj = new FindOptions { Projection = Document.Parse("{ num: 1 }") };
+            string f = $"{{ num: {n} }}";
+            Assert.Equal(Bytes(_raw.Find(f, proj).OrderBy(d => d["_id"].AsInt32)), Bytes(_idx.Find(f, proj).OrderBy(d => d["_id"].AsInt32)));
+        }
+        var zeros = _idx.Find("{ num: 0 }", new FindOptions { Projection = Document.Parse("{ num: 1, _id: 0 }") });
+        Assert.Contains(zeros, d => d["num"].Type == DocType.Double && double.IsNegative(d["num"].AsDouble));
+        var dec = _idx.Find("{ num: 4 }", new FindOptions { Projection = Document.Parse("{ num: 1, _id: 0 }") });
+        Assert.Contains(dec, d => d["num"].Type == DocType.Decimal && d["num"].AsDecimal.Scale == 1);
+    }
+
+    [Fact]
+    public void MixedNumericIdsAreRebuiltExactly()
+    {
+        var a = _db.GetCollection("ids");
+        var b = _db.GetCollection("ids_raw");
+        DocValue[] ids = [1, 2L, 3.5, -0.0, 4.50m, long.MaxValue, "s", ObjectId.NewObjectId()];
+        foreach (var id in ids)
+        {
+            a.Insert(new Document { ["_id"] = id, ["k"] = "x" });
+            b.Insert(new Document { ["_id"] = id, ["k"] = "x" });
+        }
+        a.CreateIndex("k");
+        a.Insert(new Document { ["_id"] = 7L, ["k"] = "x" }); // inserted after index creation
+        b.Insert(new Document { ["_id"] = 7L, ["k"] = "x" });
+        Assert.Contains("covered", a.Explain("{ k: 'x' }"));
+        var o = new FindOptions { Projection = Document.Parse("{ _id: 1 }") };
+        Assert.Equal(Bytes(b.Find("{ k: 'x' }", o)), Bytes(a.Find("{ k: 'x' }", o)));
+        _db.CheckIntegrity();
+    }
+
+    [Fact]
+    public void TypeChangeWithSameValueRefreshesHints()
+    {
+        _idx.UpdateMany("{ num: 5 }", "{ $set: { num: NumberLong(5) } }");  // same key, new type (in-place patch for int64/double)
+        _raw.UpdateMany("{ num: 5 }", "{ $set: { num: NumberLong(5) } }");
+        _idx.UpdateMany("{ num: 6 }", "{ $set: { num: NumberDecimal('6.000') } }");
+        _raw.UpdateMany("{ num: 6 }", "{ $set: { num: NumberDecimal('6.000') } }");
+        _idx.ReplaceOne(Document.Parse("{ _id: 10 }"), Document.Parse("{ _id: NumberLong(10), city: 'c3', num: 1 }"));
+        _raw.ReplaceOne(Document.Parse("{ _id: 10 }"), Document.Parse("{ _id: NumberLong(10), city: 'c3', num: 1 }"));
+        _db.CheckIntegrity(); // verifies every entry's hint
+        foreach (var (f, p) in new[] { ("{ num: 5 }", "{ num: 1 }"), ("{ num: 6 }", "{ num: 1, _id: 0 }"), ("{ city: 'c3' }", "{ _id: 1 }"), ("{ city: 'c3' }", "{ city: 1 }") })
+        {
+            var o = new FindOptions { Projection = Document.Parse(p) };
+            Assert.Equal(_raw.Find(f, o).Select(d => Bytes([d])).Order(), _idx.Find(f, o).Select(d => Bytes([d])).Order());
+        }
+    }
+
+    [Fact]
+    public void LegacyAndMalformedHintsFallBack()
+    {
+        var idKey = KeyEncoder.Encode(5);
+        Assert.False(FolioDb.Engine.IndexHint.TryDecode(idKey, default, out _));           // legacy: numbers are ambiguous
+        Assert.True(FolioDb.Engine.IndexHint.TryDecode(KeyEncoder.Encode("a"), default, out var s));
+        Assert.Equal("a", s.AsString);
+        Assert.False(FolioDb.Engine.IndexHint.TrySplit([], out _, out _));
+        Assert.False(FolioDb.Engine.IndexHint.TrySplit([(byte)DocType.Int32], out _, out _));          // truncated
+        Assert.False(FolioDb.Engine.IndexHint.TrySplit([(byte)DocType.Double, 1, 2], out _, out _));   // short payload
+        Assert.True(FolioDb.Engine.IndexHint.TrySplit([(byte)DocType.Int64, 0], out var ih, out var vh));
+        Assert.True(FolioDb.Engine.IndexHint.TryDecode(idKey, ih, out var id));
+        Assert.Equal(DocType.Int64, id.Type);
+        Assert.False(FolioDb.Engine.IndexHint.TryDecode(idKey, vh, out _));                 // "exact" hint on a numeric key
+        Assert.False(FolioDb.Engine.IndexHint.TryDecode(KeyEncoder.Encode(long.MaxValue), [(byte)DocType.Int32], out _));
     }
 
     [Fact]

@@ -560,7 +560,7 @@ internal readonly struct BTree
     {
         private readonly StorageTx _tx;
         private readonly uint _root;
-        private readonly List<(uint Page, int Index)> _stack = new(8);
+        private readonly List<(uint Page, byte[] Data, int Index)> _stack = new(8);
         private byte[] _leaf = [];
         private int _index;
 
@@ -597,7 +597,46 @@ internal readonly struct BTree
                     return Settle();
                 }
                 int ci = ChildIndex(page, key);
-                _stack.Add((pg, ci));
+                _stack.Add((pg, page, ci));
+                pg = ChildAt(page, ci);
+            }
+        }
+
+        /// <summary>
+        /// Positions exactly at <paramref name="key"/> if present. Consecutive lookups reuse the current leaf and the
+        /// cached interior path, so ascending (or nearby) keys avoid re-reading pages from the root.
+        /// </summary>
+        public bool SeekExact(ReadOnlySpan<byte> key)
+        {
+            bool found;
+            int n = _leaf.Length == 0 ? 0 : Count(_leaf);
+            if (n > 0 && KeyAt(_leaf, 0).SequenceCompareTo(key) <= 0 && KeyAt(_leaf, n - 1).SequenceCompareTo(key) >= 0)
+            {
+                _index = LowerBound(_leaf, key, out found);
+                IsValid = found;
+                return found;
+            }
+            uint pg = _root;
+            for (int level = 0; ; level++)
+            {
+                byte[] page;
+                if (level < _stack.Count && _stack[level].Page == pg) page = _stack[level].Data;
+                else
+                {
+                    if (level < _stack.Count) _stack.RemoveRange(level, _stack.Count - level);
+                    page = _tx.ReadPage(pg);
+                }
+                if (IsLeaf(page))
+                {
+                    if (level < _stack.Count) _stack.RemoveRange(level, _stack.Count - level);
+                    _leaf = page;
+                    _index = LowerBound(page, key, out found);
+                    IsValid = found;
+                    return found;
+                }
+                int ci = ChildIndex(page, key);
+                if (level < _stack.Count) _stack[level] = (pg, page, ci);
+                else _stack.Add((pg, page, ci));
                 pg = ChildAt(page, ci);
             }
         }
@@ -619,7 +658,7 @@ internal readonly struct BTree
                     _leaf = page;
                     return;
                 }
-                _stack.Add((pg, 0));
+                _stack.Add((pg, page, 0));
                 pg = ChildAt(page, 0);
             }
         }
@@ -636,11 +675,10 @@ internal readonly struct BTree
                         IsValid = false;
                         return false;
                     }
-                    var (pg, idx) = _stack[^1];
-                    var parent = _tx.ReadPage(pg);
+                    var (pg, parent, idx) = _stack[^1];
                     if (idx < Count(parent))
                     {
-                        _stack[^1] = (pg, idx + 1);
+                        _stack[^1] = (pg, parent, idx + 1);
                         DescendLeftmost(ChildAt(parent, idx + 1));
                         _index = 0;
                         break;

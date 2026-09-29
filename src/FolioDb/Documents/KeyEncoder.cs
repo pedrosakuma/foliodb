@@ -411,7 +411,6 @@ internal static class KeyEncoder
         }
     }
 
-    /// <summary>Decodes an encoded key back to a value (used for primary keys recovered from index entries).</summary>
     /// <summary>
     /// True when <see cref="Decode"/> returns the stored value with its original type. Numbers are encoded by value
     /// (5, 5L, 5.0 and 5m share a key), so numbers and containers (which may hold numbers) are ambiguous.
@@ -419,6 +418,7 @@ internal static class KeyEncoder
     public static bool DecodesExactly(ReadOnlySpan<byte> key) =>
         key[0] is TagString or TagBinary or TagObjectId or TagBoolean or TagDateTime;
 
+    /// <summary>Decodes an encoded key back to a value (used for primary keys recovered from index entries).</summary>
     public static DocValue Decode(ReadOnlySpan<byte> key, out int consumed)
     {
         byte tag = key[0];

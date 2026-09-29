@@ -124,11 +124,21 @@ public sealed class FolioDatabase : IDisposable
                 long withField = 0;
                 var cur = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
                 long expectedEntries = 0;
+                var entries = new BTree(tx.Storage, index.Root).CreateCursor();
                 for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
                 {
-                    int n = CollectionEngine.ExtractIndexKeys(cur.Value, index.Field, out _).Count;
-                    expectedEntries += n;
-                    if (n > 0) withField++;
+                    var keys = CollectionEngine.ExtractIndexKeys(cur.Value, index.Field, out _);
+                    var idHint = IndexHint.ForId(cur.Value);
+                    foreach (var (k, hint) in keys)
+                    {
+                        if (!entries.SeekExact([.. k, .. cur.Key]))
+                            throw new CorruptDatabaseException($"Index {name}.{index.Name} is missing an entry.");
+                        // Legacy entries carry no hint; otherwise the hint must match the stored types.
+                        if (!entries.Value.IsEmpty && !entries.Value.SequenceEqual(IndexHint.Entry(idHint, hint)))
+                            throw new CorruptDatabaseException($"Index {name}.{index.Name} has a stale type hint.");
+                    }
+                    expectedEntries += keys.Count;
+                    if (keys.Count > 0) withField++;
                 }
                 long actual = new BTree(tx.Storage, index.Root).Verify();
                 if (actual != expectedEntries)

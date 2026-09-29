@@ -61,6 +61,21 @@ public class StorageTests
 
             Assert.True(cur.Seek(Key(2500)));
             Assert.Equal(Key(model.Keys.First(k => k >= 2500)), cur.Key.ToArray());
+
+            // SeekExact reuses the cached path: ascending, descending, repeated and random probes must match the model.
+            var seek = tree.CreateCursor();
+            var probes = Enumerable.Range(-5, 5010).Concat(Enumerable.Range(0, 5000).Reverse())
+                .Concat(Enumerable.Range(0, 5000).Select(_ => rnd.Next(-10, 5010))).Concat([7, 7, 7]);
+            foreach (int k in probes)
+            {
+                bool found = seek.SeekExact(Key(k));
+                Assert.Equal(model.TryGetValue(k, out var expectedValue), found);
+                if (found)
+                {
+                    Assert.Equal(Key(k), seek.Key.ToArray());
+                    Assert.Equal(expectedValue, seek.Value.ToArray());
+                }
+            }
         }
 
         // Deleting everything returns pages to the freelist, and they are reused.
