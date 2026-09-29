@@ -284,6 +284,15 @@ internal sealed class Shell : IDisposable
             throw new FormatException($"'{modifiers[0].Name}' cannot be chained after {call.Name}().");
         switch (call.Name)
         {
+            case "aggregate":
+            {
+                var pipeline = Arg(call, 0);
+                if (pipeline.Type != DocType.Array) throw new FormatException("aggregate expects an array of stage documents.");
+                var stages = pipeline.AsArray.Select(v => v.Type == DocType.Document ? v.AsDocument
+                    : throw new FormatException("Every aggregation stage must be a document."));
+                foreach (var doc in col.Aggregate(stages)) PrintValue(doc);
+                break;
+            }
             case "find":
             {
                 Document? sort = null;
@@ -541,9 +550,10 @@ internal sealed class Shell : IDisposable
           db.<col>.insert({...}) | insertMany([{...}, ...])
           db.<col>.find({filter}, {projection}).sort({f: 1}).skip(n).limit(n) | .count() | .explain()
           db.<col>.findOne({filter}) | count({filter}) | explain({filter})
+          db.<col>.aggregate([{$match: {...}}, {$group: {_id: '$field', n: {$sum: 1}}}])
           db.<col>.updateOne({filter}, {$set: {...}}, {upsert: true}) | updateMany(...) | replaceOne(...)
           db.<col>.deleteOne({filter}) | deleteMany({filter})
-          db.<col>.createIndex({field: 1}, {unique: true}) | dropIndex('field') | getIndexes() | drop()
+          db.<col>.createIndex({field: 1, other: -1}, {unique: true}) | dropIndex({field: 1, other: -1}) | getIndexes() | drop()
           db.getCollection('name').find() | db.getCollectionNames() | db.stats()
           begin | commit | rollback          explicit transaction
         Dot commands:

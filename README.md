@@ -39,6 +39,8 @@ no reflection — typed mapping is done by a source generator).
   are returned as is); `$elemMatch: {...}` on a top-level array keeps only the first matching element (field omitted
   when nothing matches) and implies an inclusion projection.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
+- **Aggregation**: `$match`, `$project`, `$group`, `$sort`, `$skip`, `$limit`, `$count`, `$unwind`; group accumulators
+  `$sum`, `$avg`, `$min`, `$max`, `$count`, `$push`, `$first`, `$last`. A leading `$match` uses the query planner/indexes.
 - **Source generator** for typed POCOs/records (`[FolioDocument]`), with compile-time diagnostics.
 - **`folio` CLI shell** (like `sqlite3`): REPL, scripts, `.dump`/`.import`/`.export`, `.integrity`, `.timer`.
 - Tested: 120+ unit tests including a B+Tree fuzz test against a model, WAL torn-write/corruption tests,
@@ -82,6 +84,40 @@ Writers are serialized by an in-process lock; a writer waiting longer than `Busy
 
 The current file format is version 3. Version 2 databases remain readable and are upgraded on the next header write;
 after that, older binaries reject them. Keep a backup before upgrading if you need to return to an older binary.
+
+### Aggregation
+
+```csharp
+var totals = db.GetCollection("orders").Aggregate("""
+    [
+      {$match: {status: 'paid'}},
+      {$unwind: '$lines'},
+      {$group: {_id: '$lines.sku', quantity: {$sum: '$lines.qty'}, orders: {$count: {}}}},
+      {$sort: {quantity: -1}},
+      {$limit: 10}
+    ]
+    """);
+```
+
+The same pipeline works in `db.orders.aggregate([...])` in the shell. The C# API also accepts
+`IEnumerable<Document>`; typed collections return untyped documents because pipelines change the result shape.
+The whole pipeline runs in one read snapshot (or the caller's transaction/snapshot), without modifying stored rows.
+
+- `$project` uses find-projection rules, including `$slice`/`$elemMatch`; it does **not** compute expressions.
+- Group expressions accept constants, `$field.path` references, object/array expressions, and `{$literal: value}`.
+  Field references resolve document fields and numeric array positions; use `$unwind` before referencing fields of
+  array elements. Missing references become null. Unsupported expression operators/variables are errors.
+- Group keys use the same exact comparisons as indexes (numeric types with equal values share a group); the first
+  encountered key retains its stored type. `$sum`/`$avg` ignore non-numbers; an empty numeric input yields 0/null.
+  Arithmetic shares update promotion rules; integer/decimal overflow is an error. Decimal averages stay decimal,
+  others return double. `$min`/`$max` ignore null/missing and use the database's type order.
+- `$unwind: '$path'` emits one row per element; missing/null/empty arrays emit none, and non-array values emit one.
+  The object/options form of `$unwind` is not supported.
+- `$sort` is stable. Use it before `$first`, `$last` or `$push` when order matters; unsorted scan/group order is not
+  guaranteed. `$skip`/`$limit` accept integers from 0 to `int.MaxValue` (`$limit:0` returns no rows). `$count:'name'`
+  emits an int64 count, or no row for empty input.
+- All stages are validated even on empty collections. Results and intermediate stages are materialized in memory;
+  there is no disk spilling or streaming cursor yet.
 
 ### Typed documents (source generator, AOT-safe)
 
@@ -239,7 +275,7 @@ The compound path avoids fetching 100 candidate documents, at the cost of higher
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
-- No aggregation pipeline or full-text search.
+- No full-text search, aggregation disk spilling, joins, or general expression language.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

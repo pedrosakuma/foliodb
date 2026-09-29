@@ -70,6 +70,15 @@ public sealed class Collection
 
     // ------------------------------------------------------------------ queries
 
+    /// <summary>Runs a read-only aggregation pipeline in one snapshot; the result shape is untyped.</summary>
+    public List<Document> Aggregate(IEnumerable<Document> pipeline)
+    {
+        var compiled = new Aggregation(pipeline);
+        return Read(compiled.Execute);
+    }
+
+    public List<Document> Aggregate(string pipeline) => Aggregate(Aggregation.Parse(DocJson.Parse(pipeline)));
+
     public Document? FindById(DocValue id) => Read((tx, meta) => CollectionEngine.FindById(tx, meta, id));
 
     public List<Document> Find(Document? filter = null, FindOptions? options = null)

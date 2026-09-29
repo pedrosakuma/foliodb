@@ -137,11 +137,12 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
         _ => DocJson.WriteValue(this),
     };
 
-    /// <summary>Deep copy (documents and arrays are cloned; immutable scalars are shared).</summary>
+    /// <summary>Deep copy (documents, arrays and binary buffers are cloned; immutable scalars are shared).</summary>
     public DocValue DeepClone() => _type switch
     {
         DocType.Document => FromDocument(AsDocument.Clone()),
         DocType.Array => FromArray(AsArray.Clone()),
+        DocType.Binary => FromBinary(AsBinary.ToArray()),
         _ => this,
     };
 }

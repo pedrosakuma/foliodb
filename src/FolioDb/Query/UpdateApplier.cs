@@ -275,19 +275,7 @@ internal static class UpdateApplier
         if (cur.IsNull) return multiply ? Zero(operand) : operand;
         if (!cur.IsNumber) throw new FolioException($"Cannot apply {(multiply ? "$mul" : "$inc")} to non-numeric field '{path}'.");
 
-        // Promotion: decimal > double > int64 > int32 (as in MongoDB).
-        if (cur.Type == DocType.Decimal || operand.Type == DocType.Decimal)
-        {
-            try { return multiply ? cur.AsDecimal * operand.AsDecimal : cur.AsDecimal + operand.AsDecimal; }
-            catch (OverflowException) { throw new FolioException($"Decimal overflow applying {(multiply ? "$mul" : "$inc")} to '{path}'."); }
-        }
-        if (cur.Type == DocType.Double || operand.Type == DocType.Double)
-            return multiply ? cur.AsDouble * operand.AsDouble : cur.AsDouble + operand.AsDouble;
-
-        long a = cur.AsInt64, b = operand.AsInt64;
-        long r = multiply ? checked(a * b) : checked(a + b);
-        bool wide = cur.Type == DocType.Int64 || operand.Type == DocType.Int64 || r is > int.MaxValue or < int.MinValue;
-        return wide ? DocValue.FromInt64(r) : DocValue.FromInt32((int)r);
+        return NumericMath.Apply(cur, operand, multiply, $"applying {(multiply ? "$mul" : "$inc")} to '{path}'");
     }
 
     private static DocValue Zero(DocValue like) => like.Type switch
