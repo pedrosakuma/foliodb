@@ -272,6 +272,61 @@ Compound read path (`CompoundIndexBenchmarks`; 10k docs, 512-byte payload, 100 c
 
 The compound path avoids fetching 100 candidate documents, at the cost of higher allocation in tuple planning/decoding.
 
+### Concurrent reads and updates
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --concurrency 3 3
+```
+
+This separate closed-loop harness reports CSV, not BenchmarkDotNet results. Arguments are seconds per trial and
+repetitions (both default to 3). Dedicated worker threads start together; each issues its next request after the
+previous one completes. Each scenario/mode gets a discarded one-second warmup; recorded trials use fresh databases,
+and Full/Normal runs are interleaved with alternating order. Setup and integrity checks are outside the measurement.
+
+Workload: 10,000 documents, 1 KiB payload, 256 hot IDs, random point reads and one Int64 `$inc` per write transaction,
+no secondary indexes. Automatic checkpoints use the default 1,000-frame threshold. The experimental `BusyTimeout`
+is **1 second**, not the engine default of 30 seconds. Committed increments are checked against successful writes,
+and snapshots are checked for stable values. Unexpected failures abort the run.
+
+The CSV separates acquisition latency (`BeginTransaction`, including snapshot creation), service time (update through
+commit/release), total successful-write latency, commit-call latency (including any automatic checkpoint), and read
+latency. It includes p50/p95/p99, write maximum, timed-out acquisition count/maximum, per-writer progress min/max,
+and WAL size sampled every 50 ms without opening a reader. Histogram percentiles are upper-bin estimates with
+error at most 2% plus 0.02 microseconds. Throughput includes final in-flight requests draining after the stop signal;
+failed acquisitions are **not** included in successful-write percentiles.
+
+Example run on 2026-09-29: .NET 10 JIT, Linux/ext4 temporary storage, shared host, three 3-second trials.
+Numbers below are medians of each trial's throughput/percentile, **not** pooled percentiles or production capacity.
+
+| Mode | Writers / readers | Reads/s | Updates/s | Read p99 | Acquire p99 | Update total p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| Full | 0 / 4 | 762,451 | - | 11.1 us | - | - |
+| Full | 1 / 0 | - | 502 | - | 4.1 us | 5.40 ms |
+| Full | 4 / 0 | - | 367 | - | 162.8 ms | 166.1 ms |
+| Full | 1 / 4 | 625,981 | 411 | 31.0 us | 8.6 us | 7.71 ms |
+| Full | 4 / 4 | 627,137 | 419 | 33.6 us | 267.1 ms | 272.5 ms |
+| Normal | 0 / 4 | 732,709 | - | 12.7 us | - | - |
+| Normal | 1 / 0 | - | 29,536 | - | 0.8 us | 0.075 ms |
+| Normal | 4 / 0 | - | 10,239 | - | 90.4 us | 2.54 ms |
+| Normal | 1 / 4 | 362,398 | 17,778 | 47.5 us | 6.5 us | 0.599 ms |
+| Normal | 4 / 4 | 471,410 | 8,785 | 38.8 us | 10.38 ms | 11.24 ms |
+
+Full had 8 acquisition timeouts with 4 writers/no readers and 6 with 4 writers/4 readers, summed over the three
+trials. Normal had none. In Full with 4 writers/4 readers, median service p50 was 2.17 ms, but acquisition p99 was
+267 ms: waiting for another writer is distinct from executing the update. The semaphore does not promise FIFO.
+Commit-call time dominated the uncontended Full median (1.78 ms of 1.82 ms service); this includes more than fsync,
+so the experiment does not isolate disk synchronization as the only cause.
+
+The extra 4-writer/4-reader scenario retains each reader snapshot for 100 ms. In Normal, the median sampled WAL
+peak increased from **43.7 MiB to 217.6 MiB** (Full: 10.0 to 11.3 MiB). Checkpoints need a moment with no active
+snapshots, not merely the expiration of the oldest one. Snapshot-case read rates are not directly comparable:
+they reuse a snapshot and repeatedly read one ID rather than opening a snapshot for each random lookup.
+
+These are initial contention measurements. Earlier blocks on the same shared host varied substantially even for
+read-only baselines. The workload does not model fixed arrival rates, network requests, cold storage, secondary-index
+maintenance, or multi-update batches. Closed-loop percentiles do not account for requests that would have arrived
+while a worker was blocked. No write coordination or durability behavior was changed for this experiment.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

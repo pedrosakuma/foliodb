@@ -5,7 +5,10 @@ using FolioDb;
 using LiteDB;
 using Microsoft.Data.Sqlite;
 
-BenchmarkSwitcher.FromAssembly(typeof(Workload).Assembly).Run(args);
+if (args.Length > 0 && args[0] == "--concurrency")
+    ConcurrentWorkload.Run(args[1..]);
+else
+    BenchmarkSwitcher.FromAssembly(typeof(Workload).Assembly).Run(args);
 
 /// <summary>Shared data set: documents with an indexed "city" field (100 distinct values).</summary>
 public static class Workload
