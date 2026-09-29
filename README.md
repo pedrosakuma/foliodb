@@ -327,6 +327,52 @@ read-only baselines. The workload does not model fixed arrival rates, network re
 maintenance, or multi-update batches. Closed-loop percentiles do not account for requests that would have arrived
 while a worker was blocked. No write coordination or durability behavior was changed for this experiment.
 
+### Experimental multi-file routing measurements
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --sharding 3 3
+```
+
+This benchmark-only option compares 1, 2 and 4 independent database files on the same device. It does **not**
+implement sharding in the engine. Nonnegative Int32 IDs route by `id % shards`; no CLR hash or randomized string
+hash is used. This restricted routing is not a general numeric-key implementation. Every worker chooses from all
+256 hot IDs, rather than owning one shard. Total documents (10,000), workers (4 writers, 0 or 4 readers), payload,
+and configured page-cache budget (4,096 pages divided among files) remain fixed.
+
+Each file retains its own 1,000-frame checkpoint threshold; aggregate WAL allowance and per-file overhead therefore
+increase with shard count. File sizes are sampled sequentially and summed, so the WAL peak is approximate, not an
+atomic snapshot. Full/Normal and shard counts are interleaved, reversing configuration order between repetitions.
+Post-run checks validate routing, document count, total increments, integrity and checkpoint completion across files.
+There is no cross-file transaction, globally consistent snapshot, global unique index, or non-ID query fan-out.
+
+Initial results, same shared Linux/ext4 host and methodology as above: median of three 3-second trials, four writers.
+The shard count is appended as a `shards` CSV column (also present as 1 for `--concurrency`).
+
+| Mode | Readers | Files | Updates/s | Reads/s | Successful update p99 | Acquisition timeouts (3 trials) |
+|---|---:|---:|---:|---:|---:|---:|
+| Full | 0 | 1 | 533 | - | 9.0 ms | 15 |
+| Full | 0 | 2 | 788 | - | 36.9 ms | 0 |
+| Full | 0 | 4 | 1,039 | - | 17.7 ms | 0 |
+| Normal | 0 | 1 | 13,905 | - | 0.86 ms | 0 |
+| Normal | 0 | 2 | 20,147 | - | 4.79 ms | 0 |
+| Normal | 0 | 4 | 30,893 | - | 3.49 ms | 0 |
+| Full | 4 | 1 | 281 | 618,066 | 141.7 ms | 15 |
+| Full | 4 | 2 | 675 | 859,240 | 38.4 ms | 0 |
+| Full | 4 | 4 | 828 | 930,641 | 22.9 ms | 0 |
+| Normal | 4 | 1 | 9,338 | 497,017 | 10.59 ms | 0 |
+| Normal | 4 | 2 | 13,719 | 506,138 | 4.99 ms | 0 |
+| Normal | 4 | 4 | 21,288 | 443,281 | 3.63 ms | 0 |
+
+Do not interpret the low successful-write p99 for one Full file/no readers as fairness: 15 acquisitions timed out
+at the experimental one-second limit and are excluded from that percentile. More files improved throughput but did
+not universally improve successful-operation tails or read throughput. Full mixed-workload throughput ranged from
+275 to 427 updates/s with one file and 794 to 849 with four, so the roughly 3x median gain is not a stable scaling
+factor. The same-device flushes still share I/O resources. Checkpoint opportunities and smaller per-file trees also
+change with partitioning; these numbers do not isolate writer-lock contention alone.
+
+These results establish potential for independent writers, not justification for transparent production sharding.
+Cross-shard correctness and non-ID workloads remain unmeasured.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
