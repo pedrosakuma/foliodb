@@ -1,3 +1,6 @@
+using System.Buffers.Binary;
+using System.Text;
+
 namespace FolioDb.Query;
 
 /// <summary>Applies Mongo-style update documents (<c>$set</c>, <c>$inc</c>, ...) or whole-document replacements.</summary>
@@ -112,6 +115,135 @@ internal static class UpdateApplier
         return doc;
     }
 
+    private static readonly UTF8Encoding s_strictUtf8 = new(false, true);
+
+    /// <summary>
+    /// Fast path for operator updates that only overwrite existing scalar values with values of the same encoded size
+    /// (e.g. <c>$inc</c> on an int32/int64/double/decimal, <c>$set</c> of a same-length string). Returns the patched
+    /// bytes, byte-identical to <c>Serialize(Apply(Deserialize(original), update))</c>, or null when the update needs
+    /// the general path (missing fields, growing values, containers, array operators, ...).
+    /// </summary>
+    public static byte[]? TryPatch(byte[] original, Document update)
+    {
+        if (!IsOperatorUpdate(update)) return null;
+        byte[]? doc = null;
+        using var buf = new ByteBuffer(64);
+        foreach (var (op, arg) in update)
+        {
+            if (op is not ("$set" or "$inc" or "$mul" or "$min" or "$max" or "$currentDate")) return null;
+            foreach (var (path, value) in arg.AsDocument)
+            {
+                var data = doc ?? original;
+                if (!TryLocate(data, path, out int typePos, out int valuePos, out int size)) return null;
+                var cur = RawValue.Read((DocType)data[typePos], data.AsSpan(valuePos), out _);
+                if (cur.Type is DocType.Document or DocType.Array) return null;
+
+                DocValue next;
+                switch (op)
+                {
+                    case "$set": next = value; break;
+                    case "$inc": next = Arith(cur.ToDocValue(), path, value, multiply: false); break;
+                    case "$mul": next = Arith(cur.ToDocValue(), path, value, multiply: true); break;
+                    case "$min":
+                        if (value.CompareTo(cur.ToDocValue()) >= 0) continue;
+                        next = value;
+                        break;
+                    case "$max":
+                        if (value.CompareTo(cur.ToDocValue()) <= 0) continue;
+                        next = value;
+                        break;
+                    default: next = DateTime.UtcNow; break;
+                }
+                if (next.Type is DocType.Document or DocType.Array) return null;
+
+                buf.Clear();
+                DocumentSerializer.WriteValue(buf, next, 0);
+                if (buf.Length != size) return null;
+                doc ??= (byte[])original.Clone();
+                doc[typePos] = (byte)next.Type;
+                buf.WrittenSpan.CopyTo(doc.AsSpan(valuePos));
+            }
+        }
+        return doc ?? original;
+    }
+
+    /// <summary>Finds an existing value by dotted path, with the same resolution rules as <see cref="Document.TryGetPath"/>.</summary>
+    private static bool TryLocate(ReadOnlySpan<byte> data, string path, out int typePos, out int valuePos, out int size)
+    {
+        typePos = valuePos = size = 0;
+        int start = 0;
+        bool isArray = false;
+        Span<byte> name = stackalloc byte[DocumentSerializer.MaxNameBytes];
+        var segments = path.Split('.');
+        for (int s = 0; s < segments.Length; s++)
+        {
+            string segment = segments[s];
+            int index = -1, nameLen = 0;
+            if (isArray)
+            {
+                if (!int.TryParse(segment, out index) || index < 0) return false;
+            }
+            else
+            {
+                try
+                {
+                    if (s_strictUtf8.GetByteCount(segment) > name.Length) return false;
+                    nameLen = s_strictUtf8.GetBytes(segment, name);
+                }
+                catch (ArgumentException) { return false; }
+            }
+
+            // Every read stays inside the current container; malformed bytes make the fast path decline.
+            if (start + 4 > data.Length) return false;
+            int len = BinaryPrimitives.ReadInt32LittleEndian(data[start..]);
+            if (len < 5 || len > data.Length - start || data[start + len - 1] != 0) return false;
+            int end = start + len - 1;
+            int pos = start + 4;
+            bool found = false;
+            for (int i = 0; pos < end && data[pos] != 0; i++)
+            {
+                int vpos;
+                bool match;
+                if (isArray)
+                {
+                    vpos = pos + 1;
+                    match = i == index;
+                }
+                else
+                {
+                    if (pos + 2 > end) return false;
+                    int n = data[pos + 1];
+                    vpos = pos + 2 + n;
+                    if (vpos > end) return false;
+                    match = data.Slice(pos + 2, n).SequenceEqual(name[..nameLen]);
+                }
+                int consumed;
+                try { RawValue.Read((DocType)data[pos], data[vpos..end], out consumed); }
+                catch (Exception e) when (e is ArgumentOutOfRangeException or CorruptDatabaseException) { return false; }
+                if (vpos + consumed > end) return false;
+                if (match)
+                {
+                    typePos = pos;
+                    valuePos = vpos;
+                    size = consumed;
+                    found = true;
+                    break;
+                }
+                pos = vpos + consumed;
+            }
+            if (!found) return false;
+            var type = (DocType)data[typePos];
+            if (type is not (DocType.Document or DocType.Array))
+            {
+                if (s + 1 < segments.Length) return false;
+                break;
+            }
+            start = valuePos;
+            isArray = type == DocType.Array;
+        }
+        return true;
+    }
+
     private static IEnumerable<DocValue> Each(DocValue value)
     {
         if (value.Type == DocType.Document && value.AsDocument.TryGetValue("$each", out var each))
@@ -134,10 +266,13 @@ internal static class UpdateApplier
         return existing.AsArray;
     }
 
-    private static DocValue Arith(Document doc, string path, DocValue operand, bool multiply)
+    private static DocValue Arith(Document doc, string path, DocValue operand, bool multiply) =>
+        Arith(doc.TryGetPath(path, out var cur) ? cur : DocValue.Null, path, operand, multiply);
+
+    private static DocValue Arith(DocValue cur, string path, DocValue operand, bool multiply)
     {
         if (!operand.IsNumber) throw new FolioException($"{(multiply ? "$mul" : "$inc")} requires a numeric argument.");
-        if (!doc.TryGetPath(path, out var cur) || cur.IsNull) return multiply ? Zero(operand) : operand;
+        if (cur.IsNull) return multiply ? Zero(operand) : operand;
         if (!cur.IsNumber) throw new FolioException($"Cannot apply {(multiply ? "$mul" : "$inc")} to non-numeric field '{path}'.");
 
         // Promotion: decimal > double > int64 > int32 (as in MongoDB).

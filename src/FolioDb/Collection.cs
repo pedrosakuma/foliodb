@@ -146,8 +146,10 @@ public sealed class Collection
             long modified = 0;
             foreach (var (idKey, bytes) in matches)
             {
-                var updated = UpdateApplier.Apply(Document.FromBytes(bytes), update);
-                if (CollectionEngine.Replace(tx, meta, idKey, bytes, updated)) modified++;
+                bool changed = UpdateApplier.TryPatch(bytes, update) is { } patched
+                    ? CollectionEngine.Replace(tx, meta, idKey, bytes, patched)
+                    : CollectionEngine.Replace(tx, meta, idKey, bytes, UpdateApplier.Apply(Document.FromBytes(bytes), update));
+                if (changed) modified++;
             }
             return new UpdateResult(matches.Count, modified, null);
         }, atomic: !many);

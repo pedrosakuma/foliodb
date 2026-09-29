@@ -19,7 +19,7 @@ no reflection — typed mapping is done by a source generator).
   (`5 == 5L == 5.0 == 5m`, `0.1m < 0.1`). Arithmetic (`$inc`/`$mul`) promotes int32 → int64 → double → decimal.
 - **B+Tree** primary index on `_id` (auto-generated `ObjectId` when missing) and **secondary indexes** (single field, dotted paths, unique, multikey on arrays).
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
-- **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert.
+- **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Source generator** for typed POCOs/records (`[FolioDocument]`), with compile-time diagnostics.
 - **`folio` CLI shell** (like `sqlite3`): REPL, scripts, `.dump`/`.import`/`.export`, `.integrity`, `.timer`.
 - Tested: 120+ unit tests including a B+Tree fuzz test against a model, WAL torn-write/corruption tests,
@@ -176,9 +176,16 @@ Numeric representation (`NumericBenchmarks`; a 10k-doc collection with an index 
 
 The string representation is only shown for cost comparison: it sorts lexicographically (`"10" < "9"`), so it is not a valid option.
 
-Update rewrite cost (`UpdateRewriteBenchmarks`, one `$inc` per document): values are immutable in the binary format,
-so an update re-serializes the whole document and rewrites its B+Tree cell (or overflow chain). Cost therefore scales with document size:
-~3.7 µs for 200 B, ~28 µs for 4 KB and ~440 µs for 64 KB (overflow pages).
+Update rewrite cost (`UpdateRewriteBenchmarks`, one `$inc` per document). When an operator update only overwrites existing
+scalars with values of the same encoded size (`$inc`/`$mul`/`$min`/`$max`/`$set` without type growth, `$currentDate`), the
+stored bytes are patched in place and only the B+Tree leaf or the overflow pages that actually changed are written to the WAL.
+Anything else (new fields, growing strings, int32 → int64 promotion, array operators) re-serializes the whole document:
+
+| Document size | Full rewrite | In-place patch |
+|---|---:|---:|
+| 200 B | 3.7 µs | 3.5 µs |
+| 4 KB (overflow) | 27.7 µs | 20.5 µs |
+| 64 KB (overflow) | 442 µs | 72 µs |
 
 ## Limitations
 

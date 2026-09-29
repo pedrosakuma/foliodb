@@ -153,9 +153,12 @@ internal static class CollectionEngine
     }
 
     /// <summary>Replaces a stored document. Returns false if the new version is byte-identical (not modified).</summary>
-    public static bool Replace(EngineTx tx, CollectionMeta meta, byte[] idKey, byte[] oldBytes, Document newDoc)
+    public static bool Replace(EngineTx tx, CollectionMeta meta, byte[] idKey, byte[] oldBytes, Document newDoc) =>
+        Replace(tx, meta, idKey, oldBytes, DocumentSerializer.Serialize(newDoc));
+
+    /// <summary>Replaces a stored document with already serialized bytes. Returns false if they are identical.</summary>
+    public static bool Replace(EngineTx tx, CollectionMeta meta, byte[] idKey, byte[] oldBytes, byte[] newBytes)
     {
-        var newBytes = DocumentSerializer.Serialize(newDoc);
         if (newBytes.AsSpan().SequenceEqual(oldBytes)) return false;
         if (newBytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
 
@@ -187,7 +190,7 @@ internal static class CollectionEngine
                 metaChanged = true;
             }
         }
-        new BTree(tx.Storage, meta.PrimaryRoot).Insert(idKey, newBytes, overwrite: true);
+        new BTree(tx.Storage, meta.PrimaryRoot).Update(idKey, newBytes);
         if (metaChanged) tx.SaveCollection(meta);
         return true;
     }

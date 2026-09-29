@@ -312,6 +312,46 @@ internal readonly struct BTree
 
     public bool ContainsKey(ReadOnlySpan<byte> key) => TryGet(key, out _);
 
+    /// <summary>
+    /// Replaces the value of <paramref name="key"/>. A value of the same size as the stored one is overwritten in place,
+    /// dirtying only the leaf or the overflow pages whose bytes actually change; otherwise falls back to <see cref="Insert"/>.
+    /// </summary>
+    public void Update(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        uint pg = Root;
+        byte[] page;
+        while (true)
+        {
+            page = _tx.ReadPage(pg);
+            if (IsLeaf(page)) break;
+            pg = ChildAt(page, ChildIndex(page, key));
+        }
+        int idx = LowerBound(page, key, out bool found);
+        int off = found ? Slot(page, idx) : 0;
+        if (!found || BinaryPrimitives.ReadInt32LittleEndian(page.AsSpan(off + 3)) != value.Length)
+        {
+            Insert(key, value, overwrite: true);
+            return;
+        }
+
+        int vpos = off + LeafCellHeader + BinaryPrimitives.ReadUInt16LittleEndian(page.AsSpan(off));
+        if ((page[off + 2] & FlagOverflow) == 0)
+        {
+            if (!page.AsSpan(vpos, value.Length).SequenceEqual(value)) value.CopyTo(_tx.WritePage(pg).AsSpan(vpos));
+            return;
+        }
+
+        uint opg = BinaryPrimitives.ReadUInt32LittleEndian(page.AsSpan(vpos));
+        int chunk = PageSize - 4;
+        for (int pos = 0; pos < value.Length; pos += chunk)
+        {
+            var op = _tx.ReadPage(opg);
+            var part = value.Slice(pos, Math.Min(chunk, value.Length - pos));
+            if (!op.AsSpan(4, part.Length).SequenceEqual(part)) part.CopyTo(_tx.WritePage(opg).AsSpan(4));
+            opg = BinaryPrimitives.ReadUInt32LittleEndian(op);
+        }
+    }
+
     /// <summary>Inserts or replaces. Returns false (and does nothing) if the key exists and <paramref name="overwrite"/> is false.</summary>
     public bool Insert(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool overwrite)
     {
