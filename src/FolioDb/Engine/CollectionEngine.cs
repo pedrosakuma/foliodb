@@ -468,6 +468,8 @@ internal sealed class SortSpec
 /// keeps matched sub-documents (possibly empty) and drops array elements that are not documents/arrays; exclusion
 /// copies everything else unchanged. Ambiguous specifications are rejected: a path and one of its prefixes
 /// (<c>{ a: 1, 'a.b': 1 }</c>), or positional and field segments under the same parent (<c>{ 'a.0': 1, 'a.b': 1 }</c>).
+/// Operators: <c>{ path: { $slice: n | -n | [skip, limit] } }</c> keeps part of an array (neutral: alone it keeps all
+/// other fields) and <c>{ field: { $elemMatch: {...} } }</c> keeps the first matching element (top-level, inclusion).
 /// </summary>
 internal sealed class Projection
 {
@@ -476,6 +478,9 @@ internal sealed class Projection
         public readonly List<(string Name, byte[] Utf8, int Position, Node Child)> Children = [];
         public bool Positional;
         public bool IsLeaf => Children.Count == 0;
+        public bool HasSlice;
+        public long SliceSkip, SliceLimit;
+        public FieldFilter? ElemMatch;
 
         public int Find(ReadOnlySpan<byte> utf8)
         {
@@ -499,9 +504,11 @@ internal sealed class Projection
     private readonly bool _include;
     private readonly bool _includeId;
     private readonly bool _idInTree; // a sub-path of _id ('_id.x') was given: the tree decides what of _id is kept
+    private readonly bool _hasOperators;
 
-    private Projection(Node root, List<string> paths, bool include, bool includeId, bool idInTree)
+    private Projection(Node root, List<string> paths, bool include, bool includeId, bool idInTree, bool hasOperators)
     {
+        _hasOperators = hasOperators;
         _root = root;
         _paths = paths;
         _include = include;
@@ -516,9 +523,24 @@ internal sealed class Projection
         bool includeId = true, idSpecified = false;
         var paths = new List<string>();
         var root = new Node();
+        bool hasOperators = false;
         foreach (var (k, v) in spec)
         {
-            bool on = v.Type == DocType.Boolean ? v.AsBoolean : v.IsNumber && v.AsDouble != 0;
+            if (v.Type == DocType.Document)
+            {
+                if (k == "_id") throw new FolioException("Projection operators cannot be applied to _id.");
+                var leaf = AddPath(root, k);
+                ParseOperator(k, v.AsDocument, leaf);
+                if (leaf.ElemMatch is not null)
+                {
+                    if (include == false) throw new FolioException("$elemMatch cannot be used in an exclusion projection.");
+                    include = true;
+                }
+                hasOperators = true;
+                continue;
+            }
+            if (v.Type != DocType.Boolean && !v.IsNumber) throw new FolioException($"Invalid projection value for '{k}': expected 1/0, true/false or an operator.");
+            bool on = v.Type == DocType.Boolean ? v.AsBoolean : v.AsDouble != 0;
             if (k == "_id")
             {
                 includeId = on;
@@ -534,10 +556,51 @@ internal sealed class Projection
         if (idInTree && idSpecified) throw new FolioException("Projection path collision at '_id'.");
         foreach (var c in root.Children) Validate(c.Child, c.Name); // the root is always a document: no positions
         // { _id: 1 } alone is an inclusion of _id only; { _id: 0 } alone excludes it.
-        return new Projection(root, paths, include ?? (idSpecified && includeId), includeId, idInTree);
+        // Only $slice given: like Mongo, all other fields are kept.
+        bool mode = include ?? (!hasOperators && idSpecified && includeId);
+        return new Projection(root, paths, mode, includeId, idInTree, hasOperators);
     }
 
-    private static void AddPath(Node root, string path)
+    private static void ParseOperator(string path, Document op, Node leaf)
+    {
+        if (op.Count != 1) throw new FolioException($"Invalid projection for '{path}': use dotted paths or a single operator ($slice, $elemMatch).");
+        var (name, arg) = op.First();
+        switch (name)
+        {
+            case "$slice":
+                leaf.HasSlice = true;
+                if (arg.IsNumber && IsInteger(arg))
+                {
+                    long n = arg.AsInt64;
+                    (leaf.SliceSkip, leaf.SliceLimit) = n >= 0 ? (0L, n) : (n, long.MaxValue);
+                }
+                else if (arg.Type == DocType.Array && arg.AsArray.Count == 2 && arg.AsArray.All(IsInteger))
+                {
+                    leaf.SliceSkip = arg.AsArray[0].AsInt64;
+                    leaf.SliceLimit = arg.AsArray[1].AsInt64;
+                    if (leaf.SliceLimit <= 0) throw new FolioException($"$slice limit for '{path}' must be positive.");
+                }
+                else throw new FolioException($"$slice for '{path}' requires an integer or [skip, limit].");
+                break;
+            case "$elemMatch":
+                if (path.Contains('.')) throw new FolioException($"$elemMatch projection requires a top-level field, got '{path}'.");
+                if (arg.Type != DocType.Document) throw new FolioException("$elemMatch requires a document.");
+                leaf.ElemMatch = (FieldFilter)FilterParser.Parse(new Document { ["e"] = new Document { ["$elemMatch"] = arg } });
+                break;
+            default:
+                throw new FolioException($"Unknown projection operator '{name}' for '{path}'.");
+        }
+    }
+
+    private static bool IsInteger(DocValue v) => v.IsNumber && v.Type switch
+    {
+        DocType.Int32 or DocType.Int64 => true,
+        DocType.Double => v.AsDouble is > -1e18 and < 1e18 && double.IsInteger(v.AsDouble),
+        DocType.Decimal => v.AsDecimal is > -1e18m and < 1e18m && decimal.IsInteger(v.AsDecimal),
+        _ => false,
+    };
+
+    private static Node AddPath(Node root, string path)
     {
         var segments = path.Split('.');
         if (segments.Length > DocumentSerializer.MaxDepth) throw new FolioException($"Projection path '{path}' is too deep.");
@@ -564,6 +627,7 @@ internal sealed class Projection
             }
             node = node.Children[ci].Child;
         }
+        return node;
     }
 
     private static void Validate(Node node, string prefix)
@@ -581,7 +645,7 @@ internal sealed class Projection
     public bool HasPaths => _paths.Count > 0;
 
     /// <summary>True when every included path is <paramref name="field"/> (so the result can be built from its index key).</summary>
-    public bool OnlyIncludes(string field) => _include && !_idInTree && _paths.TrueForAll(p => p == field);
+    public bool OnlyIncludes(string field) => _include && !_idInTree && !_hasOperators && _paths.TrueForAll(p => p == field);
 
     /// <summary>Projects straight from the serialized document, materializing only the selected values.</summary>
     public Document Apply(RawDocument raw)
@@ -607,13 +671,13 @@ internal sealed class Projection
             if (ci < 0 || seen[ci]) continue; // first occurrence only, as filters and indexes see it
             seen[ci] = true;
             var (name, _, _, child) = node.Children[ci];
-            if (child.IsLeaf) into.AddUnchecked(name, f.Value.ToDocValue());
-            else if (TryInclude(f.Value, child, out var v)) into.AddUnchecked(name, v);
+            if (TryInclude(f.Value, child, out var v)) into.AddUnchecked(name, v);
         }
     }
 
     private static bool TryInclude(RawValue v, Node node, out DocValue result)
     {
+        if (node.IsLeaf) return TryLeaf(v, node, out result);
         switch (v.Type)
         {
             case DocType.Document:
@@ -633,9 +697,7 @@ internal sealed class Projection
                     {
                         int ci = node.FindPosition(i++);
                         if (ci < 0) continue;
-                        var child = node.Children[ci].Child;
-                        if (child.IsLeaf) arr.Add(item.ToDocValue());
-                        else if (TryInclude(item, child, out var x)) arr.Add(x);
+                        if (TryInclude(item, node.Children[ci].Child, out var x)) arr.Add(x);
                     }
                     else if (item.Type is DocType.Document or DocType.Array && TryInclude(item, node, out var x)) arr.Add(x);
                 }
@@ -648,6 +710,41 @@ internal sealed class Projection
         }
     }
 
+    /// <summary>Value of a projected leaf: as is, sliced ($slice) or its first matching element ($elemMatch, else omitted).</summary>
+    private static bool TryLeaf(RawValue v, Node leaf, out DocValue result)
+    {
+        if (leaf.ElemMatch is not null)
+        {
+            result = default;
+            if (v.Type != DocType.Array) return false;
+            foreach (var item in v.AsArray)
+            {
+                if (!leaf.ElemMatch.MatchesElement(item)) continue;
+                result = new DocArray { item.ToDocValue() };
+                return true;
+            }
+            return false;
+        }
+        if (!leaf.HasSlice || v.Type != DocType.Array)
+        {
+            result = v.ToDocValue();
+            return true;
+        }
+        long count = 0;
+        foreach (var _ in v.AsArray) count++;
+        long start = leaf.SliceSkip >= 0 ? Math.Min(leaf.SliceSkip, count) : Math.Max(count + leaf.SliceSkip, 0);
+        long end = start + Math.Min(leaf.SliceLimit, count - start);
+        var arr = new DocArray();
+        long i = 0;
+        foreach (var item in v.AsArray)
+        {
+            if (i >= end) break;
+            if (i++ >= start) arr.Add(item.ToDocValue());
+        }
+        result = arr;
+        return true;
+    }
+
     private static void ExcludeFields(RawDocument doc, Node node, Document into, bool dropId)
     {
         foreach (var f in doc)
@@ -655,12 +752,20 @@ internal sealed class Projection
             if (dropId && f.Name.SequenceEqual("_id"u8)) continue;
             int ci = node.Find(f.Name);
             if (ci < 0) into.AddUnchecked(Encoding.UTF8.GetString(f.Name), f.Value.ToDocValue());
-            else if (!node.Children[ci].Child.IsLeaf) into.AddUnchecked(node.Children[ci].Name, Exclude(f.Value, node.Children[ci].Child));
+            else if (KeepExcluded(node.Children[ci].Child)) into.AddUnchecked(node.Children[ci].Name, Exclude(f.Value, node.Children[ci].Child));
         }
     }
 
+    /// <summary>In an exclusion projection a plain leaf removes the value; a $slice leaf keeps it (sliced).</summary>
+    private static bool KeepExcluded(Node node) => !node.IsLeaf || node.HasSlice;
+
     private static DocValue Exclude(RawValue v, Node node)
     {
+        if (node.IsLeaf)
+        {
+            TryLeaf(v, node, out var sliced);
+            return sliced;
+        }
         switch (v.Type)
         {
             case DocType.Document:
@@ -679,7 +784,7 @@ internal sealed class Projection
                     {
                         int ci = node.FindPosition(i++);
                         if (ci < 0) arr.Add(item.ToDocValue());
-                        else if (!node.Children[ci].Child.IsLeaf) arr.Add(Exclude(item, node.Children[ci].Child));
+                        else if (KeepExcluded(node.Children[ci].Child)) arr.Add(Exclude(item, node.Children[ci].Child));
                     }
                     else arr.Add(item.Type is DocType.Document or DocType.Array ? Exclude(item, node) : item.ToDocValue());
                 }

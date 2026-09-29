@@ -60,6 +60,67 @@ public sealed class ProjectionTests : IDisposable
     public void AmbiguousOrInvalidSpecsAreRejected(string projection) =>
         Assert.Throws<FolioException>(() => Project(projection));
 
+    [Theory]
+    // $slice alone keeps every other field
+    [InlineData("{ tags: { $slice: 2 }, _id: 0, end: 0, itens: 0, anos: 0, '0': 0 }", null)]
+    [InlineData("{ tags: { $slice: 2 } }", """{"_id":1,"end":{"cidade":"SP","cep":"01000","geo":{"lat":1,"lng":2}},"itens":[{"nome":"a","qtd":1},{"nome":"b","qtd":2},5,[{"nome":"c"}]],"tags":["x","y"],"0":"zero","anos":{"2024":1,"2025":2}}""")]
+    [InlineData("{ tags: { $slice: -1 }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":["z"]}""")]
+    [InlineData("{ tags: { $slice: [1, 1] }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":["y"]}""")]
+    [InlineData("{ tags: { $slice: [-2, 5] }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":["y","z"]}""")]
+    [InlineData("{ tags: { $slice: [10, 5] }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":[]}""")]
+    [InlineData("{ tags: { $slice: -10 }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":["x","y","z"]}""")]
+    [InlineData("{ tags: { $slice: 0 }, end: 0, itens: 0, anos: 0, '0': 0 }", """{"_id":1,"tags":[]}""")]
+    // with inclusions it is an inclusion
+    [InlineData("{ tags: { $slice: 1 }, 'end.cidade': 1, _id: 0 }", """{"end":{"cidade":"SP"},"tags":["x"]}""")]
+    // non-array values are kept as they are; nested paths fan out like any other path
+    [InlineData("{ 'end.cidade': { $slice: 1 }, _id: 0, itens: 0, tags: 0, anos: 0, '0': 0 }", """{"end":{"cidade":"SP","cep":"01000","geo":{"lat":1,"lng":2}}}""")]
+    [InlineData("{ 'itens.nome': 1, tags: { $slice: -2 }, _id: 0 }", """{"itens":[{"nome":"a"},{"nome":"b"},[{"nome":"c"}]],"tags":["y","z"]}""")]
+    // $elemMatch: first matching element only, field omitted when nothing matches
+    [InlineData("{ itens: { $elemMatch: { qtd: { $gte: 2 } } } }", """{"_id":1,"itens":[{"nome":"b","qtd":2}]}""")]
+    [InlineData("{ itens: { $elemMatch: { qtd: 9 } } }", """{"_id":1}""")]
+    [InlineData("{ tags: { $elemMatch: { $gt: 'x' } }, _id: 0 }", """{"tags":["y"]}""")]
+    [InlineData("{ itens: { $elemMatch: { nome: 'a' } }, 'end.cep': 1, _id: 0 }", """{"end":{"cep":"01000"},"itens":[{"nome":"a","qtd":1}]}""")]
+    public void ProjectionOperators(string projection, string? expected)
+    {
+        var actual = Project(projection);
+        if (expected is null) Assert.Equal("""{"tags":["x","y"]}""", actual);
+        else Assert.Equal(expected, actual);
+    }
+
+    [Theory]
+    [InlineData("{ tags: { $slice: 'a' } }")]
+    [InlineData("{ tags: { $slice: 1.5 } }")]
+    [InlineData("{ tags: { $slice: [1, 0] } }")]
+    [InlineData("{ tags: { $slice: [1] } }")]
+    [InlineData("{ tags: { $slice: 1, $elemMatch: {} } }")]
+    [InlineData("{ tags: { $foo: 1 } }")]
+    [InlineData("{ end: { cidade: 1 } }")]
+    [InlineData("{ 'itens.x': { $elemMatch: { a: 1 } } }")]
+    [InlineData("{ itens: { $elemMatch: { a: 1 } }, tags: 0 }")]
+    [InlineData("{ tags: 0, itens: { $elemMatch: { a: 1 } } }")]
+    [InlineData("{ tags: { $slice: 1 }, 'tags.0': 1 }")]
+    [InlineData("{ _id: { $slice: 1 } }")]
+    [InlineData("{ tags: 'yes' }")]
+    public void InvalidOperatorsAreRejected(string projection) => Assert.Throws<FolioException>(() => Project(projection));
+
+    [Fact]
+    public void HugeSliceArgumentsAreRejected()
+    {
+        foreach (var bad in new DocValue[] { decimal.MinValue, decimal.MaxValue, double.MaxValue, double.NaN })
+            Assert.Throws<FolioException>(() => _c.Find((Document?)null,
+                new FindOptions { Projection = new Document { ["tags"] = new Document { ["$slice"] = bad } } }).ToList());
+    }
+
+    [Fact]
+    public void OperatorsDisableCoveredProjection()
+    {
+        var c = _db.GetCollection("cov");
+        c.Insert("{ _id: 1, k: ['a', 'b', 'c'] }");
+        c.Insert("{ _id: 2, s: 'x' }");
+        c.CreateIndex("s");
+        Assert.Equal("""{"_id":2,"s":"x"}""", c.FindOne("{ s: 'x' }", new FindOptions { Projection = Document.Parse("{ s: { $slice: 1 } }") })!.ToJson());
+    }
+
     [Fact]
     public void NumericTopLevelNamesAreDistinctFields()
     {

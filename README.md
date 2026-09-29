@@ -26,6 +26,9 @@ no reflection — typed mapping is done by a source generator).
   applies to every element (`{'itens.nome': 1}` → `itens: [{nome: 'a'}, {nome: 'b'}]`). Arrays stay arrays. Specs that
   would be ambiguous are rejected: a path together with its prefix (`{end: 1, 'end.cep': 1}`) or positions mixed with
   field names under the same parent (`{'itens.0': 1, 'itens.nome': 1}`).
+  **Projection operators**: `$slice: n | -n | [skip, limit]` trims arrays (alone it keeps every other field; non-arrays
+  are returned as is); `$elemMatch: {...}` on a top-level array keeps only the first matching element (field omitted
+  when nothing matches) and implies an inclusion projection.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Source generator** for typed POCOs/records (`[FolioDocument]`), with compile-time diagnostics.
 - **`folio` CLI shell** (like `sqlite3`): REPL, scripts, `.dump`/`.import`/`.export`, `.integrity`, `.timer`.

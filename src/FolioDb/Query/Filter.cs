@@ -219,30 +219,32 @@ internal sealed class FieldFilter : Filter
     {
         if (v.Type != DocType.Array) return false;
         foreach (var item in v.AsArray)
-        {
-            if (_elemIsValueFilter)
-            {
-                // {$elemMatch: {$gt: 1, $lt: 5}} — operators apply to the element itself; wrap it in a synthetic doc.
-                var buf = new ByteBuffer(item.Data.Length + 16);
-                try
-                {
-                    buf.WriteInt32(0);
-                    buf.WriteByte((byte)item.Type);
-                    buf.WriteByte(1);
-                    buf.WriteByte((byte)'v');
-                    WriteRawValue(buf, item);
-                    buf.WriteByte(0);
-                    buf.PatchInt32(0, buf.Length);
-                    if (_elemFilter!.Matches(new RawDocument(buf.WrittenSpan))) return true;
-                }
-                finally
-                {
-                    buf.Dispose();
-                }
-            }
-            else if (item.Type == DocType.Document && _elemFilter!.Matches(item.AsDocument)) return true;
-        }
+            if (MatchesElement(item)) return true;
         return false;
+    }
+
+    /// <summary>True when one array element satisfies this <c>$elemMatch</c> condition.</summary>
+    internal bool MatchesElement(RawValue item)
+    {
+        if (Op != FieldOp.ElemMatch) throw new InvalidOperationException("Not an $elemMatch filter.");
+        if (!_elemIsValueFilter) return item.Type == DocType.Document && _elemFilter!.Matches(item.AsDocument);
+        // {$elemMatch: {$gt: 1, $lt: 5}} — operators apply to the element itself; wrap it in a synthetic doc.
+        var buf = new ByteBuffer(item.Data.Length + 16);
+        try
+        {
+            buf.WriteInt32(0);
+            buf.WriteByte((byte)item.Type);
+            buf.WriteByte(1);
+            buf.WriteByte((byte)'v');
+            WriteRawValue(buf, item);
+            buf.WriteByte(0);
+            buf.PatchInt32(0, buf.Length);
+            return _elemFilter!.Matches(new RawDocument(buf.WrittenSpan));
+        }
+        finally
+        {
+            buf.Dispose();
+        }
     }
 
     private static void WriteRawValue(ByteBuffer buf, RawValue v)
