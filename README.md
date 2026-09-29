@@ -14,6 +14,9 @@ no reflection — typed mapping is done by a source generator).
 - **Single file + WAL**, SQLite-style: write-ahead log with checksummed frames, crash recovery, automatic/manual checkpoints.
 - **ACID transactions**: many concurrent readers (snapshot isolation) + one writer; auto-commit per statement.
 - **Binary document format** (BSON-like: typed, length-prefixed, zero-copy field access). JSON is only used for input/output.
+- **Numbers**: `int32`, `int64`, `double` and native 128-bit `decimal` (`NumberDecimal('0.1')` / `{"$numberDecimal":"0.1"}`, `$type: 'decimal'`).
+  Each value keeps its type, but comparisons, indexes and sort use the exact numeric value across types
+  (`5 == 5L == 5.0 == 5m`, `0.1m < 0.1`). Arithmetic (`$inc`/`$mul`) promotes int32 → int64 → double → decimal.
 - **B+Tree** primary index on `_id` (auto-generated `ObjectId` when missing) and **secondary indexes** (single field, dotted paths, unique, multikey on arrays).
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert.
@@ -122,7 +125,7 @@ folio> .dump > backup.js
 | Layer | Files | Notes |
 |---|---|---|
 | Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader, relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
-| Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. |
+| Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
 | Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
 | B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. |
 | Catalog / engine | `Engine/*` | Collections and index metadata in a catalog tree; index maintenance on insert/update/delete; unique constraints. |
@@ -162,11 +165,25 @@ with an index on `json_extract(data,'$.city')`, WAL + `synchronous=NORMAL`; Lite
 
 The indexed-equality case materializes 100 full `Document` objects while the SQLite benchmark only reads the JSON text.
 
+Numeric representation (`NumericBenchmarks`; a 10k-doc collection with an index on `price`):
+
+| Operation | `double` | `decimal` (native) | `decimal` as string |
+|---|---:|---:|---:|
+| Serialize document | 149 ns | 167 ns | 160 ns |
+| Deserialize document | 241 ns | 252 ns | 261 ns |
+| Encode index key | 30 ns | 92 ns | 46 ns |
+| Indexed range count (~100 hits) | 67 µs | 80 µs | 80 µs |
+
+The string representation is only shown for cost comparison: it sorts lexicographically (`"10" < "9"`), so it is not a valid option.
+
+Update rewrite cost (`UpdateRewriteBenchmarks`, one `$inc` per document): values are immutable in the binary format,
+so an update re-serializes the whole document and rewrites its B+Tree cell (or overflow chain). Cost therefore scales with document size:
+~3.7 µs for 200 B, ~28 µs for 4 KB and ~440 µs for 64 KB (overflow pages).
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
 - Single-field indexes only (no compound indexes); no aggregation pipeline, no full-text search.
-- Typed `decimal` members are stored losslessly as invariant strings, so range queries on them compare as strings; `ulong` values above `long.MaxValue` are stored the same way.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

@@ -77,6 +77,13 @@ internal static class DocumentSerializer
             case DocType.Double:
             case DocType.DateTime: buf.WriteInt64(value.RawBits); break;
             case DocType.Boolean: buf.WriteByte((byte)(value.RawBits != 0 ? 1 : 0)); break;
+            case DocType.Decimal:
+            {
+                Span<int> bits = stackalloc int[4];
+                decimal.GetBits(value.AsDecimal, bits);
+                foreach (int b in bits) buf.WriteInt32(b);
+                break;
+            }
             case DocType.String:
             {
                 string s = value.AsString;
@@ -124,6 +131,18 @@ internal readonly ref struct RawValue
     public long Int64 => BinaryPrimitives.ReadInt64LittleEndian(Data);
     public double Double => BitConverter.Int64BitsToDouble(Int64);
     public bool Boolean => Data[0] != 0;
+
+    /// <summary>Decimal stored as its four little-endian <see cref="decimal.GetBits(decimal)"/> words.</summary>
+    public decimal Decimal
+    {
+        get
+        {
+            Span<int> bits = stackalloc int[4];
+            for (int i = 0; i < 4; i++) bits[i] = BinaryPrimitives.ReadInt32LittleEndian(Data[(i * 4)..]);
+            try { return new decimal(bits); }
+            catch (ArgumentException) { throw new CorruptDatabaseException("Invalid decimal value."); }
+        }
+    }
     public RawDocument AsDocument => new(Data);
     public RawArray AsArray => new(Data);
 
@@ -133,6 +152,7 @@ internal readonly ref struct RawValue
         DocType.Int32 => DocValue.FromInt32(Int32),
         DocType.Int64 => DocValue.FromInt64(Int64),
         DocType.Double => DocValue.FromDouble(Double),
+        DocType.Decimal => DocValue.FromDecimal(Decimal),
         DocType.DateTime => DocValue.FromUnixMilliseconds(Int64),
         DocType.Boolean => DocValue.FromBoolean(Boolean),
         DocType.String => DocValue.FromString(Encoding.UTF8.GetString(Data)),
@@ -155,6 +175,7 @@ internal readonly ref struct RawValue
             case DocType.Double:
             case DocType.DateTime: consumed = 8; return new(type, data[..8]);
             case DocType.ObjectId: consumed = ObjectId.Size; return new(type, data[..ObjectId.Size]);
+            case DocType.Decimal: consumed = 16; return new(type, data[..16]);
             case DocType.String:
             case DocType.Binary:
             {

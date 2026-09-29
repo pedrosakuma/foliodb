@@ -118,7 +118,7 @@ internal static class FilterParser
     {
         DocType.Boolean => v.AsBoolean,
         DocType.Null => false,
-        DocType.Int32 or DocType.Int64 or DocType.Double => v.AsDouble != 0,
+        DocType.Int32 or DocType.Int64 or DocType.Double or DocType.Decimal => v.AsDouble != 0,
         _ => true,
     };
 
@@ -144,6 +144,7 @@ internal static class FilterParser
             "null" => DocType.Null,
             "int" or "int32" => DocType.Int32,
             "long" or "int64" => DocType.Int64,
+            "decimal" or "decimal128" => DocType.Decimal,
             var s => throw new FolioException($"Unknown $type '{s}'."),
         };
     }

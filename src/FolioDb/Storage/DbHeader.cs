@@ -7,7 +7,7 @@ namespace FolioDb.Storage;
 internal struct DbHeader
 {
     public static ReadOnlySpan<byte> Magic => "FolioDb format 1"u8; // exactly 16 bytes
-    public const int FormatVersion = 1;
+    public const int FormatVersion = 2;
 
     public int PageSize;
     public uint PageCount;
@@ -49,6 +49,8 @@ internal struct DbHeader
     {
         if (!first64[..16].SequenceEqual(Magic))
             throw new CorruptDatabaseException($"Not a FolioDb database (found '{Encoding.ASCII.GetString(first64[..16])}').");
+        int version = BinaryPrimitives.ReadInt32LittleEndian(first64[20..]);
+        if (version != FormatVersion) throw new CorruptDatabaseException($"Unsupported format version {version}.");
         return BinaryPrimitives.ReadInt32LittleEndian(first64[16..]);
     }
 }

@@ -140,6 +140,12 @@ internal static class UpdateApplier
         if (!doc.TryGetPath(path, out var cur) || cur.IsNull) return multiply ? Zero(operand) : operand;
         if (!cur.IsNumber) throw new FolioException($"Cannot apply {(multiply ? "$mul" : "$inc")} to non-numeric field '{path}'.");
 
+        // Promotion: decimal > double > int64 > int32 (as in MongoDB).
+        if (cur.Type == DocType.Decimal || operand.Type == DocType.Decimal)
+        {
+            try { return multiply ? cur.AsDecimal * operand.AsDecimal : cur.AsDecimal + operand.AsDecimal; }
+            catch (OverflowException) { throw new FolioException($"Decimal overflow applying {(multiply ? "$mul" : "$inc")} to '{path}'."); }
+        }
         if (cur.Type == DocType.Double || operand.Type == DocType.Double)
             return multiply ? cur.AsDouble * operand.AsDouble : cur.AsDouble + operand.AsDouble;
 
@@ -152,6 +158,7 @@ internal static class UpdateApplier
     private static DocValue Zero(DocValue like) => like.Type switch
     {
         DocType.Double => 0.0,
+        DocType.Decimal => 0m,
         DocType.Int64 => 0L,
         _ => 0,
     };

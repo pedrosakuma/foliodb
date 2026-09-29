@@ -54,14 +54,12 @@ public static class FolioMapper
         _ => throw new InvalidCastException($"Cannot read {value.Type} value as Guid."),
     };
 
-    /// <summary>Decimals are stored as invariant strings: lossless (value and scale), but not numerically comparable in queries.</summary>
-    public static DocValue WriteDecimal(decimal value) => value.ToString(CultureInfo.InvariantCulture);
+    public static DocValue WriteDecimal(decimal value) => DocValue.FromDecimal(value);
 
     public static decimal ReadDecimal(DocValue value) => value.Type switch
     {
-        DocType.String => decimal.Parse(value.AsString, CultureInfo.InvariantCulture),
-        DocType.Int32 or DocType.Int64 => value.AsInt64,
-        _ => (decimal)value.AsDouble,
+        DocType.String => decimal.Parse(value.AsString, NumberStyles.Float, CultureInfo.InvariantCulture),
+        _ => value.AsDecimal,
     };
 
     public static DocValue WriteDateTimeOffset(DateTimeOffset value) => DocValue.FromDateTime(value.UtcDateTime);
@@ -76,14 +74,15 @@ public static class FolioMapper
     public static DocValue WriteChar(char value) => value.ToString();
     public static char ReadChar(DocValue value) => value.AsString is [var c] ? c : throw new InvalidCastException("Expected a single-character string.");
 
-    /// <summary>Stored as Int64 when it fits, otherwise as an invariant decimal string (lossless).</summary>
+    /// <summary>Stored as Int64 when it fits, otherwise as an exact Decimal (still numeric for queries and indexes).</summary>
     public static DocValue WriteUInt64(ulong value) =>
-        value <= long.MaxValue ? (long)value : value.ToString(CultureInfo.InvariantCulture);
+        value <= long.MaxValue ? DocValue.FromInt64((long)value) : DocValue.FromDecimal(value);
 
     public static ulong ReadUInt64(DocValue value) => value.Type switch
     {
         DocType.String => ulong.Parse(value.AsString, CultureInfo.InvariantCulture),
         DocType.Int32 or DocType.Int64 => checked((ulong)value.AsInt64),
+        DocType.Decimal => decimal.ToUInt64(value.AsDecimal),
         _ => checked((ulong)value.AsDouble),
     };
 }

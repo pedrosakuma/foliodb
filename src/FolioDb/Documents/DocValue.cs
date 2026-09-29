@@ -23,11 +23,12 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
 
     public DocType Type => _type == 0 ? DocType.Null : _type;
     public bool IsNull => Type == DocType.Null;
-    public bool IsNumber => _type is DocType.Int32 or DocType.Int64 or DocType.Double;
+    public bool IsNumber => _type is DocType.Int32 or DocType.Int64 or DocType.Double or DocType.Decimal;
 
     public static DocValue FromInt32(int v) => new(DocType.Int32, v, null);
     public static DocValue FromInt64(long v) => new(DocType.Int64, v, null);
     public static DocValue FromDouble(double v) => new(DocType.Double, BitConverter.DoubleToInt64Bits(v), null);
+    public static DocValue FromDecimal(decimal v) => new(DocType.Decimal, 0, v);
     public static DocValue FromBoolean(bool v) => new(DocType.Boolean, v ? 1 : 0, null);
     public static DocValue FromString(string? v) => v is null ? Null : new(DocType.String, 0, v);
     public static DocValue FromBinary(byte[]? v) => v is null ? Null : new(DocType.Binary, 0, v);
@@ -48,6 +49,7 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
     public static implicit operator DocValue(int v) => FromInt32(v);
     public static implicit operator DocValue(long v) => FromInt64(v);
     public static implicit operator DocValue(double v) => FromDouble(v);
+    public static implicit operator DocValue(decimal v) => FromDecimal(v);
     public static implicit operator DocValue(bool v) => FromBoolean(v);
     public static implicit operator DocValue(string? v) => FromString(v);
     public static implicit operator DocValue(byte[]? v) => FromBinary(v);
@@ -61,6 +63,7 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
         DocType.Int32 => (int)_bits,
         DocType.Int64 => checked((int)_bits),
         DocType.Double => checked((int)BitConverter.Int64BitsToDouble(_bits)),
+        DocType.Decimal => (int)(decimal)_ref!,
         _ => throw InvalidCast("Int32"),
     };
 
@@ -68,6 +71,7 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
     {
         DocType.Int32 or DocType.Int64 => _bits,
         DocType.Double => checked((long)BitConverter.Int64BitsToDouble(_bits)),
+        DocType.Decimal => (long)(decimal)_ref!,
         _ => throw InvalidCast("Int64"),
     };
 
@@ -75,7 +79,17 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
     {
         DocType.Int32 or DocType.Int64 => _bits,
         DocType.Double => BitConverter.Int64BitsToDouble(_bits),
+        DocType.Decimal => (double)(decimal)_ref!,
         _ => throw InvalidCast("Double"),
+    };
+
+    /// <summary>Exact for integers and decimals; doubles are converted with <see cref="decimal"/>'s own rounding (~15 significant digits).</summary>
+    public decimal AsDecimal => _type switch
+    {
+        DocType.Int32 or DocType.Int64 => _bits,
+        DocType.Double => (decimal)BitConverter.Int64BitsToDouble(_bits),
+        DocType.Decimal => (decimal)_ref!,
+        _ => throw InvalidCast("Decimal"),
     };
 
     public bool AsBoolean => _type == DocType.Boolean ? _bits != 0 : throw InvalidCast("Boolean");
@@ -115,6 +129,7 @@ public readonly struct DocValue : IEquatable<DocValue>, IComparable<DocValue>
         DocType.Null => "null",
         DocType.Int32 or DocType.Int64 => _bits.ToString(CultureInfo.InvariantCulture),
         DocType.Double => AsDouble.ToString("R", CultureInfo.InvariantCulture),
+        DocType.Decimal => AsDecimal.ToString(CultureInfo.InvariantCulture),
         DocType.Boolean => AsBoolean ? "true" : "false",
         DocType.String => AsString,
         DocType.ObjectId => AsObjectId.ToString(),

@@ -14,4 +14,6 @@ public enum DocType : byte
     Null = 0x0A,
     Int32 = 0x10,
     Int64 = 0x12,
+    /// <summary>Exact base-10 number (.NET <see cref="decimal"/>: 96-bit mantissa, scale 0..28).</summary>
+    Decimal = 0x13,
 }

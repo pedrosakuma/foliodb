@@ -10,5 +10,6 @@
   <ItemGroup>
     <PackageReference Include="System.IO.Hashing" Version="10.0.0" />
     <InternalsVisibleTo Include="FolioDb.Tests" />
+    <InternalsVisibleTo Include="FolioDb.Bench" />
   </ItemGroup>
 </Project>

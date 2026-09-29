@@ -7,8 +7,8 @@ namespace FolioDb;
 
 /// <summary>
 /// JSON transport layer (never used for storage). The parser is lenient (Mongo-shell style): unquoted keys,
-/// single-quoted strings, trailing commas, <c>ObjectId("..")</c>, <c>ISODate("..")</c>, <c>NumberLong(..)</c>
-/// and Extended JSON wrappers (<c>{"$oid":..}</c>, <c>{"$date":..}</c>, <c>{"$numberLong":..}</c>, <c>{"$binary":..}</c>).
+/// single-quoted strings, trailing commas, <c>ObjectId("..")</c>, <c>ISODate("..")</c>, <c>NumberLong(..)</c>, <c>NumberDecimal("..")</c>
+/// and Extended JSON wrappers (<c>{"$oid":..}</c>, <c>{"$date":..}</c>, <c>{"$numberLong":..}</c>, <c>{"$numberDecimal":..}</c>, <c>{"$binary":..}</c>).
 /// Numbers: integers → Int32/Int64, anything with '.', or exponent → Double.
 /// The writer emits relaxed Extended JSON; doubles always keep a decimal point so types round-trip.
 /// </summary>
@@ -153,6 +153,8 @@ public static class DocJson
                         return DocValue.FromInt32(int.Parse(v.AsString, CultureInfo.InvariantCulture));
                     case "$numberDouble" when v.Type == DocType.String:
                         return DocValue.FromDouble(ParseDoubleSpecial(v.AsString));
+                    case "$numberDecimal" when v.Type == DocType.String:
+                        return ParseDecimal(v.AsString);
                     case "$binary" when v.Type == DocType.String: return DocValue.FromBinary(Convert.FromBase64String(v.AsString));
                     case "$binary" when v.Type == DocType.Document && v.AsDocument.TryGetValue("base64", out var b64):
                         return DocValue.FromBinary(Convert.FromBase64String(b64.AsString));
@@ -160,6 +162,11 @@ public static class DocJson
             }
             return doc;
         }
+
+        private DocValue ParseDecimal(string s) =>
+            decimal.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var m)
+                ? DocValue.FromDecimal(m)
+                : throw Error($"Invalid decimal '{s}' (range ±7.9e28, up to 28 decimal places)");
 
         private static double ParseDoubleSpecial(string s) => s switch
         {
@@ -307,6 +314,9 @@ public static class DocJson
                     return arg.Type == DocType.String ? int.Parse(arg.AsString, CultureInfo.InvariantCulture) : arg.AsInt32;
                 case "NumberDouble":
                     return arg.Type == DocType.String ? ParseDoubleSpecial(arg.AsString) : arg.AsDouble;
+                case "NumberDecimal":
+                    // Pass a string for exactness: NumberDecimal(0.1) goes through a double literal first.
+                    return arg.Type == DocType.String ? ParseDecimal(arg.AsString) : DocValue.FromDecimal(arg.AsDecimal);
                 case "BinData":
                     return Convert.FromBase64String(arg.AsString);
                 default: throw Error($"Unknown function '{ident}'");
@@ -349,6 +359,11 @@ public static class DocJson
                 }
                 break;
             }
+            case DocType.Decimal:
+                w.WriteStartObject();
+                w.WriteString("$numberDecimal", v.AsDecimal.ToString(CultureInfo.InvariantCulture));
+                w.WriteEndObject();
+                break;
             case DocType.String: w.WriteStringValue(v.AsString); break;
             case DocType.ObjectId:
                 w.WriteStartObject();

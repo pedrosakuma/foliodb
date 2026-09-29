@@ -12,6 +12,20 @@ public partial class NumericHolder
 public class RegressionTests
 {
     [Fact]
+    public void OlderFormatVersionIsRejected()
+    {
+        using var tmp = new TempDb();
+        using (var db = tmp.Open()) db.GetCollection("c").Insert("{ _id: 1 }");
+        using (var fs = File.OpenWrite(tmp.Path))
+        {
+            fs.Position = 20;
+            fs.Write(BitConverter.GetBytes(1));
+        }
+        var ex = Assert.Throws<CorruptDatabaseException>(() => tmp.Open());
+        Assert.Contains("format version 1", ex.Message);
+    }
+
+    [Fact]
     public void RenameIntoIdIsRejected()
     {
         using var tmp = new TempDb();
