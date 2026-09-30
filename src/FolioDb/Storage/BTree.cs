@@ -54,6 +54,85 @@ internal readonly struct BTree
         SetContentStart(page, pageSize, pageSize);
     }
 
+    /// <summary>Builds a new tree from strictly increasing keys, keeping only its rightmost page at each level.</summary>
+    internal sealed class BulkBuilder
+    {
+        private readonly StorageTx _tx;
+        private readonly List<Level> _levels = [];
+        private byte[]? _lastKey;
+
+        private sealed record Level(uint Page, byte[] FirstKey);
+
+        public BulkBuilder(StorageTx tx)
+        {
+            _tx = tx;
+            uint page = tx.AllocatePage();
+            InitEmptyLeaf(tx.WritePage(page), tx.PageSize);
+            _levels.Add(new Level(page, []));
+        }
+
+        public void Add(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (key.Length > MaxKeySize(_tx.PageSize))
+                throw new FolioException($"Key of {key.Length} bytes exceeds the maximum of {MaxKeySize(_tx.PageSize)} bytes for page size {_tx.PageSize}.");
+            if (_lastKey is not null && key.SequenceCompareTo(_lastKey) <= 0)
+                throw new InvalidOperationException("Bulk-load keys must be strictly increasing.");
+            var tree = new BTree(_tx, _levels[0].Page);
+            var cell = tree.LeafCell(key, value);
+            var leaf = _tx.WritePage(_levels[0].Page);
+            if (!tree.TryInsertCell(leaf, Count(leaf), cell))
+            {
+                AppendChild(1, _levels[0]);
+                uint page = _tx.AllocatePage();
+                InitEmptyLeaf(_tx.WritePage(page), _tx.PageSize);
+                _levels[0] = new Level(page, key.ToArray());
+                if (!tree.TryInsertCell(_tx.WritePage(page), 0, cell))
+                    throw new InvalidOperationException("Bulk-load leaf cell does not fit on an empty page.");
+            }
+            else if (_lastKey is null) _levels[0] = new Level(_levels[0].Page, key.ToArray());
+            _lastKey = key.ToArray();
+        }
+
+        private void AppendChild(int level, Level child)
+        {
+            if (level == _levels.Count)
+            {
+                uint page = _tx.AllocatePage();
+                var interior = _tx.WritePage(page);
+                Array.Clear(interior);
+                interior[0] = InteriorType;
+                SetRightChild(interior, child.Page);
+                SetContentStart(interior, _tx.PageSize, _tx.PageSize);
+                _levels.Add(new Level(page, child.FirstKey));
+                return;
+            }
+            var current = _levels[level];
+            var tree = new BTree(_tx, current.Page);
+            var pageData = _tx.WritePage(current.Page);
+            var cell = InteriorCell(child.FirstKey, RightChild(pageData));
+            if (tree.TryInsertCell(pageData, Count(pageData), cell))
+            {
+                SetRightChild(pageData, child.Page);
+                return;
+            }
+            AppendChild(level + 1, current);
+            uint next = _tx.AllocatePage();
+            var interiorPage = _tx.WritePage(next);
+            Array.Clear(interiorPage);
+            interiorPage[0] = InteriorType;
+            SetRightChild(interiorPage, child.Page);
+            SetContentStart(interiorPage, _tx.PageSize, _tx.PageSize);
+            _levels[level] = new Level(next, child.FirstKey);
+        }
+
+        public uint Finish()
+        {
+            for (int level = 0; level + 1 < _levels.Count; level++)
+                AppendChild(level + 1, _levels[level]);
+            return _levels[^1].Page;
+        }
+    }
+
     // ------------------------------------------------------------------ page accessors
 
     private static int Count(ReadOnlySpan<byte> p) => BinaryPrimitives.ReadUInt16LittleEndian(p[2..]);

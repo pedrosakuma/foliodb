@@ -352,6 +352,23 @@ public sealed class Collection
         return meta is not null && CollectionEngine.DropIndex(tx, meta, keys);
     }, atomic: true);
 
+    /// <summary>
+    /// Rebuilds an existing secondary index in key order inside a write transaction. Returns false if absent;
+    /// the primary _id index cannot be rebuilt. Readers retain their previous snapshot until it closes.
+    /// </summary>
+    public bool RebuildIndex(string nameOrField) => Write(tx =>
+    {
+        var meta = tx.GetCollection(Name);
+        return meta is not null && CollectionEngine.RebuildIndex(tx, meta, nameOrField);
+    }, atomic: false);
+
+    /// <summary>Rebuilds the secondary index matching the ordered key pattern; returns false if absent.</summary>
+    public bool RebuildIndex(Document keys) => Write(tx =>
+    {
+        var meta = tx.GetCollection(Name);
+        return meta is not null && CollectionEngine.RebuildIndex(tx, meta, keys);
+    }, atomic: false);
+
     public IReadOnlyList<IndexInfo> GetIndexes() => Read((_, meta) =>
     {
         var list = new List<IndexInfo> { new("_id_", "_id", true, false) };

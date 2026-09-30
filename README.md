@@ -25,6 +25,8 @@ no reflection — typed mapping is done by a source generator).
   product, limited to 1,000 keys per document; multikey queries always recheck the document. Patterns allow at most
   32 fields and do not allow `_id` as a compound component. `GetIndexes().Keys` retains the full ordered pattern;
   `DropIndex(pattern)` matches normalized directions. Generated names gain a numeric suffix on collisions.
+- **Explicit secondary-index rebuild**: `RebuildIndex(nameOrField)` or `RebuildIndex(pattern)` bulk-loads a new tree
+  in sorted key order, then replaces its catalog root and frees the old tree in one transaction.
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
   **Covered queries**: counts and index-field/`_id` projections are answered from index keys alone when the index is exact
   (not multikey, single predicate, same-field range, or a compound prefix/range covering every predicate).
@@ -87,6 +89,43 @@ long total = snap.GetCollection("accounts").Count();
 
 Writers are serialized by an in-process lock; a writer waiting longer than `BusyTimeout` gets
 `"database is busy"`. Readers never block and never see uncommitted data.
+
+### Rebuilding a secondary index
+
+```csharp
+var users = db.GetCollection("users");
+users.CreateIndex(Document.Parse("{ city: 1, age: -1 }"));
+bool rebuilt = users.RebuildIndex(Document.Parse("{ city: 1, age: -1 }"));
+// Or users.RebuildIndex("city_1_age_-1"); for a plain ascending field, "city" also works.
+```
+
+The typed `Collection<T>` has the same overloads. `false` means the collection or matching index does not
+exist; `_id_` is the primary tree and is not rebuilt (`false`). Patterns use the same validation and normalized
+directions as `DropIndex`. Rebuilding an empty index succeeds. The name, ordered pattern and unique setting
+are retained; multikey status and encoded value/type hints are recomputed from current documents. Duplicates
+in a unique index fail with `DuplicateKeyException`. A failed rebuild in an explicit transaction dooms that
+transaction: dispose/roll it back, rather than committing it. A read-only snapshot rejects the operation.
+
+An automatic call is one atomic write; inside `BeginTransaction()` it joins that transaction. It holds the
+writer admission lock for the full sort/build/commit, so other writers wait or time out; existing readers and
+snapshots continue to see the old catalog and tree. After commit new readers see the new tree. WAL recovery
+preserves either version, never a partially published index. A borrowed read callback in the same transaction
+cannot invoke maintenance; the usual write guard applies. There is no cancellation API.
+
+The sort keeps approximately 8 MiB of encoded entries in memory plus at most one merge head per run (up to
+128 runs); entries spill to delete-on-close files in the system temporary directory. When the 128-run limit
+is exceeded or temporary storage runs out, the operation fails and the transaction must roll back. A write
+transaction also buffers dirty database pages and WAL frames, so its memory/WAL demand scales with the new
+tree and the pages freed from the old tree. Reserve temporary disk space for both the sort runs (up to
+approximately 1 GiB at the run limit) and the database WAL; a full disk can fail the operation. Sorted
+bulk-loading removes fragmentation in the rebuilt index and typically improves page occupancy; it does **not**
+reorganize the primary tree or shrink the database file. Freed pages return to the freelist for reuse.
+Measure paired rebuild versus transactional drop/create on seeded histories with
+`dotnet run -c Release --project bench/FolioDb.Bench -- --index-maintenance 3000 2`. The CSV reports
+occupancy, height, elapsed time, thread allocations, sort scratch, WAL and freelist; diagnostics and
+integrity checks are outside timed sections. Working-set values are before/after snapshots, not peak memory.
+Running repeatedly on the target storage is recommended
+before deciding whether maintenance is worthwhile.
 
 #### Optional FIFO writer admission
 

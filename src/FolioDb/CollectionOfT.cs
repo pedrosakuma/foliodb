@@ -81,6 +81,8 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public string CreateIndex(Document keys, bool unique = false) => Untyped.CreateIndex(keys, unique);
     public bool DropIndex(string nameOrField) => Untyped.DropIndex(nameOrField);
     public bool DropIndex(Document keys) => Untyped.DropIndex(keys);
+    public bool RebuildIndex(string nameOrField) => Untyped.RebuildIndex(nameOrField);
+    public bool RebuildIndex(Document keys) => Untyped.RebuildIndex(keys);
     public IReadOnlyList<IndexInfo> GetIndexes() => Untyped.GetIndexes();
 
     private static List<T> Map(List<Document> docs)

@@ -569,7 +569,7 @@ internal static class CollectionEngine
 
     public static bool DropIndex(EngineTx tx, CollectionMeta meta, string nameOrField)
     {
-        var index = meta.Indexes.FirstOrDefault(i => i.Name == nameOrField) ?? meta.Indexes.FirstOrDefault(i => i.IsSimple && i.Field == nameOrField);
+        var index = FindIndex(meta, nameOrField);
         if (index is null) return false;
         new BTree(tx.Storage, index.Root).Drop();
         meta.Indexes.Remove(index);
@@ -582,6 +582,72 @@ internal static class CollectionEngine
         var fields = IndexMeta.ParsePattern(keys);
         var index = meta.Indexes.FirstOrDefault(i => i.SameFields(fields));
         return index is not null && DropIndex(tx, meta, index.Name);
+    }
+
+    private static IndexMeta? FindIndex(CollectionMeta meta, string nameOrField) =>
+        meta.Indexes.FirstOrDefault(i => i.Name == nameOrField)
+        ?? meta.Indexes.FirstOrDefault(i => i.IsSimple && i.Field == nameOrField);
+
+    public static bool RebuildIndex(EngineTx tx, CollectionMeta meta, string nameOrField) =>
+        RebuildIndex(tx, meta, FindIndex(meta, nameOrField));
+
+    public static bool RebuildIndex(EngineTx tx, CollectionMeta meta, Document keys)
+    {
+        var fields = IndexMeta.ParsePattern(keys);
+        return RebuildIndex(tx, meta, meta.Indexes.FirstOrDefault(i => i.SameFields(fields)));
+    }
+
+    private static bool RebuildIndex(EngineTx tx, CollectionMeta meta, IndexMeta? old)
+    {
+        if (old is null) return false;
+        using var sorted = new IndexSort();
+        var primary = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
+        bool multiKey = false;
+        for (bool ok = primary.SeekFirst(); ok; ok = primary.MoveNext())
+        {
+            var idKey = primary.Key;
+            var bytes = primary.Value;
+            var idHint = IndexHint.ForId(bytes);
+            var keys = ExtractIndexKeys(bytes, old, out bool multi);
+            multiKey |= multi;
+            foreach (var (key, hint) in keys)
+            {
+                CheckKeySize(tx, old, key.Length + idKey.Length);
+                sorted.Add(Concat(key, idKey), key.Length, IndexHint.Entry(idHint, hint));
+            }
+        }
+
+        var builder = new BTree.BulkBuilder(tx.Storage);
+        byte[]? previousKey = null, previousValue = null;
+        IndexSort.Entry? pending = null;
+        foreach (var entry in sorted.Sorted())
+        {
+            if (pending is { } last && !last.Key.AsSpan().SequenceEqual(entry.Key))
+            {
+                builder.Add(last.Key, last.Hint);
+                pending = null;
+            }
+            var value = entry.Key.AsSpan(0, entry.ValueLength);
+            if (old.Unique && previousValue is not null && value.SequenceEqual(previousValue)
+                && !entry.Key.AsSpan().SequenceEqual(previousKey))
+                throw new DuplicateKeyException($"Cannot rebuild unique index '{old.Name}': duplicate value {old.DescribeKey(value)}.");
+            previousKey = entry.Key;
+            previousValue = value.ToArray();
+            pending = entry; // Repeated keys from one document keep the last hint, as regular insertion does.
+        }
+        if (pending is { } final) builder.Add(final.Key, final.Hint);
+        var replacement = new IndexMeta
+        {
+            Name = old.Name,
+            Fields = old.Fields,
+            Unique = old.Unique,
+            Root = builder.Finish(),
+            MultiKey = multiKey,
+        };
+        meta.Indexes[meta.Indexes.IndexOf(old)] = replacement;
+        tx.SaveCollection(meta);
+        new BTree(tx.Storage, old.Root).Drop();
+        return true;
     }
 }
 

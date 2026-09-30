@@ -140,8 +140,11 @@ static void Run(string path)
         Check(back.CreatedAt == new DateTime(2024, 1, 2, 3, 4, 5, DateTimeKind.Utc), "typed date");
         Check(back.Id == id.AsObjectId, "typed id");
         Check(orders.Find("{ 'lines.sku': 'pen' }").Count == 1, "typed query");
+        Check(orders.RebuildIndex("customer") && orders.Find("{ customer: 'ana' }").Count == 1, "typed rebuild");
         users.CreateIndex(Document.Parse("{age:1,email:-1}"));
         Check(users.Count("{age:30,email:{$gte:'u'}}") == users.Find("{age:30}").Count, "compound count");
+        Check(users.RebuildIndex(Document.Parse("{age:1,email:-1}")) && users.RebuildIndex("email"), "AOT rebuild");
+        Check(users.Count("{age:30,email:{$gte:'u'}}") == users.Find("{age:30}").Count, "rebuilt compound query");
         Check(users.Find("{age:30}", new FindOptions { Projection = Document.Parse("{age:1,email:1}") }).Count > 0, "compound projection");
         Check(users.FindOne("{email:'u5@x.io'}", new FindOptions { Projection = Document.Parse("{tags:{$slice:1}}") })!["tags"].AsArray.Count == 1, "slice projection");
         var groups = users.Aggregate("[{$match:{age:30}},{$group:{_id:'$age',n:{$count:{}},avg:{$avg:'$age'}}}]");
