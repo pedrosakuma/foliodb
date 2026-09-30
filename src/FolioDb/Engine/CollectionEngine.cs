@@ -597,6 +597,74 @@ internal static class CollectionEngine
         return RebuildIndex(tx, meta, meta.Indexes.FirstOrDefault(i => i.SameFields(fields)));
     }
 
+    /// <summary>Copies one collection into a new database using sorted bulk-loaded primary and secondary trees.</summary>
+    internal static void CopyForVacuum(EngineTx source, CollectionMeta sourceMeta, EngineTx destination, CancellationToken cancellationToken)
+    {
+        var primaryBuilder = new BTree.BulkBuilder(destination.Storage);
+        var sourcePrimary = new BTree(source.Storage, sourceMeta.PrimaryRoot).CreateCursor();
+        for (bool ok = sourcePrimary.SeekFirst(); ok; ok = sourcePrimary.MoveNext())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            primaryBuilder.Add(sourcePrimary.Key, sourcePrimary.Value);
+        }
+
+        var copy = new CollectionMeta { Name = sourceMeta.Name, PrimaryRoot = primaryBuilder.Finish() };
+        foreach (var index in sourceMeta.Indexes)
+            copy.Indexes.Add(CopyIndexForVacuum(source, sourceMeta, destination, index, cancellationToken));
+        destination.SaveCollection(copy);
+    }
+
+    private static IndexMeta CopyIndexForVacuum(EngineTx source, CollectionMeta sourceMeta, EngineTx destination,
+        IndexMeta template, CancellationToken cancellationToken)
+    {
+        using var sorted = new IndexSort();
+        var primary = new BTree(source.Storage, sourceMeta.PrimaryRoot).CreateCursor();
+        bool multiKey = false;
+        for (bool ok = primary.SeekFirst(); ok; ok = primary.MoveNext())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var idKey = primary.Key;
+            var bytes = primary.Value;
+            var idHint = IndexHint.ForId(bytes);
+            var keys = ExtractIndexKeys(bytes, template, out bool multi);
+            multiKey |= multi;
+            foreach (var (key, hint) in keys)
+            {
+                CheckKeySize(destination, template, key.Length + idKey.Length);
+                sorted.Add(Concat(key, idKey), key.Length, IndexHint.Entry(idHint, hint));
+            }
+        }
+
+        var builder = new BTree.BulkBuilder(destination.Storage);
+        byte[]? previousKey = null, previousValue = null;
+        IndexSort.Entry? pending = null;
+        foreach (var entry in sorted.Sorted())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (pending is { } last && !last.Key.AsSpan().SequenceEqual(entry.Key))
+            {
+                builder.Add(last.Key, last.Hint);
+                pending = null;
+            }
+            var value = entry.Key.AsSpan(0, entry.ValueLength);
+            if (template.Unique && previousValue is not null && value.SequenceEqual(previousValue)
+                && !entry.Key.AsSpan().SequenceEqual(previousKey))
+                throw new DuplicateKeyException($"Cannot copy unique index '{template.Name}': duplicate value {template.DescribeKey(value)}.");
+            previousKey = entry.Key;
+            previousValue = value.ToArray();
+            pending = entry;
+        }
+        if (pending is { } final) builder.Add(final.Key, final.Hint);
+        return new IndexMeta
+        {
+            Name = template.Name,
+            Fields = [.. template.Fields],
+            Unique = template.Unique,
+            Root = builder.Finish(),
+            MultiKey = multiKey,
+        };
+    }
+
     private static bool RebuildIndex(EngineTx tx, CollectionMeta meta, IndexMeta? old)
     {
         if (old is null) return false;

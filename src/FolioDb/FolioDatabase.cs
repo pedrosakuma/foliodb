@@ -34,7 +34,9 @@ public sealed class FolioDatabase : IDisposable
     }
 
     internal Pager Pager => _pager;
+    internal FolioOptions Options => _options;
     internal int WaitingWriters => _writeLock.WaitingCount;
+    internal Action<VacuumStage>? TestVacuumStage;
 
     internal EngineTx BeginRead()
     {
@@ -109,6 +111,22 @@ public sealed class FolioDatabase : IDisposable
         {
             _writeLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Rebuilds this database into a compact, new file at <paramref name="destination"/> without changing this database.
+    /// The destination must not exist. Reads use one fixed snapshot while concurrent writers may continue on the source.
+    /// </summary>
+    /// <remarks>
+    /// The result is first built and checkpointed in a private staging file in the destination directory, then published
+    /// with a non-overwriting move. If the operation fails or is canceled, the source is unchanged and no destination is
+    /// published. A staging file left after an I/O failure is incomplete and is never named as the requested destination.
+    /// Close this database yourself before replacing its files with the result; this method never swaps the source or WAL.
+    /// </remarks>
+    public void VacuumInto(string destination, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Vacuum.Into(this, destination, cancellationToken);
     }
 
     public DatabaseStats GetStats() => Read(tx => new DatabaseStats(

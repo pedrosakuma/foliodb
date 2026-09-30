@@ -13,6 +13,8 @@ else if (args.Length > 0 && args[0] == "--fragmentation")
     FragmentationWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--index-maintenance")
     IndexMaintenanceWorkload.Run(args[1..]);
+else if (args.Length > 0 && args[0] == "--vacuum")
+    VacuumWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--concurrency")
     ConcurrentWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--sharding")

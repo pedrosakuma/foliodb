@@ -27,6 +27,8 @@ no reflection — typed mapping is done by a source generator).
   `DropIndex(pattern)` matches normalized directions. Generated names gain a numeric suffix on collisions.
 - **Explicit secondary-index rebuild**: `RebuildIndex(nameOrField)` or `RebuildIndex(pattern)` bulk-loads a new tree
   in sorted key order, then replaces its catalog root and frees the old tree in one transaction.
+- **Explicit compact copy**: `VacuumInto(destination)` reconstructs every primary and secondary tree into a compact,
+  new database without modifying the source.
 - **Mongo-style queries**: `$eq $ne $gt $gte $lt $lte $in $nin $exists $type $size $all $elemMatch $regex $not $and $or $nor`, sort, skip, limit, projection, `explain`.
   **Covered queries**: counts and index-field/`_id` projections are answered from index keys alone when the index is exact
   (not multikey, single predicate, same-field range, or a compound prefix/range covering every predicate).
@@ -126,6 +128,55 @@ occupancy, height, elapsed time, thread allocations, sort scratch, WAL and freel
 integrity checks are outside timed sections. Working-set values are before/after snapshots, not peak memory.
 Running repeatedly on the target storage is recommended
 before deciding whether maintenance is worthwhile.
+
+### Compacting into a new database
+
+```csharp
+using var db = FolioDatabase.Open("app.folio");
+db.VacuumInto("app.compact.folio");
+// Close `db`, validate/open app.compact.folio, then perform any replacement yourself.
+```
+
+`VacuumInto` is deliberately an **explicit copy**, not an in-place file swap. It preserves the source main file and
+WAL on success, cancellation, I/O failure, or process crash; it never renames, truncates, checkpoints, or deletes
+either source file. The destination must be absent and cannot name the source, its `-wal`, an existing file,
+directory, hard-link path, or symlink (including a dangling symlink). It is published only after a complete,
+checkpointed staging database has been closed, through a non-overwriting move. If publication loses a race to an
+existing destination, it fails without deleting that foreign entry. Before publication, any interrupted work is only
+a private `.<destination>.vacuum-<random>.tmp` staging file in the target directory, never the requested destination;
+on Unix it is created user-readable/writable only. A failed cleanup can leave that clearly incomplete staging file,
+which can be removed manually after inspection.
+
+The copy holds one source read snapshot from catalog enumeration through the final output checkpoint. Writers may
+continue and the output contains exactly the state at that snapshot; source checkpoints return `false` while that
+snapshot is active, so its WAL can grow. Existing explicit source snapshots are allowed. The output keeps the source
+page size and format compatibility, serialised document bytes, collection names (including empty collections), index
+names/patterns/uniqueness, compound directions, and multikey/type hints. Primary trees are read in `_id` order and
+bulk-loaded; secondary entries are externally sorted and bulk-loaded. This removes freelist holes and B+Tree
+fragmentation in every copied tree, but makes no claim about physical filesystem extent contiguity.
+
+The output commit buffers its dirty output pages, so this release does **not** promise bounded memory: working memory
+and temporary disk scale with the compact output, plus up to roughly 1 GiB of external-index sort runs. Reserve space
+for the source, compact output, WAL, and sort files. `CancellationToken` is checked between collections, documents,
+and sorted index entries; cancellation is not observed inside a single page write. `SynchronousMode.Full` is used for
+the output and it is checkpointed before publish. The non-overwriting rename makes successful process-level
+publication atomic on supported local filesystems, but FolioDb does not claim directory-entry durability across a
+power loss because it cannot portably fsync the containing directory. Linux behavior is exercised in tests; Windows
+uses the same .NET non-overwrite move and handle rules but is not exercised by this test run.
+
+Run a paired seeded churn measurement with:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --vacuum 1000 1
+```
+
+One Linux shared-host trial (4 KiB pages; 1,000 documents with compound and multikey indexes, one-third deleted)
+went from **606 pages / 2,482,176 bytes / 126 free pages** to **351 pages / 1,437,696 bytes / 0 free pages** in
+**52.426 ms**. The matched point-read checksum was 6,460; sampled reads improved from 21.126 to 15.203 us/operation
+for primary lookups and from 53.468 to 32.496 us/operation for indexed ranges. Both files had a 32-byte empty WAL
+after checkpoint. Process working set was sampled at 94.8 MiB before and 95.5 MiB after, **not a peak or an
+attributable allocation measurement**; the implementation's material bound is its transaction's dirty compact-output
+pages plus sort buffers/runs, so measure peak memory and disk on the deployment volume before scheduling large copies.
 
 #### Optional FIFO writer admission
 

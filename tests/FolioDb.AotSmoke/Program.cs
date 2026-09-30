@@ -151,6 +151,15 @@ static void Run(string path)
         Check(groups.Count == 1 && groups[0]["n"].AsInt64 == users.Count("{age:30}") && groups[0]["avg"].AsDouble == 30, "aggregation");
         Check(orders.Aggregate("[{$unwind:'$lines'},{$group:{_id:'$lines.sku',n:{$sum:'$lines.qty'}}}]").Count == 2, "typed aggregation");
         db.CheckIntegrity();
+        string compactPath = path + ".vacuum";
+        db.VacuumInto(compactPath);
+        using (var compact = FolioDatabase.Open(compactPath))
+        {
+            Check(compact.GetCollection("users").Count() == 2000, "vacuum copy");
+            compact.CheckIntegrity();
+        }
+        File.Delete(compactPath);
+        File.Delete(compactPath + "-wal");
     }
 
     // Reopen: durability through checkpoint on close.
