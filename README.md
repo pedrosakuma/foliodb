@@ -42,6 +42,8 @@ no reflection — typed mapping is done by a source generator).
   bytes (scalars, UTF-8 string/binary spans, nested documents/arrays) without building a `Document`; see below.
 - **Optional borrowed queries**: `Visit` uses the existing query planner and filters with a callback per match,
   early termination and no result list. `Find`/`FindOne` remain the convenient materialized APIs.
+- **Reusable filters**: `PreparedFilter` prepares a filter once for repeated materialized or borrowed reads;
+  no runtime code generation, shared plan cache or change to existing JSON/document overloads.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Aggregation**: `$match`, `$project`, `$group`, `$sort`, `$skip`, `$limit`, `$count`, `$unwind`; group accumulators
   `$sum`, `$avg`, `$min`, `$max`, `$count`, `$push`, `$first`, `$last`. A leading `$match` uses the query planner/indexes.
@@ -172,8 +174,10 @@ would see there, including uncommitted writes of the transaction.
   exactly like `FindById`. A completed transaction or disposed snapshot throws `InvalidOperationException`.
 - **Copies**: inline and single-overflow-page documents are read in place. A document spanning several overflow pages
   (larger than page size − 4 bytes) is first assembled into one temporary buffer, exactly as for `FindById`; its
-  fields are still not materialized. The id is encoded into a small key array, and an auto-read call still
-  allocates its read transaction and catalog lookup; a capturing (non-`static`) lambda allocates a closure.
+  fields are still not materialized. Point lookups consume the id encoding directly from a per-thread buffer
+  before invoking the callback. An auto-read call still allocates its read transaction and catalog metadata;
+  a capturing (non-`static`) lambda allocates a closure. Buffer growth, page cache misses and caller-side
+  construction of ids (for example boxing a fresh ObjectId or decimal into DocValue) may also allocate.
 
 ### Choosing the query API
 
@@ -211,6 +215,35 @@ Slow callbacks keep the snapshot open and can delay checkpoints and grow the WAL
 callbacks run progressively: effects from earlier callbacks are not undone if a later read or callback fails.
 Capturing a running sum, as above, allocates a closure per call site evaluation, not per result.
 Parsing/planning, page cache misses, filters such as regex and multi-page overflow may still allocate.
+
+### Reusing filters
+
+```csharp
+var adultFilter = PreparedFilter.Parse("{age:{$gte:18}}");
+// Or: PreparedFilter.FromDocument(new Document { ["age"] = new Document { ["$gte"] = 18 } });
+var adults = people.Find(adultFilter);       // still returns independent documents
+long count = people.Count(adultFilter);
+long visited = people.Visit(adultFilter, static doc => true);
+string plan = people.Explain(adultFilter);
+```
+
+Reuse the same instance across calls. `Find`, `FindOne`, `Count`, `Visit` and `Explain` accept prepared filters;
+the typed collection also exposes the four reading methods (use `Untyped.Explain` for planning).
+`FromDocument` deep-copies input constants, including binary buffers and nested arrays/documents, so later
+mutations of the source do not affect the filter. `Parse` owns its parsed values. Prepared filters are immutable
+and can be shared across threads and databases; transactions/snapshots still have their usual threading rules.
+
+Only parsing/preparation of predicates, paths, constants and regexes is reused. A plan is selected for the
+current catalog on **each** execution, so index creation/removal, multikey changes and snapshot isolation remain
+visible normally. No database pages or snapshots are retained by the filter. Preparation interprets the existing
+filter language and does not emit code, preserving Native AOT support.
+Invalid filters fail during preparation; execution errors retain the normal read behavior.
+Null/empty input to the factory means all documents; a null `PreparedFilter` passed to a collection is an error.
+
+Preparation and the defensive copy have a one-time cost: prepare outside a hot loop. For one-off queries,
+the existing JSON/document overloads remain the simplest choice. This first version has no parameter binding,
+prepared updates/deletes or prepared aggregation pipelines; changing constants requires a new prepared filter.
+Find options (sort/projection) are still processed per call.
 
 ### Aggregation
 
@@ -768,8 +801,9 @@ Short job, one launch, three iterations, shared Linux/.NET 10 JIT host:
 | 8,192 B | Implicit transaction | 26,008 B/op | 9,160 B/op | 65% |
 | 8,192 B | Existing snapshot | 25,152 B/op | 8,304 B/op | 67% |
 
-The remaining 48 bytes are the encoded id key. The implicit scope additionally allocates its read transaction and
-per-transaction catalog lookup (856 B). Multi-page (8 KiB) documents still assemble one temporary buffer (~8.2 KB).
+At this stage, the remaining 48 bytes were the encoded id key. The implicit scope additionally allocated its read
+transaction and per-transaction catalog lookup (856 B). The subsequent setup optimization below removes that key
+array and reduces catalog allocations. Multi-page (8 KiB) documents still assemble one temporary buffer (~8.2 KB).
 Short-run means moved in the same direction (for example 705 -> 514 ns for 128 B and 990 -> 526 ns for 1 KiB in a
 snapshot, 4,349 -> 2,427 ns for 8 KiB implicit), but the three-iteration intervals are wide on a shared host;
 treat them as indicative, not as a latency guarantee. The gain depends on how much of the document the caller would
@@ -801,6 +835,44 @@ are indicative, not latency guarantees or concurrency measurements.
 ```sh
 dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*VisitBenchmarks*' --job short
 ```
+
+### Read setup optimizations: key, catalog, prepared filter
+
+These changes were measured sequentially, before moving to the next step, on the same shared Linux/.NET 10 JIT
+host with BenchmarkDotNet ShortRun. Earlier tables above describe their historical stage.
+
+1. Point lookups now consume `KeyEncoder`'s existing per-thread buffer directly in the synchronous B+Tree lookup.
+   Nothing keeps that key span past the lookup or across a callback. Persistent index/filter keys still use owned
+   arrays and the exact same encoding (including cross-type numeric equality).
+2. Catalog reads decode metadata directly from binary views instead of building intermediate documents, arrays and
+   field-name strings. Names and index descriptors that must persist are still owned. The catalog cache remains
+   per transaction; the on-disk format and catalog validation rules are unchanged.
+3. Optional prepared filters reuse the existing predicate tree, not a stale catalog-dependent plan.
+
+| Warm borrowed point read, 1 KiB payload | Before | After key | After catalog |
+|---|---:|---:|---:|
+| Existing snapshot | 48 B/op | **0 B/op** | **0 B/op** |
+| Implicit transaction | 904 B/op | 856 B/op | **472 B/op** |
+
+The 0 B/op measurement is for a warmed cache and encoding buffer with numeric ids and a cached static callback,
+not a blanket promise. The 8 KiB multi-page case still allocated 8,256 B/op in a snapshot after removing the key
+array; its implicit read dropped from 9,160 to 8,728 B/op after both optimizations. Materialized point reads also
+benefit from removing the key array; materialization itself remains unchanged.
+
+For the indexed query benchmark (1, 100 or 1,000 matches), borrowed queries allocated 3.63 KiB/query originally,
+2.49 KiB after direct catalog decoding, and **1.96 KiB with a reused prepared filter**. In the final comparison:
+
+| 1 match per query | Document filter | Prepared filter |
+|---|---:|---:|
+| Full materialization | 5.08 KiB | 4.55 KiB |
+| Projection | 3.45 KiB | 2.92 KiB |
+| Borrowed visitor | 2.49 KiB | 1.96 KiB |
+
+Preparation happened in benchmark setup and the visitor delegate was cached. These savings are per query,
+not per result: with 1,000 matches, borrowed allocations remained 2.49 vs 1.96 KiB in this workload.
+At one match the visitor means were 2.628 vs 2.349 us; at 100 matches they were 34.245 vs 33.604 us with overlapping
+intervals. Shared-host noise and short iterations prevent broad CPU/latency claims, particularly for larger
+result sets where traversal dominates. No concurrent-throughput or profiler-overhead claim is inferred.
 
 ## Limitations
 

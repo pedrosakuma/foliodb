@@ -156,6 +156,21 @@ public sealed class Collection
         _ => _db.Read(tx => CollectionEngine.Visit(tx, tx.GetCollection(Name), filter, visitor)),
     };
 
+    /// <inheritdoc cref="Visit(Document, Func{DocumentView, bool})"/>
+    public long Visit(PreparedFilter filter, Func<DocumentView, bool> visitor)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        ArgumentNullException.ThrowIfNull(visitor);
+        return Visit(filter.Compiled, visitor);
+    }
+
+    /// <summary>Runs a previously prepared filter, selecting a plan for the current snapshot.</summary>
+    public List<Document> Find(PreparedFilter filter, FindOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Read((tx, meta) => CollectionEngine.Find(tx, meta, filter.Compiled, options));
+    }
+
     public List<Document> Find(Document? filter = null, FindOptions? options = null)
     {
         var f = FilterParser.Parse(filter);
@@ -174,6 +189,9 @@ public sealed class Collection
     public Document? FindOne(string? filter, FindOptions? options = null) =>
         Find(filter, WithLimitOne(options)).FirstOrDefault();
 
+    public Document? FindOne(PreparedFilter filter, FindOptions? options = null) =>
+        Find(filter, WithLimitOne(options)).FirstOrDefault();
+
     private static FindOptions WithLimitOne(FindOptions? o) =>
         new() { Sort = o?.Sort, Projection = o?.Projection, Skip = o?.Skip ?? 0, Limit = 1 };
 
@@ -185,6 +203,12 @@ public sealed class Collection
 
     public long Count(string? filter) => Count(string.IsNullOrWhiteSpace(filter) ? null : Document.Parse(filter));
 
+    public long Count(PreparedFilter filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Read((tx, meta) => CollectionEngine.Count(tx, meta, filter.Compiled));
+    }
+
     /// <summary>Describes how the query would be executed (full scan, primary key or index).</summary>
     public string Explain(Document? filter = null)
     {
@@ -193,6 +217,12 @@ public sealed class Collection
     }
 
     public string Explain(string? filter) => Explain(string.IsNullOrWhiteSpace(filter) ? null : Document.Parse(filter));
+
+    public string Explain(PreparedFilter filter)
+    {
+        ArgumentNullException.ThrowIfNull(filter);
+        return Read((_, meta) => meta is null ? "EMPTY (collection does not exist)" : QueryPlanner.Plan(meta, filter.Compiled).ToString());
+    }
 
     // ------------------------------------------------------------------ updates
 

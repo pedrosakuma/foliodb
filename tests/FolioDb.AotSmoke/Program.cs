@@ -98,6 +98,9 @@ static void Run(string path)
         });
         Check(visited == users.Count("{age:{$lt:10}}") &&
             ageSum == users.Find("{age:{$lt:10}}").Sum(d => d["age"].AsInt32), "borrowed indexed query");
+        var youngFilter = PreparedFilter.Parse("{age:{$lt:10}}");
+        Check(users.Count(youngFilter) == visited && users.Find(youngFilter).Count == visited &&
+            users.Visit(youngFilter, static _ => true) == visited, "prepared filter reuse");
         Check(users.Count("{ age: { $gte: 30, $lt: 40 } }") == 2000 / 90 * 10 + Math.Min(2000 % 90, 40) - Math.Min(2000 % 90, 30), "range count");
         Check(users.Explain("{ email: 'u5@x.io' }").Contains("email"), "index plan");
         Check(users.FindOne("{ email: 'u5@x.io' }")?["age"].AsInt32 == 5, "findOne");

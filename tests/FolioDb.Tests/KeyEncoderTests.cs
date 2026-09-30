@@ -42,6 +42,8 @@ public class KeyEncoderTests
         var vb = DocJson.Parse(b);
         var ka = KeyEncoder.Encode(va);
         var kb = KeyEncoder.Encode(vb);
+        Assert.True(KeyEncoder.EncodeTemporary(va).SequenceEqual(ka));
+        Assert.True(KeyEncoder.EncodeTemporary(vb).SequenceEqual(kb));
         Assert.True(ka.AsSpan().SequenceCompareTo(kb) < 0, $"{a} should sort before {b}");
         Assert.True(KeyEncoder.Compare(va, vb) < 0);
         Assert.True(va.CompareTo(vb) < 0);

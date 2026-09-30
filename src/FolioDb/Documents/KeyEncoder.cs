@@ -42,12 +42,18 @@ internal static class KeyEncoder
         _ => throw new FolioException($"Unsupported type {t}."),
     };
 
-    public static byte[] Encode(DocValue v)
+    public static byte[] Encode(DocValue v) => EncodeTemporary(v).ToArray();
+
+    /// <summary>
+    /// Borrows the per-thread encoding buffer. Consume synchronously before another Encode/Compare call or any
+    /// user callback; callers needing to retain a key must use Encode instead.
+    /// </summary>
+    internal static ReadOnlySpan<byte> EncodeTemporary(DocValue v)
     {
         var buf = t_a ??= new ByteBuffer();
         buf.Clear();
         Encode(buf, v);
-        return buf.ToArray();
+        return buf.WrittenSpan;
     }
 
     public static int Compare(DocValue a, DocValue b)

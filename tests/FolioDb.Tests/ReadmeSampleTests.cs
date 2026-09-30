@@ -101,6 +101,24 @@ public class ReadmeSampleTests
     }
 
     [Fact]
+    public void ReusingFilters()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var people = db.GetCollection("people");
+        people.InsertMany([Document.Parse("{_id:1,age:31}"), Document.Parse("{_id:2,age:12}")]);
+        var adultFilter = PreparedFilter.Parse("{age:{$gte:18}}");
+        var adults = people.Find(adultFilter);
+        long count = people.Count(adultFilter);
+        long visited = people.Visit(adultFilter, static doc => true);
+        string plan = people.Explain(adultFilter);
+        Assert.Single(adults);
+        Assert.Equal(1, count);
+        Assert.Equal(1, visited);
+        Assert.Equal(people.Explain("{age:{$gte:18}}"), plan);
+    }
+
+    [Fact]
     public void TypedDocuments()
     {
         using var tmp = new TempDb();

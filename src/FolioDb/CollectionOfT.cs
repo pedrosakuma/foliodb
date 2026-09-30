@@ -33,6 +33,11 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     /// <inheritdoc cref="Collection.Visit(string, Func{DocumentView, bool})"/>
     public long Visit(string? filter, Func<DocumentView, bool> visitor) => Untyped.Visit(filter, visitor);
 
+    /// <inheritdoc cref="Collection.Visit(PreparedFilter, Func{DocumentView, bool})"/>
+    public long Visit(PreparedFilter filter, Func<DocumentView, bool> visitor) => Untyped.Visit(filter, visitor);
+
+    public List<T> Find(PreparedFilter filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
+
     public List<T> Find(Document? filter = null, FindOptions? options = null) => Map(Untyped.Find(filter, options));
     public List<T> Find(string? filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
 
@@ -42,8 +47,12 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public T? FindOne(string? filter, FindOptions? options = null) =>
         Untyped.FindOne(filter, options) is { } d ? T.FromDocument(d) : default;
 
+    public T? FindOne(PreparedFilter filter, FindOptions? options = null) =>
+        Untyped.FindOne(filter, options) is { } d ? T.FromDocument(d) : default;
+
     public long Count(Document? filter = null) => Untyped.Count(filter);
     public long Count(string? filter) => Untyped.Count(filter);
+    public long Count(PreparedFilter filter) => Untyped.Count(filter);
 
     /// <summary>Replaces the stored document with the same <c>_id</c>; inserts it when <paramref name="upsert"/> is set.</summary>
     public bool Update(T entity, bool upsert = false)

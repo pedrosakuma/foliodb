@@ -312,7 +312,7 @@ internal static class CollectionEngine
     public static Document? FindById(EngineTx tx, CollectionMeta? meta, DocValue id)
     {
         if (meta is null) return null;
-        return new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.Encode(id), out var bytes)
+        return new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.EncodeTemporary(id), out var bytes)
             ? DocumentSerializer.Deserialize(bytes)
             : null;
     }
@@ -323,7 +323,7 @@ internal static class CollectionEngine
     /// </summary>
     public static bool TryBorrowById(EngineTx tx, CollectionMeta? meta, DocValue id, out DocumentView view)
     {
-        if (meta is not null && new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.Encode(id), out var bytes))
+        if (meta is not null && new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.EncodeTemporary(id), out var bytes))
         {
             view = new DocumentView(new RawDocument(bytes));
             return true;

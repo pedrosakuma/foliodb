@@ -4,6 +4,56 @@ namespace FolioDb.Tests;
 
 public class BorrowedReadTests
 {
+    [Fact]
+    public void Warm_snapshot_point_reads_do_not_allocate_keys()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        DocValue[] ids = [42, long.MaxValue, 0.5, 12.345m, ObjectId.NewObjectId(), "a\0b", true,
+            new byte[] { 1, 0, 2 }, DateTime.UnixEpoch, new Document { ["key"] = 1 }];
+        var c = db.GetCollection("items");
+        foreach (var id in ids) c.Insert(new Document { ["_id"] = id, ["n"] = 7L });
+        using var snapshot = db.BeginSnapshot();
+        var reader = snapshot.GetCollection("items");
+        Func<DocumentView, long> callback = static d => d.TryGetValue("n", out var n) ? n.AsInt64 : -1;
+        for (int i = 0; i < 100; i++)
+            foreach (var id in ids) Assert.True(reader.TryReadById(id, callback, out _));
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        long sum = 0;
+        for (int i = 0; i < 100; i++)
+            foreach (var id in ids)
+            {
+                reader.TryReadById(id, callback, out long n);
+                sum += n;
+            }
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(7000, sum);
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void Temporary_key_is_consumed_before_nested_callbacks_reuse_the_encoder()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var c = db.GetCollection("items");
+        c.Insert(new Document { ["_id"] = 42, ["n"] = 7 });
+        using var snapshot = db.BeginSnapshot();
+        var reader = snapshot.GetCollection("items");
+        foreach (var id in new DocValue[] { 42, 42L, 42.0, 42m })
+        {
+            Assert.Equal(7, reader.FindById(id)!["n"].AsInt32);
+            Assert.True(reader.TryReadById(id, d =>
+            {
+                // Forces the shared encoding buffer to grow while the outer document is still borrowed.
+                Assert.False(reader.TryReadById(new string('z', 4096), static inner => inner.FieldCount, out _));
+                Assert.True(reader.TryReadById(42, static inner => inner.FieldCount, out _));
+                return d.TryGetValue("n", out var n) ? n.AsInt32 : -1;
+            }, out int n));
+            Assert.Equal(7, n);
+        }
+    }
+
     private static readonly DateTime When = new(2024, 5, 6, 7, 8, 9, 123, DateTimeKind.Utc);
     private static readonly ObjectId Oid = ObjectId.NewObjectId();
 

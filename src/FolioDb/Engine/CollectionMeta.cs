@@ -46,18 +46,37 @@ internal sealed class IndexMeta
     public static IndexField[] ParsePattern(Document keys)
     {
         ArgumentNullException.ThrowIfNull(keys);
-        if (keys.Count == 0) throw new FolioException("An index needs at least one field.");
-        if (keys.Count > MaxFields) throw new FolioException($"An index can have at most {MaxFields} fields.");
+        ValidateFieldCount(keys.Count);
         var fields = new IndexField[keys.Count];
         int i = 0;
         foreach (var (path, dir) in keys)
-        {
-            ValidatePath(path);
-            if (keys.Count > 1 && path == "_id") throw new FolioException("_id cannot be part of a compound index.");
-            if (!dir.IsNumber || (KeyEncoder.Compare(dir, 1) != 0 && KeyEncoder.Compare(dir, -1) != 0)) throw new FolioException($"Index direction for '{path}' must be 1 or -1.");
-            fields[i++] = new IndexField(path, dir.AsDouble < 0);
-        }
+            fields[i++] = ParseField(path, dir, keys.Count);
         return fields;
+    }
+
+    private static IndexField[] ParsePattern(DocumentView keys)
+    {
+        int count = keys.FieldCount;
+        ValidateFieldCount(count);
+        var fields = new IndexField[count];
+        int i = 0;
+        foreach (var field in keys)
+            fields[i++] = ParseField(field.GetName(), field.Value.ToDocValue(), count);
+        return fields;
+    }
+
+    private static void ValidateFieldCount(int count)
+    {
+        if (count == 0) throw new FolioException("An index needs at least one field.");
+        if (count > MaxFields) throw new FolioException($"An index can have at most {MaxFields} fields.");
+    }
+
+    private static IndexField ParseField(string path, DocValue dir, int count)
+    {
+        ValidatePath(path);
+        if (count > 1 && path == "_id") throw new FolioException("_id cannot be part of a compound index.");
+        if (!dir.IsNumber || (KeyEncoder.Compare(dir, 1) != 0 && KeyEncoder.Compare(dir, -1) != 0)) throw new FolioException($"Index direction for '{path}' must be 1 or -1.");
+        return new IndexField(path, dir.AsDouble < 0);
     }
 
     public static void ValidatePath(string path)
@@ -135,13 +154,13 @@ internal sealed class IndexMeta
         return d;
     }
 
-    public static IndexMeta FromDocument(Document d) => new()
+    public static IndexMeta FromView(DocumentView d) => new()
     {
-        Name = d["name"].AsString,
-        Fields = d.TryGetValue("keys", out var keys) ? ParsePattern(keys.AsDocument) : [new IndexField(d["field"].AsString, false)],
-        Unique = d["unique"].AsBoolean,
-        Root = (uint)d["root"].AsInt64,
-        MultiKey = d["multiKey"].AsBoolean,
+        Name = CollectionMeta.Field(d, "name"u8).GetString(),
+        Fields = d.TryGetValue("keys"u8, out var keys) ? ParsePattern(keys.AsDocument) : [new IndexField(CollectionMeta.Field(d, "field"u8).GetString(), false)],
+        Unique = CollectionMeta.Field(d, "unique"u8).AsBoolean,
+        Root = (uint)CollectionMeta.Field(d, "root"u8).AsInt64,
+        MultiKey = CollectionMeta.Field(d, "multiKey"u8).AsBoolean,
     };
 }
 
@@ -163,14 +182,21 @@ internal sealed class CollectionMeta
         };
     }
 
-    public static CollectionMeta FromDocument(Document d)
+    internal static DocValueView Field(DocumentView d, scoped ReadOnlySpan<byte> name)
     {
+        d.TryGetValue(name, out var value);
+        return value;
+    }
+
+    public static CollectionMeta FromBytes(ReadOnlySpan<byte> bytes)
+    {
+        var d = new DocumentView(new RawDocument(bytes));
         var meta = new CollectionMeta
         {
-            Name = d["name"].AsString,
-            PrimaryRoot = (uint)d["primaryRoot"].AsInt64,
+            Name = Field(d, "name"u8).GetString(),
+            PrimaryRoot = (uint)Field(d, "primaryRoot"u8).AsInt64,
         };
-        foreach (var i in d["indexes"].AsArray) meta.Indexes.Add(IndexMeta.FromDocument(i.AsDocument));
+        foreach (var i in Field(d, "indexes"u8).AsArray) meta.Indexes.Add(IndexMeta.FromView(i.AsDocument));
         return meta;
     }
 }

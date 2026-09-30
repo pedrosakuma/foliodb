@@ -9,6 +9,7 @@ public class VisitBenchmarks
     private FolioDatabase _db = null!;
     private Collection _items = null!;
     private Document _filter = null!;
+    private PreparedFilter _prepared = null!;
     private readonly FindOptions _projection = new() { Projection = new Document { ["n"] = 1, ["_id"] = 0 } };
     private Func<DocumentView, bool> _visitor = null!;
     private long _sum;
@@ -32,6 +33,7 @@ public class VisitBenchmarks
         _db.Checkpoint();
         _items = _db.GetCollection("items");
         _filter = new Document { ["bucket"] = 0 };
+        _prepared = PreparedFilter.FromDocument(_filter);
         _visitor = d =>
         {
             if (!d.TryGetValue("n", out var n)) throw new InvalidOperationException("Missing n.");
@@ -39,7 +41,8 @@ public class VisitBenchmarks
             return true;
         };
         long expected = (long)Matches * (Matches - 1) / 2;
-        if (Materialized() != expected || Projected() != expected || Borrowed() != expected)
+        if (Materialized() != expected || Projected() != expected || Borrowed() != expected ||
+            MaterializedPrepared() != expected || ProjectedPrepared() != expected || BorrowedPrepared() != expected)
             throw new InvalidOperationException("Read results differ.");
     }
 
@@ -64,6 +67,30 @@ public class VisitBenchmarks
     {
         _sum = 0;
         if (_items.Visit(_filter, _visitor) != Matches) throw new InvalidOperationException("Unexpected visit count.");
+        return _sum;
+    }
+
+    [Benchmark]
+    public long MaterializedPrepared()
+    {
+        long sum = 0;
+        foreach (var d in _items.Find(_prepared)) sum += d["n"].AsInt64;
+        return sum;
+    }
+
+    [Benchmark]
+    public long ProjectedPrepared()
+    {
+        long sum = 0;
+        foreach (var d in _items.Find(_prepared, _projection)) sum += d["n"].AsInt64;
+        return sum;
+    }
+
+    [Benchmark]
+    public long BorrowedPrepared()
+    {
+        _sum = 0;
+        if (_items.Visit(_prepared, _visitor) != Matches) throw new InvalidOperationException("Unexpected visit count.");
         return _sum;
     }
 

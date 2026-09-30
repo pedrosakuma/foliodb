@@ -28,7 +28,7 @@ internal sealed class EngineTx : IDisposable
     {
         if (_catalogCache.TryGetValue(name, out var cached)) return cached;
         CollectionMeta? meta = null;
-        if (Catalog.TryGet(CatalogKey(name), out var bytes)) meta = CollectionMeta.FromDocument(DocumentSerializer.Deserialize(bytes));
+        if (Catalog.TryGet(CatalogKey(name), out var bytes)) meta = CollectionMeta.FromBytes(bytes);
         _catalogCache[name] = meta;
         return meta;
     }
