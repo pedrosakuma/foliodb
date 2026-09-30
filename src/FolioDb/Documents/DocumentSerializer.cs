@@ -33,14 +33,36 @@ internal static class DocumentSerializer
 
     public static void Serialize(Document doc, ByteBuffer buf) => WriteDocument(buf, doc, 0);
 
-    private static void WriteDocument(ByteBuffer buf, Document doc, int depth)
+    /// <summary>
+    /// Serializes <paramref name="doc"/> with <paramref name="id"/> written first as <c>_id</c>, ignoring any
+    /// <c>_id</c> the document itself carries. Equivalent to calling <see cref="Document.InsertFirst"/> on a copy.
+    /// </summary>
+    public static byte[] SerializeWithId(Document doc, DocValue id)
+    {
+        var buf = t_buffer ??= new ByteBuffer(1024);
+        buf.Clear();
+        WriteDocument(buf, doc, 0, id);
+        var result = buf.ToArray();
+        if (buf.Length > 1 << 20) { buf.Dispose(); t_buffer = null; }
+        return result;
+    }
+
+    private static void WriteDocument(ByteBuffer buf, Document doc, int depth, DocValue? idFirst = null)
     {
         if (depth > MaxDepth) throw new FolioException("Document nesting is too deep.");
         int start = buf.Length;
         buf.WriteInt32(0);
         Span<byte> name = stackalloc byte[MaxNameBytes];
+        if (idFirst is { } id)
+        {
+            buf.WriteByte((byte)id.Type);
+            buf.WriteByte(3);
+            buf.Write("_id"u8);
+            WriteValue(buf, id, depth);
+        }
         foreach (var (key, value) in doc)
         {
+            if (idFirst is not null && key == "_id") continue;
             int n;
             try { n = Encoding.UTF8.GetBytes(key, name); }
             catch (ArgumentException) { throw new FolioException($"Field name '{key[..Math.Min(32, key.Length)]}…' exceeds {MaxNameBytes} UTF-8 bytes."); }

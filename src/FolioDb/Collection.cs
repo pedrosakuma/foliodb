@@ -245,6 +245,7 @@ public sealed class Collection
         ArgumentNullException.ThrowIfNull(filter);
         ArgumentNullException.ThrowIfNull(update);
         UpdateApplier.Validate(update);
+        bool operatorUpdate = UpdateApplier.IsOperatorUpdate(update);
         var f = FilterParser.Parse(filter);
         return Write(tx =>
         {
@@ -260,10 +261,11 @@ public sealed class Collection
             long modified = 0;
             foreach (var (idKey, bytes) in matches)
             {
-                bool changed = UpdateApplier.TryPatch(bytes, update) is { } patched
-                    ? CollectionEngine.Replace(tx, meta, idKey, bytes, patched)
-                    : CollectionEngine.Replace(tx, meta, idKey, bytes, UpdateApplier.Apply(Document.FromBytes(bytes), update));
-                if (changed) modified++;
+                // A replacement only needs the stored _id, so it never materializes the stored document.
+                var newBytes = operatorUpdate
+                    ? UpdateApplier.TryPatch(bytes, update) ?? DocumentSerializer.Serialize(UpdateApplier.Apply(Document.FromBytes(bytes), update))
+                    : UpdateApplier.ApplyReplacement(bytes, update);
+                if (CollectionEngine.Replace(tx, meta, idKey, bytes, newBytes)) modified++;
             }
             return new UpdateResult(matches.Count, modified, null);
         }, atomic: !many);

@@ -1173,6 +1173,20 @@ allocation column is reproducible across runs and is the only result claimed. `R
 the query that locates the document (visible as the 0-index rows costing more than `Insert`), which this change
 did not touch.
 
+### Replacement updates
+
+A replacement update (`UpdateOne(filter, wholeDocument)`, as opposed to an operator update such as `$set`) used to
+decode the stored document into a `Document` only to read its `_id` back out, then throw that document away and
+serialize the replacement. `UpdateApplier.ApplyReplacement` now reads `_id` directly from the stored bytes and
+`DocumentSerializer.SerializeWithId` writes it as the first field, skipping any `_id` carried by the replacement.
+The `_id`-is-immutable rule and the resulting field order are unchanged, because `Document.InsertFirst` already
+moved `_id` to position 0. `Collection.Update` also decides operator-versus-replacement once instead of per matched
+document.
+
+Measured inside an explicit transaction on a collection of 1,000 documents with no secondary indexes, `ReplaceOne`
+went from 4,443 to 3,059 bytes per operation (-31%); of that, 934 bytes are the replacement document built by the
+caller, so the engine's own share fell from 3,509 to 2,125 bytes (-39%).
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

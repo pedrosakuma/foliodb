@@ -38,9 +38,21 @@ internal static class UpdateApplier
 
     private static bool IsIdPath(string path) => path == "_id" || path.StartsWith("_id.", StringComparison.Ordinal);
 
-    /// <summary>Returns the updated document (a new instance). The original is not modified.</summary>
-    public static Document Apply(Document original, Document update)
+    /// <summary>
+    /// Whole-document replacement, without materializing the stored document: only its <c>_id</c> is read, and the
+    /// replacement is serialized with that <c>_id</c> first. Equivalent to
+    /// <c>Serialize(Apply(Document.FromBytes(original), replacement))</c> for a non-operator update.
+    /// </summary>
+    public static byte[] ApplyReplacement(ReadOnlySpan<byte> original, Document replacement)
     {
+        var id = new RawDocument(original).TryGetField("_id"u8, out var raw) ? raw.ToDocValue() : DocValue.Null;
+        if (replacement.TryGetValue("_id", out var newId) && newId != id)
+            throw new FolioException("The _id field is immutable.");
+        return DocumentSerializer.SerializeWithId(replacement, id);
+    }
+
+    /// <summary>Returns the updated document (a new instance). The original is not modified.</summary>
+    public static Document Apply(Document original, Document update)    {
         if (!IsOperatorUpdate(update))
         {
             var replacement = update.Clone();
