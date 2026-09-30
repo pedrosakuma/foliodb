@@ -2,41 +2,6 @@ using FolioDb.Query;
 
 namespace FolioDb.Engine;
 
-/// <summary>
-/// A dotted index path with its UTF-8 segments decoded once. Index metadata is cached per transaction, so building
-/// this costs one catalog read instead of one allocation per indexed document.
-/// </summary>
-internal sealed class IndexPath
-{
-    /// <summary>Not an array position.</summary>
-    private const int NotAPosition = -1;
-
-    private readonly int[] _positions;
-
-    public IndexPath(string path)
-    {
-        Text = path;
-        var parts = path.Split('.');
-        Segments = new byte[parts.Length][];
-        _positions = new int[parts.Length];
-        for (int i = 0; i < parts.Length; i++)
-        {
-            Segments[i] = System.Text.Encoding.UTF8.GetBytes(parts[i]);
-            _positions[i] = int.TryParse(parts[i], out int p) && p >= 0 ? p : NotAPosition;
-        }
-    }
-
-    public string Text { get; }
-
-    /// <summary>UTF-8 bytes of each dot-separated segment.</summary>
-    public byte[][] Segments { get; }
-
-    /// <summary>The array position segment <paramref name="i"/> selects, or -1 when it is a field name.</summary>
-    public int Position(int i) => _positions[i];
-
-    public override string ToString() => Text;
-}
-
 /// <summary>One component of an index key pattern.</summary>
 internal readonly record struct IndexField(string Path, bool Descending);
 
@@ -66,9 +31,9 @@ internal sealed class IndexMeta
     /// <summary>UTF-8 names of the first path segments: index keys depend only on these top-level fields.</summary>
     public byte[][] TopLevelFields => _topLevelFields ??= Paths.Select(p => p.Segments[0]).Distinct(ByteArrayComparer.Instance).ToArray();
 
-    private IndexPath[]? _paths;
+    private FieldPath[]? _paths;
     /// <summary>Indexed paths with their UTF-8 segments decoded once, in <see cref="Fields"/> order.</summary>
-    public IndexPath[] Paths => _paths ??= Fields.Select(f => new IndexPath(f.Path)).ToArray();
+    public FieldPath[] Paths => _paths ??= Fields.Select(f => new FieldPath(f.Path)).ToArray();
 
     public bool SameFields(IndexField[] fields) => Fields.AsSpan().SequenceEqual(fields);
 

@@ -13,7 +13,7 @@ internal static class CollectionEngine
 
     /// <summary>Distinct encoded index values for <paramref name="path"/> (arrays expand to their elements). Missing fields produce no keys.</summary>
     /// <remarks>Each key carries the <see cref="IndexHint"/> of its value; for duplicates the first occurrence wins.</remarks>
-    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, IndexPath path, out bool multiKey)
+    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, FieldPath path, out bool multiKey)
     {
         var keys = new List<IndexKey>(1);
         multiKey = false;
@@ -31,7 +31,7 @@ internal static class CollectionEngine
     }
 
     internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, string field, out bool multiKey) =>
-        ExtractIndexKeys(doc, new IndexPath(field), out multiKey);
+        ExtractIndexKeys(doc, new FieldPath(field), out multiKey);
 
     /// <summary>Upper bound of keys one document may produce in a compound index (cartesian product of array fields).</summary>
     public const int MaxCompoundKeysPerDocument = 1000;
@@ -94,7 +94,7 @@ internal static class CollectionEngine
     }
 
     /// <summary>True when the present index fields appear in the document (depth-first) in index order.</summary>
-    private static bool FieldsInOrder(ReadOnlySpan<byte> doc, IndexPath[] paths)
+    private static bool FieldsInOrder(ReadOnlySpan<byte> doc, FieldPath[] paths)
     {
         var raw = new RawDocument(doc);
         int last = -1;
@@ -119,7 +119,7 @@ internal static class CollectionEngine
         return true;
     }
 
-    private static void Collect(RawValue v, IndexPath path, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
+    private static void Collect(RawValue v, FieldPath path, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
     {
         if (seg == path.Segments.Length)
         {
@@ -144,7 +144,7 @@ internal static class CollectionEngine
         else if (v.Type == DocType.Array)
         {
             multiKey = true;
-            int position = path.Position(seg);
+            int position = path.Positions[seg];
             if (position >= 0)
             {
                 int i = 0;

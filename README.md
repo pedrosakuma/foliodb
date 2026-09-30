@@ -1187,6 +1187,28 @@ Measured inside an explicit transaction on a collection of 1,000 documents with 
 went from 4,443 to 3,059 bytes per operation (-31%); of that, 934 bytes are the replacement document built by the
 caller, so the engine's own share fell from 3,509 to 2,125 bytes (-39%).
 
+### Per-query allocations on reads
+
+An allocation sample of a `Count`-by-`_id` loop attributed 25% of bytes to `Collection.Read` itself (the implicit
+transaction), 24% to `FilterParser.ParseField` and 11% to `QueryPlanner.Plan`. Two of the named contributors were
+removed:
+
+1. `FieldPath` — the dotted-path decoder introduced for index metadata — is now shared with `FieldFilter`, which
+   was splitting its path and transcoding every segment through two LINQ `Select` projections each time a filter
+   was parsed. The per-filter `Func`, iterator and array garbage is gone; the work is a single loop.
+2. `EngineTx` keeps its first catalog entry in two fields and only allocates the backing `Dictionary` when a second
+   collection name is requested in the same transaction. Almost every transaction touches one collection, so the
+   dictionary and its entry array were allocated and discarded per query.
+
+| Allocated per operation (implicit transaction, 1,000 documents) | Before | After |
+|---|---:|---:|
+| `Count` by `_id` | 1,688 B | **1,360 B** |
+| `FindById` | 1,656 B | **1,456 B** |
+| `Find` by unindexed field, limit 1 | 3,067 B | **2,735 B** |
+
+Building the filter document itself accounts for 208 B of each figure and is the caller's cost; `PreparedFilter`
+avoids re-parsing for repeated queries. No timing claim is made — see the note above about this host.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

@@ -65,8 +65,7 @@ internal sealed class FieldFilter : Filter
     public byte[][]? Keys { get; }
     public IReadOnlyList<DocValue>? Values { get; }
 
-    private readonly byte[][] _segments;
-    private readonly int[] _segmentIndexes;
+    private readonly FieldPath _path;
     private readonly bool _matchesMissing;
     private readonly Regex? _regex;
     private readonly int _size;
@@ -81,9 +80,7 @@ internal sealed class FieldFilter : Filter
         Op = op;
         Value = value;
         Values = values;
-        var parts = path.Split('.');
-        _segments = parts.Select(Encoding.UTF8.GetBytes).ToArray();
-        _segmentIndexes = parts.Select(p => int.TryParse(p, out int i) && i >= 0 ? i : -1).ToArray();
+        _path = new FieldPath(path);
 
         switch (op)
         {
@@ -137,18 +134,18 @@ internal sealed class FieldFilter : Filter
     private bool Walk(RawValue current, int seg, out bool sawMissing)
     {
         sawMissing = false;
-        if (seg == _segments.Length) return TestTerminal(current);
+        if (seg == _path.Length) return TestTerminal(current);
 
         if (current.Type == DocType.Document)
         {
-            if (current.AsDocument.TryGetField(_segments[seg], out var next)) return Walk(next, seg + 1, out sawMissing);
+            if (current.AsDocument.TryGetField(_path.Segments[seg], out var next)) return Walk(next, seg + 1, out sawMissing);
             sawMissing = true;
             return false;
         }
 
         if (current.Type == DocType.Array)
         {
-            int index = _segmentIndexes[seg];
+            int index = _path.Positions[seg];
             int i = 0;
             bool anyMissing = false;
             foreach (var item in current.AsArray)

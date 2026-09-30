@@ -5,7 +5,11 @@ namespace FolioDb.Engine;
 /// <summary>Engine-level transaction: storage transaction plus a per-transaction catalog cache.</summary>
 internal sealed class EngineTx : IDisposable
 {
-    private readonly Dictionary<string, CollectionMeta?> _catalogCache = new(StringComparer.Ordinal);
+    // Almost every transaction touches a single collection, so the first entry lives in a pair of fields and the
+    // dictionary is only allocated once a second collection name shows up.
+    private string? _cachedName;
+    private CollectionMeta? _cachedMeta;
+    private Dictionary<string, CollectionMeta?>? _catalogCache;
 
     public StorageTx Storage { get; }
     public bool IsWritable => Storage.IsWritable;
@@ -24,12 +28,35 @@ internal sealed class EngineTx : IDisposable
             if (char.IsControl(c)) throw new FolioException("Collection name contains control characters.");
     }
 
+    private bool TryGetCached(string name, out CollectionMeta? meta)
+    {
+        if (string.Equals(_cachedName, name, StringComparison.Ordinal))
+        {
+            meta = _cachedMeta;
+            return true;
+        }
+        if (_catalogCache is not null) return _catalogCache.TryGetValue(name, out meta);
+        meta = null;
+        return false;
+    }
+
+    private void Cache(string name, CollectionMeta? meta)
+    {
+        if (_cachedName is null || string.Equals(_cachedName, name, StringComparison.Ordinal))
+        {
+            _cachedName = name;
+            _cachedMeta = meta;
+            return;
+        }
+        (_catalogCache ??= new(StringComparer.Ordinal))[name] = meta;
+    }
+
     public CollectionMeta? GetCollection(string name)
     {
-        if (_catalogCache.TryGetValue(name, out var cached)) return cached;
+        if (TryGetCached(name, out var cached)) return cached;
         CollectionMeta? meta = null;
         if (Catalog.TryGet(CatalogKey(name), out var bytes)) meta = CollectionMeta.FromBytes(bytes);
-        _catalogCache[name] = meta;
+        Cache(name, meta);
         return meta;
     }
 
@@ -46,7 +73,7 @@ internal sealed class EngineTx : IDisposable
     public void SaveCollection(CollectionMeta meta)
     {
         Catalog.Insert(CatalogKey(meta.Name), DocumentSerializer.Serialize(meta.ToDocument()), overwrite: true);
-        _catalogCache[meta.Name] = meta;
+        Cache(meta.Name, meta);
     }
 
     public bool DropCollection(string name)
@@ -56,7 +83,7 @@ internal sealed class EngineTx : IDisposable
         foreach (var idx in meta.Indexes) new BTree(Storage, idx.Root).Drop();
         new BTree(Storage, meta.PrimaryRoot).Drop();
         Catalog.Delete(CatalogKey(name));
-        _catalogCache[name] = null;
+        Cache(name, null);
         return true;
     }
 
