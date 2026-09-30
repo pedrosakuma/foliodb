@@ -696,6 +696,125 @@ internal readonly struct BTree
 
     // ------------------------------------------------------------------ diagnostics
 
+    public BTreeStorageDiagnostics Diagnose()
+    {
+        var totals = new DiagnosticTotals();
+        DiagnoseNode(Root, 1, totals);
+        totals.Pages.Sort();
+        long runs = totals.Pages.Count == 0 ? 0 : 1;
+        long maximumGap = 0;
+        for (int i = 1; i < totals.Pages.Count; i++)
+        {
+            long gap = (long)totals.Pages[i] - totals.Pages[i - 1] - 1;
+            if (gap > 0) runs++;
+            maximumGap = Math.Max(maximumGap, gap);
+        }
+        long span = totals.Pages.Count == 0 ? 0 : (long)totals.Pages[^1] - totals.Pages[0] + 1;
+        return new BTreeStorageDiagnostics(
+            Root,
+            totals.Height,
+            totals.EntryCount,
+            totals.LeafPages,
+            totals.InteriorPages,
+            totals.OverflowPages,
+            totals.LeafLiveBytes,
+            totals.LeafCellBytes,
+            totals.LeafFragmentedBytes,
+            totals.LeafFreeBytes,
+            totals.InteriorLiveBytes,
+            totals.InteriorCellBytes,
+            totals.InteriorFragmentedBytes,
+            totals.InteriorFreeBytes,
+            totals.OverflowLiveBytes,
+            totals.OverflowPayloadBytes,
+            totals.OverflowFreeBytes,
+            runs,
+            span,
+            maximumGap);
+    }
+
+    private void DiagnoseNode(uint pg, int height, DiagnosticTotals totals)
+    {
+        var page = _tx.ReadPage(pg);
+        if (page[0] != LeafType && page[0] != InteriorType)
+            throw new CorruptDatabaseException($"Page {pg} is not a B+Tree page.");
+
+        totals.Pages.Add(pg);
+        totals.Height = Math.Max(totals.Height, height);
+        int count = Count(page);
+        long cellBytes = 0;
+        for (int i = 0; i < count; i++) cellBytes += CellSize(page, Slot(page, i));
+        long liveBytes = HeaderSize + 2L * count + cellBytes;
+        long fragmentedBytes = Frag(page);
+        long freeBytes = PageSize - liveBytes - fragmentedBytes;
+        if (freeBytes < 0)
+            throw new CorruptDatabaseException($"B+Tree page {pg} space accounting exceeds the page size.");
+
+        if (IsLeaf(page))
+        {
+            totals.LeafPages++;
+            totals.EntryCount += count;
+            totals.LeafLiveBytes += liveBytes;
+            totals.LeafCellBytes += cellBytes;
+            totals.LeafFragmentedBytes += fragmentedBytes;
+            totals.LeafFreeBytes += freeBytes;
+            for (int i = 0; i < count; i++) DiagnoseOverflow(page, i, totals);
+            return;
+        }
+
+        totals.InteriorPages++;
+        totals.InteriorLiveBytes += liveBytes;
+        totals.InteriorCellBytes += cellBytes;
+        totals.InteriorFragmentedBytes += fragmentedBytes;
+        totals.InteriorFreeBytes += freeBytes;
+        for (int i = 0; i <= count; i++) DiagnoseNode(ChildAt(page, i), height + 1, totals);
+    }
+
+    private void DiagnoseOverflow(ReadOnlySpan<byte> page, int index, DiagnosticTotals totals)
+    {
+        int off = Slot(page, index);
+        if ((page[off + 2] & FlagOverflow) == 0) return;
+        int keyLen = BinaryPrimitives.ReadUInt16LittleEndian(page[off..]);
+        int remaining = BinaryPrimitives.ReadInt32LittleEndian(page[(off + 3)..]);
+        uint pg = BinaryPrimitives.ReadUInt32LittleEndian(page[(off + LeafCellHeader + keyLen)..]);
+        int capacity = PageSize - 4;
+        while (remaining > 0)
+        {
+            if (pg == 0) throw new CorruptDatabaseException("Overflow chain ended before the stored value.");
+            var overflow = _tx.ReadPage(pg);
+            totals.Pages.Add(pg);
+            totals.OverflowPages++;
+            int payload = Math.Min(capacity, remaining);
+            totals.OverflowPayloadBytes += payload;
+            totals.OverflowLiveBytes += payload + 4L;
+            totals.OverflowFreeBytes += capacity - payload;
+            remaining -= payload;
+            pg = BinaryPrimitives.ReadUInt32LittleEndian(overflow);
+        }
+        if (pg != 0) throw new CorruptDatabaseException("Overflow chain is longer than the stored value.");
+    }
+
+    private sealed class DiagnosticTotals
+    {
+        public List<uint> Pages { get; } = new();
+        public int Height;
+        public long EntryCount;
+        public long LeafPages;
+        public long InteriorPages;
+        public long OverflowPages;
+        public long LeafLiveBytes;
+        public long LeafCellBytes;
+        public long LeafFragmentedBytes;
+        public long LeafFreeBytes;
+        public long InteriorLiveBytes;
+        public long InteriorCellBytes;
+        public long InteriorFragmentedBytes;
+        public long InteriorFreeBytes;
+        public long OverflowLiveBytes;
+        public long OverflowPayloadBytes;
+        public long OverflowFreeBytes;
+    }
+
     /// <summary>Verifies ordering, separator bounds and uniform depth. Returns the number of entries.</summary>
     public long Verify()
     {

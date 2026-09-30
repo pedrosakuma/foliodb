@@ -376,6 +376,81 @@ dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*'
 BenchmarkDotNet, short job, Linux x64, .NET 10 (indicative only). SQLite = Microsoft.Data.Sqlite storing JSON text
 with an index on `json_extract(data,'$.city')`, WAL + `synchronous=NORMAL`; LiteDB 5.0.21. FolioDb uses `SynchronousMode.Normal`.
 
+### B+Tree occupancy under churn
+
+Issue #1 has a separate deterministic diagnostic entry point:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --fragmentation 3000 4 3 > fragmentation.csv
+```
+
+It uses 4 KiB pages, a 1,024-page cache, `SynchronousMode.Normal`, disabled automatic checkpoints, three fresh
+database trials and four churn cycles. Each trial starts with 3,000 documents, a simple `city` index, compound
+`{bucket:1,score:-1}` index and multikey `tags` index. One eighth of documents use overflow values. Every cycle
+deletes 10% from a concentrated key interval and 10% selected randomly, inserts the same number, then swaps equal
+numbers of inline and overflow documents while changing all indexed keys. Thus document count and the approximate
+inline/overflow population stay stable. Integrity checks, checkpoints and all storage statistics run outside timed
+sections; every captured stage has an empty WAL (32-byte header).
+
+For slotted B+Tree pages, `live` is the 12-byte header, two bytes per slot and current cell bytes; `fragmented` is
+deleted cell space recorded inside the page; `free` is the remaining immediately usable capacity. These three values
+sum exactly to page count × page size. Overflow `live` includes its four-byte next-page link, and overflow `free` is
+unused tail capacity. `runs`, page-number span and maximum page-number gap describe allocator/page-number dispersion
+only: they are not filesystem extents and do not prove an I/O-locality cost.
+
+Results collected on 2026-09-30 (independent per-column medians of three trials; byte columns are median bytes).
+Each individual diagnostic snapshot satisfies the accounting invariant above. These aggregate rows can combine
+values from different trials, so their byte columns need not sum to the median page count times page size.
+
+| Tree/stage | Height | Leaf / interior / overflow pages | Leaf live / fragmented / free | Interior live / fragmented / free | Overflow live / free | Runs / span / max gap |
+|---|---:|---:|---:|---:|---:|---:|
+| Primary baseline | 3 | 512 / 7 / 1,125 | 1,251,702 / 0 / 845,450 | 13,370 / 0 / 15,302 | 3,483,308 / 1,124,692 | 183 / 1,885 / 6 |
+| Primary final | 3 | 686 / 12 / 1,182 | 1,187,243 / 741,576 / 882,895 | 17,954 / 5,424 / 25,774 | 3,647,506 / 1,193,966 | 272 / 2,236 / 6 |
+| Simple baseline | 2 | 39 / 1 / 0 | 117,468 / 0 / 42,276 | 1,380 / 0 / 2,716 | 0 / 0 | 38 / 1,885 / 280 |
+| Simple final | 2 | 48 / 1 / 0 | 117,576 / 38,073 / 40,959 | 1,704 / 0 / 2,392 | 0 / 0 | 46 / 1,998 / 221 |
+| Compound baseline | 2 | 64 / 1 / 0 | 201,768 / 0 / 60,376 | 3,918 / 0 / 178 | 0 / 0 | 51 / 1,310 / 487 |
+| Compound final | 3 | 78 / 3 / 0 | 201,936 / 50,635 / 66,917 | 4,810 / 0 / 7,478 | 0 / 0 | 65 / 1,977 / 378 |
+| Multikey baseline | 3 | 134 / 3 / 0 | 319,858 / 0 / 229,006 | 4,691 / 0 / 7,597 | 0 / 0 | 117 / 1,820 / 139 |
+| Multikey final | 3 | 222 / 4 / 0 | 331,010 / 289,692 / 293,714 | 7,783 / 0 / 8,601 | 0 / 0 | 191 / 2,218 / 91 |
+
+Final leaf capacity was `live / fragmented / free`: primary 42.2% / 26.4% / 31.4%, simple 59.8% / 19.4% /
+20.8%, compound 63.2% / 15.8% / 20.9%, and multikey 36.2% / 31.7% / 32.1%. The compound tree also grew from
+height two to three with unchanged 3,000 entries. The catalog stayed unchanged at one leaf page
+(327 live, 0 fragmented, 3,769 free bytes).
+
+Freelist reuse worked but did not prevent retained growth:
+
+| Stage | Total pages | Free pages | Main file |
+|---|---:|---:|---:|
+| Baseline | 1,888 | 0 | 7,733,248 B |
+| Cycle 1 delete / insert / update | 1,888 / 1,965 / 1,990 | 272 / 0 / 0 | 7,733,248 / 8,048,640 / 8,151,040 B |
+| Cycle 2 delete / insert / update | 1,990 / 2,048 / 2,054 | 282 / 0 / 0 | 8,151,040 / 8,388,608 / 8,413,184 B |
+| Cycle 3 delete / insert / update | 2,054 / 2,144 / 2,152 | 277 / 0 / 0 | 8,413,184 / 8,781,824 / 8,814,592 B |
+| Cycle 4 delete / insert / update | 2,152 / 2,228 / 2,238 | 274 / 0 / 0 | 8,814,592 / 9,125,888 / 9,166,848 B |
+
+Matched probes used 2,000 random ID reads, 300 compound indexed ranges and 200 same-size writes. Trial values
+(µs/op, baseline → final) were: ID `21.182/10.116/14.467 → 10.309/10.521/7.300`, range
+`42.188/13.804/7.126 → 13.778/14.379/7.233`, and write
+`138.716/35.858/33.300 → 37.842/29.264/40.520`. Medians were 14.467 → 10.309, 13.804 → 13.778 and
+35.858 → 37.842 µs/op respectively. This shared host is noisy and baseline always precedes final state, so these
+trials establish no defensible latency improvement or regression; they only show no large, repeatable timing cliff in
+this bounded run. Occupancy/page counts are deterministic structural evidence and are the basis for the recommendations:
+
+- **Delete merge/rebalance (#4): first.** Partial leaves persist across every tree; primary and multikey leaves end
+  with only 42.2% and 36.2% live occupancy, and the compound tree gains a level. Implement byte-occupancy-based
+  redistribution/merge (not cell-count thresholds), including separator replacement, root collapse and overflow-safe
+  rollback. Keep page-number dispersion out of the acceptance criteria unless filesystem/I/O measurements later
+  demonstrate a cost.
+- **RebuildIndex (#3): second.** It is a useful explicit recovery path for the measured 15.8–31.7% secondary-leaf
+  fragmentation and for the compound tree's extra level, but it only repairs one secondary tree at a time and does
+  not prevent recurrence. The design needs a temporary root, atomic catalog-root swap, uniqueness validation, failure
+  cleanup and an explicit decision between blocking rebuild and snapshot-based online rebuild with write catch-up.
+- **Vacuum (#2): third, after merge and rebuild.** Deletes exposed 272–282 reusable pages and subsequent work consumed
+  them, yet the stable-size workload still retained 350 extra pages (1.43 MiB) by the end. A vacuum must relocate live
+  pages and truncate the tail; checkpoint/freelist cleanup alone cannot do that. Decide whether the first version is
+  an offline atomic rewrite to a replacement file (simpler crash safety, requires temporary disk headroom) or an
+  in-place page mover (smaller peak space, substantially harder WAL/snapshot/root-reference handling).
+
 | Scenario | FolioDb | SQLite + JSON | LiteDB |
 |---|---:|---:|---:|
 | Insert 1,000 docs in one transaction (with 1 secondary index) | **25.9 ms** | 50.5 ms | 101.6 ms |

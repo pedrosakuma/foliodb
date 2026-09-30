@@ -116,6 +116,44 @@ public sealed class FolioDatabase : IDisposable
         _pager.WalFileLength,
         tx.ListCollections()));
 
+    internal DatabaseStorageDiagnostics GetStorageDiagnostics() => Read(tx =>
+    {
+        var trees = new List<TreeStorageDiagnostics>
+        {
+            new("$catalog", StorageTreeKind.Catalog, null, null, false,
+                new BTree(tx.Storage, tx.Storage.CatalogRoot).Diagnose()),
+        };
+        foreach (var name in tx.ListCollections())
+        {
+            var meta = tx.GetCollection(name)!;
+            trees.Add(new TreeStorageDiagnostics(
+                $"{name}/$primary",
+                StorageTreeKind.Primary,
+                name,
+                null,
+                false,
+                new BTree(tx.Storage, meta.PrimaryRoot).Diagnose()));
+            foreach (var index in meta.Indexes)
+                trees.Add(new TreeStorageDiagnostics(
+                    $"{name}/{index.Name}",
+                    StorageTreeKind.Secondary,
+                    name,
+                    index.Name,
+                    index.MultiKey,
+                    new BTree(tx.Storage, index.Root).Diagnose()));
+        }
+        return new DatabaseStorageDiagnostics(
+            new DatabaseStats(
+                _pager.PageSize,
+                tx.Storage.PageCount,
+                tx.Storage.FreePageCount,
+                _pager.WalFrameCount,
+                _pager.DatabaseFileLength,
+                _pager.WalFileLength,
+                tx.ListCollections()),
+            trees);
+    });
+
     /// <summary>Verifies B+Tree invariants of every collection and index; throws <see cref="CorruptDatabaseException"/> on failure.</summary>
     public void CheckIntegrity() => Read(tx =>
     {
