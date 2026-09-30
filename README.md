@@ -1133,6 +1133,46 @@ briefly pushed load above 50 and invalidated one run, which was discarded), not 
 Next candidates, not changed here: per-query cursor/transaction/catalog allocations, overflow-page lookup cost for
 1 KiB documents, and callers' repeated UTF-8 transcoding of field names in `TryGetValue`.
 
+### Index maintenance allocations on writes
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*WriteBenchmarks*' --job short
+```
+
+`WriteBenchmarks` inserts, replaces and deletes 1,000 documents in a single transaction with 0, 1 (simple) or 2
+(simple plus compound) secondary indexes. `InsertNoIndexWork` repeats the inserts without creating the indexes, so
+the difference isolates what index maintenance costs per document.
+
+Three changes were measured together, since they all target the same per-document path:
+
+1. `IndexMeta` decodes each indexed path once into UTF-8 segments (and array positions) and caches them with the
+   rest of the cached catalog entry, instead of splitting the string and transcoding every segment for every
+   indexed document. `FieldsInOrder` uses the same segments.
+2. Compound keys are built depth-first into two pooled buffers, so each produced key allocates its final key and
+   hint once rather than one intermediate array per path prefix at every level.
+3. Index entries (`value ++ id` and `idHint ++ valueHint`) are written from pooled buffers. The B+Tree already
+   took spans and copies them into the page, so the per-entry arrays were pure garbage. The sorted bulk-load paths
+   (`RebuildIndex`, `VacuumInto`) keep owned arrays, because they retain entries until the sort completes.
+
+| Allocated per 1,000 documents | Before | After |
+|---|---:|---:|
+| Insert, no secondary index | 2.20 MB | 2.17 MB |
+| Insert, 1 index | 3.09 MB | **2.87 MB** |
+| Insert, 2 indexes | 4.89 MB | **4.01 MB** |
+| Delete, 1 index | 3.31 MB | **3.09 MB** |
+| Delete, 2 indexes | 5.21 MB | **4.36 MB** |
+| Replace, 2 indexes | 5.29 MB | **5.02 MB** |
+
+Expressed as index maintenance alone (the gap to `InsertNoIndexWork`), the simple index went from 890 to 700
+bytes per document (-21%) and the pair from 2,690 to 1,840 bytes (-32%). The remaining base cost is dominated by
+building and serializing the document and by the B+Tree's copy-on-write pages, neither of which changed.
+
+ShortRun timing on this shared host was inconclusive for these benchmarks: with one invocation per iteration and
+three iterations, the reported error reached +-54 ms on a ~31 ms mean, so no CPU claim is made here. The
+allocation column is reproducible across runs and is the only result claimed. `Replace` and `Delete` also pay for
+the query that locates the document (visible as the 0-index rows costing more than `Insert`), which this change
+did not touch.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

@@ -11,15 +11,14 @@ internal static class CollectionEngine
 
     // ------------------------------------------------------------------ index key extraction
 
-    /// <summary>Distinct encoded index values for <paramref name="field"/> (arrays expand to their elements). Missing fields produce no keys.</summary>
+    /// <summary>Distinct encoded index values for <paramref name="path"/> (arrays expand to their elements). Missing fields produce no keys.</summary>
     /// <remarks>Each key carries the <see cref="IndexHint"/> of its value; for duplicates the first occurrence wins.</remarks>
-    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, string field, out bool multiKey)
+    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, IndexPath path, out bool multiKey)
     {
-        var segments = field.Split('.').Select(Encoding.UTF8.GetBytes).ToArray();
         var keys = new List<IndexKey>(1);
         multiKey = false;
         using var buf = new ByteBuffer(64);
-        Collect(new RawValue(DocType.Document, new RawDocument(doc).Data), segments, 0, keys, buf, ref multiKey);
+        Collect(new RawValue(DocType.Document, new RawDocument(doc).Data), path, 0, keys, buf, ref multiKey);
         if (keys.Count > 1)
         {
             // Stable sort keeps the first occurrence of equal keys first.
@@ -31,6 +30,9 @@ internal static class CollectionEngine
         return keys;
     }
 
+    internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, string field, out bool multiKey) =>
+        ExtractIndexKeys(doc, new IndexPath(field), out multiKey);
+
     /// <summary>Upper bound of keys one document may produce in a compound index (cartesian product of array fields).</summary>
     public const int MaxCompoundKeysPerDocument = 1000;
 
@@ -40,7 +42,7 @@ internal static class CollectionEngine
     /// <remarks>Compound hints are the component hints followed by the <see cref="IndexHint.InOrder"/> flag.</remarks>
     internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, IndexMeta index, out bool multiKey)
     {
-        if (index.IsSimple) return ExtractIndexKeys(doc, index.Fields[0].Path, out multiKey);
+        if (index.IsSimple) return ExtractIndexKeys(doc, index.Paths[0], out multiKey);
         multiKey = false;
         var fields = index.Fields;
         var parts = new List<IndexKey>[fields.Length];
@@ -48,7 +50,7 @@ internal static class CollectionEngine
         long product = 1;
         for (int i = 0; i < fields.Length; i++)
         {
-            var keys = ExtractIndexKeys(doc, fields[i].Path, out bool multi);
+            var keys = ExtractIndexKeys(doc, index.Paths[i], out bool multi);
             multiKey |= multi;
             if (keys.Count == 0) keys.Add(s_missing);
             else any = true;
@@ -61,34 +63,48 @@ internal static class CollectionEngine
         }
         if (!any) return [];
 
-        byte[] flag = fields.Length == 1 ? [] : [!multiKey && FieldsInOrder(doc, fields) ? IndexHint.InOrder : IndexHint.OutOfOrder];
+        byte[] flag = fields.Length == 1 ? [] : [!multiKey && FieldsInOrder(doc, index.Paths) ? IndexHint.InOrder : IndexHint.OutOfOrder];
         var result = new List<IndexKey>((int)product);
-        Combine(parts, 0, [], [], result, flag);
+        using var key = new ByteBuffer(64);
+        using var hint = new ByteBuffer(32);
+        Combine(parts, 0, key, hint, result, flag);
         return result;
     }
 
-    private static void Combine(List<IndexKey>[] parts, int i, byte[] key, byte[] hint, List<IndexKey> result, byte[] flag)
+    /// <summary>Depth-first cartesian product of the per-field keys; <paramref name="key"/> and <paramref name="hint"/> hold the current prefix.</summary>
+    private static void Combine(List<IndexKey>[] parts, int i, ByteBuffer key, ByteBuffer hint, List<IndexKey> result, byte[] flag)
     {
         if (i == parts.Length)
         {
-            result.Add(new(key, [.. hint, .. flag]));
+            var hints = new byte[hint.Length + flag.Length];
+            hint.WrittenSpan.CopyTo(hints);
+            flag.CopyTo(hints.AsSpan(hint.Length));
+            result.Add(new(key.ToArray(), hints));
             return;
         }
-        foreach (var (k, h) in parts[i]) Combine(parts, i + 1, [.. key, .. k], [.. hint, .. h], result, flag);
+        int keyLength = key.Length, hintLength = hint.Length;
+        foreach (var (k, h) in parts[i])
+        {
+            key.Write(k);
+            hint.Write(h);
+            Combine(parts, i + 1, key, hint, result, flag);
+            key.Truncate(keyLength);
+            hint.Truncate(hintLength);
+        }
     }
 
     /// <summary>True when the present index fields appear in the document (depth-first) in index order.</summary>
-    private static bool FieldsInOrder(ReadOnlySpan<byte> doc, IndexField[] fields)
+    private static bool FieldsInOrder(ReadOnlySpan<byte> doc, IndexPath[] paths)
     {
         var raw = new RawDocument(doc);
         int last = -1;
-        foreach (var f in fields)
+        foreach (var path in paths)
         {
             var current = new RawValue(DocType.Document, raw.Data);
             bool found = true;
-            foreach (var segment in f.Path.Split('.'))
+            foreach (var segment in path.Segments)
             {
-                if (current.Type != DocType.Document || !current.AsDocument.TryGetField(Encoding.UTF8.GetBytes(segment), out current))
+                if (current.Type != DocType.Document || !current.AsDocument.TryGetField(segment, out current))
                 {
                     found = false;
                     break;
@@ -103,9 +119,9 @@ internal static class CollectionEngine
         return true;
     }
 
-    private static void Collect(RawValue v, byte[][] segments, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
+    private static void Collect(RawValue v, IndexPath path, int seg, List<IndexKey> keys, ByteBuffer buf, ref bool multiKey)
     {
-        if (seg == segments.Length)
+        if (seg == path.Segments.Length)
         {
             if (v.Type == DocType.Array)
             {
@@ -123,24 +139,25 @@ internal static class CollectionEngine
         }
         if (v.Type == DocType.Document)
         {
-            if (v.AsDocument.TryGetField(segments[seg], out var next)) Collect(next, segments, seg + 1, keys, buf, ref multiKey);
+            if (v.AsDocument.TryGetField(path.Segments[seg], out var next)) Collect(next, path, seg + 1, keys, buf, ref multiKey);
         }
         else if (v.Type == DocType.Array)
         {
             multiKey = true;
-            if (int.TryParse(Encoding.UTF8.GetString(segments[seg]), out int position) && position >= 0)
+            int position = path.Position(seg);
+            if (position >= 0)
             {
                 int i = 0;
                 foreach (var item in v.AsArray)
                     if (i++ == position)
                     {
-                        Collect(item, segments, seg + 1, keys, buf, ref multiKey);
+                        Collect(item, path, seg + 1, keys, buf, ref multiKey);
                         break;
                     }
                 return;
             }
             foreach (var item in v.AsArray)
-                if (item.Type == DocType.Document) Collect(item, segments, seg, keys, buf, ref multiKey);
+                if (item.Type == DocType.Document) Collect(item, path, seg, keys, buf, ref multiKey);
         }
     }
 
@@ -157,6 +174,18 @@ internal static class CollectionEngine
         a.CopyTo(r, 0);
         b.CopyTo(r.AsSpan(a.Length));
         return r;
+    }
+
+    /// <summary>
+    /// Concatenates into <paramref name="buf"/> and returns its contents. The span is only valid until the next call
+    /// with the same buffer, so it must be consumed before the next index entry is built.
+    /// </summary>
+    private static ReadOnlySpan<byte> Concat(ByteBuffer buf, ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
+    {
+        buf.Clear();
+        buf.Write(a);
+        buf.Write(b);
+        return buf.WrittenSpan;
     }
 
     private static bool ConflictsInUniqueIndex(BTree index, byte[] valueKey, ReadOnlySpan<byte> idKey)
@@ -197,7 +226,7 @@ internal static class CollectionEngine
             throw new DuplicateKeyException($"Duplicate key in collection '{meta.Name}': _id {DocJson.WriteValue(id)}.");
 
         // Validate every index before mutating anything, so a failed insert leaves the transaction untouched.
-        var perIndex = new List<(IndexMeta Index, List<IndexKey> Keys, bool Multi)>(meta.Indexes.Count);
+        List<(IndexMeta Index, List<IndexKey> Keys, bool Multi)>? perIndex = null;
         foreach (var index in meta.Indexes)
         {
             var keys = ExtractIndexKeys(bytes, index, out bool multi);
@@ -207,16 +236,21 @@ internal static class CollectionEngine
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
                     throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {index.DescribeKey(k)}.");
             }
-            perIndex.Add((index, keys, multi));
+            (perIndex ??= new(meta.Indexes.Count)).Add((index, keys, multi));
         }
 
         primary.Insert(idKey, bytes, overwrite: false);
-        var idHint = perIndex.Count > 0 ? IndexHint.ForId(bytes) : [];
+        if (perIndex is null) return id;
+
+        var idHint = IndexHint.ForId(bytes);
         bool metaChanged = false;
+        using var entryKey = new ByteBuffer(64);
+        using var entryValue = new ByteBuffer(32);
         foreach (var (index, keys, multi) in perIndex)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var (k, hint) in keys) tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
+            foreach (var (k, hint) in keys)
+                tree.Insert(Concat(entryKey, k, idKey), Concat(entryValue, idHint, hint), overwrite: true);
             if (multi && !index.MultiKey)
             {
                 index.MultiKey = true;
@@ -229,12 +263,18 @@ internal static class CollectionEngine
 
     public static void Delete(EngineTx tx, CollectionMeta meta, ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> docBytes)
     {
+        if (meta.Indexes.Count > 0) DeleteIndexEntries(tx, meta, idKey, docBytes);
+        new BTree(tx.Storage, meta.PrimaryRoot).Delete(idKey);
+    }
+
+    private static void DeleteIndexEntries(EngineTx tx, CollectionMeta meta, ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> docBytes)
+    {
+        using var entryKey = new ByteBuffer(64);
         foreach (var index in meta.Indexes)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var (k, _) in ExtractIndexKeys(docBytes, index, out _)) tree.Delete(Concat(k, idKey));
+            foreach (var (k, _) in ExtractIndexKeys(docBytes, index, out _)) tree.Delete(Concat(entryKey, k, idKey));
         }
-        new BTree(tx.Storage, meta.PrimaryRoot).Delete(idKey);
     }
 
     /// <summary>Replaces a stored document. Returns false if the new version is byte-identical (not modified).</summary>
@@ -247,7 +287,7 @@ internal static class CollectionEngine
         if (newBytes.AsSpan().SequenceEqual(oldBytes)) return false;
         if (newBytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
 
-        var changes = new List<(IndexMeta Index, List<byte[]> Removed, List<IndexKey> Written, bool Multi)>();
+        List<(IndexMeta Index, List<byte[]> Removed, List<IndexKey> Written, bool Multi)>? changes = null;
         byte[] idHint = [];
         bool idHintChanged = false;
         if (meta.Indexes.Count > 0)
@@ -259,7 +299,7 @@ internal static class CollectionEngine
         {
             // Compound hints also record whether the fields are in index order, which a reorder can change.
             if (!idHintChanged && SameFields(oldBytes, newBytes, index.TopLevelFields)
-                && (index.Fields.Length == 1 || FieldsInOrder(oldBytes, index.Fields) == FieldsInOrder(newBytes, index.Fields))) continue;
+                && (index.Fields.Length == 1 || FieldsInOrder(oldBytes, index.Paths) == FieldsInOrder(newBytes, index.Paths))) continue;
             var oldKeys = ExtractIndexKeys(oldBytes, index, out _);
             var newKeys = ExtractIndexKeys(newBytes, index, out bool multi);
             var removed = oldKeys.Where(o => !newKeys.Exists(n => n.Key.AsSpan().SequenceEqual(o.Key))).Select(o => o.Key).ToList();
@@ -272,15 +312,24 @@ internal static class CollectionEngine
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
                     throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {index.DescribeKey(k)}.");
             }
-            changes.Add((index, removed, [.. added, .. rehinted], multi));
+            (changes ??= new(meta.Indexes.Count)).Add((index, removed, [.. added, .. rehinted], multi));
+        }
+
+        if (changes is null)
+        {
+            new BTree(tx.Storage, meta.PrimaryRoot).Update(idKey, newBytes);
+            return true;
         }
 
         bool metaChanged = false;
+        using var entryKey = new ByteBuffer(64);
+        using var entryValue = new ByteBuffer(32);
         foreach (var (index, removed, written, multi) in changes)
         {
             var tree = new BTree(tx.Storage, index.Root);
-            foreach (var k in removed) tree.Delete(Concat(k, idKey));
-            foreach (var (k, hint) in written) tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
+            foreach (var k in removed) tree.Delete(Concat(entryKey, k, idKey));
+            foreach (var (k, hint) in written)
+                tree.Insert(Concat(entryKey, k, idKey), Concat(entryValue, idHint, hint), overwrite: true);
             if (multi && !index.MultiKey)
             {
                 index.MultiKey = true;
@@ -548,6 +597,8 @@ internal static class CollectionEngine
         var tree = new BTree(tx.Storage, index.Root);
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
         var cur = primary.CreateCursor();
+        using var entryKey = new ByteBuffer(64);
+        using var entryValue = new ByteBuffer(32);
         for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
         {
             var idKey = cur.Key.ToArray();
@@ -558,7 +609,7 @@ internal static class CollectionEngine
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (unique && ConflictsInUniqueIndex(tree, k, idKey))
                     throw new DuplicateKeyException($"Cannot create unique index '{name}': duplicate value {index.DescribeKey(k)}.");
-                tree.Insert(Concat(k, idKey), IndexHint.Entry(idHint, hint), overwrite: true);
+                tree.Insert(Concat(entryKey, k, idKey), Concat(entryValue, idHint, hint), overwrite: true);
                 if (multi) index.MultiKey = true;
             }
         }
