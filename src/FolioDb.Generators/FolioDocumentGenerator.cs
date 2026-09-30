@@ -437,6 +437,112 @@ public sealed class FolioDocumentGenerator : IIncrementalGenerator
         throw new InvalidOperationException();
     }
 
+    /// <summary>Like <see cref="SimpleRead"/>, over a borrowed DocValueView; conversions are the same.</summary>
+    private static string? ViewSimpleRead(ITypeSymbol type, string v)
+    {
+        const string M = "global::FolioDb.Mapping.FolioMapper";
+        switch (type.SpecialType)
+        {
+            case SpecialType.System_UInt64: return $"{M}.ReadUInt64({v})";
+            case SpecialType.System_Decimal: return $"{M}.ReadDecimal({v})";
+            case SpecialType.System_Char: return $"{M}.ReadChar({v})";
+            case SpecialType.System_String: return $"({v}.IsNull ? null! : {v}.GetString())";
+        }
+        if (type is IArrayTypeSymbol { ElementType.SpecialType: SpecialType.System_Byte, Rank: 1 }) return $"({v}.IsNull ? null! : {v}.AsBinary.ToArray())";
+        switch (type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+        {
+            case "global::FolioDb.Document": return $"({v}.IsNull ? null! : {v}.AsDocument.ToDocument())";
+            case "global::FolioDb.DocArray": return $"({v}.IsNull ? null! : {v}.AsArray.ToArray())";
+            case "global::FolioDb.DocValue": return $"{v}.ToDocValue()";
+        }
+        // Remaining simple types use accessors/helpers with identical names on DocValueView.
+        return SimpleRead(type, v);
+    }
+
+    /// <summary>
+    /// Read expression over a DocValueView. Views are ref structs and cannot be captured by lambdas, so collections
+    /// are read by static local functions appended to <paramref name="funcs"/>.
+    /// </summary>
+    private static string ViewReadExpr(ITypeSymbol type, string v, int depth, string p, StringBuilder funcs, string ind)
+    {
+        const string M = "global::FolioDb.Mapping.FolioMapper";
+        const string DVV = "global::FolioDb.DocValueView";
+        var kind = Classify(type, out var el);
+        string e = p + "e" + depth, fn = p + "read" + depth;
+        string i1 = ind + "    ";
+        switch (kind)
+        {
+            case Kind.Simple: return ViewSimpleRead(type, v)!;
+            case Kind.Nullable: return $"({v}.IsNull ? default({Fq(type)}) : {ViewReadExpr(el!, v, depth + 1, p, funcs, ind)})";
+            case Kind.Enum:
+                var under = ((INamedTypeSymbol)type).EnumUnderlyingType!;
+                return under.SpecialType is SpecialType.System_Int64 or SpecialType.System_UInt64 or SpecialType.System_UInt32
+                    ? $"({Fq(type)}){v}.AsInt64"
+                    : $"({Fq(type)}){v}.AsInt32";
+            case Kind.Nested:
+                string t = Fq(type).TrimEnd('?');
+                return type.IsValueType
+                    ? $"{M}.ReadNested<{t}>({v}.AsDocument)"
+                    : $"({v}.IsNull ? null! : {M}.ReadNested<{t}>({v}.AsDocument))";
+            case Kind.List:
+            case Kind.Array:
+            case Kind.HashSet:
+            {
+                string et = Fq(el!);
+                string item = ViewReadExpr(el!, e, depth + 1, p, funcs, ind);
+                string ret = kind switch
+                {
+                    Kind.List => $"global::System.Collections.Generic.List<{et}>",
+                    Kind.HashSet => $"global::System.Collections.Generic.HashSet<{et}>",
+                    _ => et + "[]",
+                };
+                funcs.Append(ind).Append("static ").Append(ret).Append(' ').Append(fn).Append('(').Append(DVV).AppendLine(" v)");
+                funcs.Append(ind).AppendLine("{");
+                funcs.Append(i1).AppendLine("if (v.IsNull) return null!;");
+                funcs.Append(i1).AppendLine("var items = v.AsArray;");
+                if (kind == Kind.Array)
+                {
+                    funcs.Append(i1).Append("var result = ").Append(NewArray(et, "items.Count")).AppendLine(";");
+                    funcs.Append(i1).AppendLine("int i = 0;");
+                    funcs.Append(i1).Append("foreach (var ").Append(e).Append(" in items) result[i++] = ").Append(item).AppendLine(";");
+                }
+                else
+                {
+                    funcs.Append(i1).Append("var result = new ").Append(ret).AppendLine("(items.Count);");
+                    funcs.Append(i1).Append("foreach (var ").Append(e).Append(" in items) result.Add(").Append(item).AppendLine(");");
+                }
+                funcs.Append(i1).AppendLine("return result;");
+                funcs.Append(ind).AppendLine("}");
+                return $"{fn}({v})";
+            }
+            case Kind.Map:
+            {
+                string et = Fq(el!);
+                string item = ViewReadExpr(el!, e + ".Value", depth + 1, p, funcs, ind);
+                string ret = $"global::System.Collections.Generic.Dictionary<string, {et}>";
+                funcs.Append(ind).Append("static ").Append(ret).Append(' ').Append(fn).Append('(').Append(DVV).AppendLine(" v)");
+                funcs.Append(ind).AppendLine("{");
+                funcs.Append(i1).AppendLine("if (v.IsNull) return null!;");
+                funcs.Append(i1).AppendLine("var fields = v.AsDocument;");
+                funcs.Append(i1).Append("var result = new ").Append(ret).AppendLine("(fields.FieldCount);");
+                funcs.Append(i1).Append("foreach (var ").Append(e).Append(" in fields) result[").Append(e).Append(".GetName()] = ").Append(item).AppendLine(";");
+                funcs.Append(i1).AppendLine("return result;");
+                funcs.Append(ind).AppendLine("}");
+                return $"{fn}({v})";
+            }
+        }
+        throw new InvalidOperationException();
+    }
+
+    /// <summary>Allocation expression for a 1-D array of <paramref name="elementType"/>, which may itself be an array type.</summary>
+    private static string NewArray(string elementType, string length)
+    {
+        int bracket = elementType.IndexOf('[', elementType.LastIndexOf('>') + 1);
+        return bracket < 0
+            ? $"new {elementType}[{length}]"
+            : $"new {elementType.Substring(0, bracket)}[{length}]{elementType.Substring(bracket).Replace("?", "")}";
+    }
+
     /// <summary>For _id members: a condition under which the id is "unset" and should be generated by the database.</summary>
     private static string? UnsetIdCondition(ITypeSymbol type, string x)
     {
@@ -526,6 +632,9 @@ public sealed class FolioDocumentGenerator : IIncrementalGenerator
             sb.Append(i2).Append("if (has_").Append(local[m]).Append(") result.").Append(m.Name).Append(" = ").Append(ReadExpr(m.Type, local[m], 0, "r" + local[m] + "_")).AppendLine(";");
         sb.Append(i2).AppendLine("return result;");
         sb.Append(i1).AppendLine("}");
+        sb.AppendLine();
+
+        EmitFromView(sb, self, members, ctorArgs, i1);
 
         sb.Append(ind).AppendLine("}");
         for (int i = containers.Count - 1; i >= 0; i--) sb.Append(Indent(i)).AppendLine("}");
@@ -533,6 +642,76 @@ public sealed class FolioDocumentGenerator : IIncrementalGenerator
     }
 
     private static string Indent(int level) => new(' ', level * 4);
+
+    /// <summary>
+    /// Single pass over the stored fields, matching names as UTF-8 bytes (grouped by length). Like FromDocument's
+    /// TryGetValue, the first occurrence of a duplicated name wins; unmapped fields are skipped without decoding.
+    /// </summary>
+    private static void EmitFromView(StringBuilder sb, string self, List<Member> members, List<Member> ctorArgs, string i1)
+    {
+        string i2 = i1 + "    ", i3 = i2 + "    ", i4 = i3 + "    ", i5 = i4 + "    ";
+        var funcs = new StringBuilder();
+        sb.Append(i1).AppendLine("/// <summary>Reads the entity directly from a borrowed view (valid only during the calling callback).</summary>");
+        sb.Append(i1).Append("public static ").Append(self).AppendLine(" FromView(global::FolioDb.DocumentView view)");
+        sb.Append(i1).AppendLine("{");
+        var local = new Dictionary<Member, string>();
+        int idx = 0;
+        foreach (var m in members)
+        {
+            string name = "v" + idx++;
+            local[m] = name;
+            sb.Append(i2).Append("bool has_").Append(name).Append(" = false; scoped global::FolioDb.DocValueView ").Append(name).AppendLine(" = default;");
+        }
+        if (members.Count > 0)
+        {
+            sb.Append(i2).AppendLine("foreach (var field in view)");
+            sb.Append(i2).AppendLine("{");
+            sb.Append(i3).AppendLine("var name = field.Utf8Name;");
+            sb.Append(i3).AppendLine("switch (name.Length)");
+            sb.Append(i3).AppendLine("{");
+            foreach (var group in members.GroupBy(m => Encoding.UTF8.GetByteCount(m.Field)).OrderBy(g => g.Key))
+            {
+                sb.Append(i4).Append("case ").Append(group.Key).AppendLine(":");
+                bool first = true;
+                foreach (var m in group)
+                {
+                    string v = local[m];
+                    sb.Append(i5).Append(first ? "if" : "else if").Append(" (global::System.MemoryExtensions.SequenceEqual(name, ")
+                      .Append(Literal(m.Field)).Append("u8)) { if (!has_").Append(v).Append(") { has_").Append(v).Append(" = true; ")
+                      .Append(v).AppendLine(" = field.Value; } }");
+                    first = false;
+                }
+                sb.Append(i5).AppendLine("break;");
+            }
+            sb.Append(i3).AppendLine("}");
+            sb.Append(i2).AppendLine("}");
+        }
+
+        string Read(Member m) => ViewReadExpr(m.Type, local[m], 0, "r" + local[m] + "_", funcs, i2);
+        string Value(Member m) => $"(has_{local[m]} ? {Read(m)} : default!)";
+
+        var inCtor = new HashSet<Member>(ctorArgs);
+        sb.Append(i2).Append("var result = new ").Append(self).Append('(')
+          .Append(string.Join(", ", ctorArgs.Select(Value))).Append(')');
+        var initMembers = members.Where(m => !inCtor.Contains(m) && m.InitOnly).ToList();
+        if (initMembers.Count > 0)
+        {
+            sb.AppendLine();
+            sb.Append(i2).AppendLine("{");
+            foreach (var m in initMembers) sb.Append(i3).Append(m.Name).Append(" = ").Append(Value(m)).AppendLine(",");
+            sb.Append(i2).Append('}');
+        }
+        sb.AppendLine(";");
+        foreach (var m in members.Where(m => !inCtor.Contains(m) && !m.InitOnly && m.CanSet))
+            sb.Append(i2).Append("if (has_").Append(local[m]).Append(") result.").Append(m.Name).Append(" = ").Append(Read(m)).AppendLine(";");
+        sb.Append(i2).AppendLine("return result;");
+        if (funcs.Length > 0)
+        {
+            sb.AppendLine();
+            sb.Append(funcs);
+        }
+        sb.Append(i1).AppendLine("}");
+    }
 
     private static string Keyword(INamedTypeSymbol t)
     {

@@ -397,6 +397,15 @@ The generator implements `IFolioDocument<T>` (`ToDocument`/`FromDocument`). Supp
 `ObjectId`, `byte[]`, `Document`/`DocValue`, lists/arrays/sets, `Dictionary<string, T>` and nested `[FolioDocument]` types.
 Diagnostics: `FOLIO001` type not partial, `FOLIO002` unsupported member type, `FOLIO003` no usable constructor, `FOLIO004` duplicate field name.
 
+It also emits `FromView(DocumentView)`, which builds the entity straight from the stored bytes in one pass (field
+names matched as UTF-8 literals, unmapped fields skipped undecoded) instead of materializing a `Document` first.
+Typed `FindById`, and `Find`/`FindOne` without sort or projection, use it; with sort or projection they fall back
+to `FromDocument`. Conversions, defaults for missing fields and "first occurrence wins" for duplicated names are the
+same as `FromDocument`. Hand-written `IFolioDocument<T>` implementations inherit a default `FromView` that
+materializes and calls `FromDocument`. `FromView` can also be called inside `TryReadById`/`Visit` callbacks.
+Because typed reads map inside that borrowed read, mappers (and property setters/constructors they call) must not
+write to the database; such writes throw `InvalidOperationException`, as in any borrowed callback.
+
 ### Options
 
 ```csharp
@@ -1235,12 +1244,29 @@ That is about 272 bytes per materialized document. An interleaved A/B (six alter
 comparing minimums, host load about 5) found the timing neutral: -0.5% for `FindById` and -0.6% for the
 limit-10 `Find`, within noise. The counting pass costs roughly what the avoided copies did.
 
+### Typed reads without an intermediate `Document`
+
+Typed reads used to pay twice: materialize a `Document` (every name and string decoded, every value boxed into a
+list), then copy it into the entity. The generated `FromView` reads the entity from the borrowed bytes instead, so
+only the entity's own strings and collections are allocated.
+
+| Per operation (same 7-field documents as above) | Document | Typed, before | Typed, `FromView` |
+|---|---:|---:|---:|
+| `FindById` allocated | 1,784 B | 1,960 B | **920 B** |
+| `Find` by indexed field, limit 10, allocated | 12,696 B | 15,096 B | **5,816 B** |
+| `FindById` time (minimum of 7) | ~2.5 µs | ~2.5 µs | **~1.9 µs** |
+| `Find` limit 10 time (minimum of 7) | ~11.5 µs | ~13.4 µs | **~8.2 µs** |
+
+A hand-written single-pass reader for the same type allocated 928 B and took ~2.0 µs, so the generated code is at
+that bound. Times come from three runs on a shared host (load about 4) and are relative, not guarantees; the
+allocation figures are the reproducible ones. Typed reads are now cheaper than untyped `Document` reads.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
 - No full-text search, aggregation disk spilling, joins, or general expression language.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
-- `TryReadById` and `Visit` are optional borrowed APIs; `Find` and aggregation still materialize documents.
+- `TryReadById` and `Visit` are optional borrowed APIs; untyped `Find`, typed `Find` with sort or projection, and aggregation still materialize documents.
   Their scope guard detects same-thread reentrancy only (transactions and snapshots are single-threaded objects).
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

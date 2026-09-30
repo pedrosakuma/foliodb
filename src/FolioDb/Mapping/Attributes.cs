@@ -8,6 +8,13 @@ public interface IFolioDocument<TSelf> where TSelf : IFolioDocument<TSelf>
 {
     static abstract Document ToDocument(TSelf value);
     static abstract TSelf FromDocument(Document document);
+
+    /// <summary>
+    /// Builds the entity straight from a borrowed view, without materializing a <see cref="Document"/>. Generated
+    /// mappers read the stored bytes in one pass; the default materializes and delegates to <see cref="FromDocument"/>.
+    /// Typed collection reads call it inside a borrowed read, so it must not write to the database.
+    /// </summary>
+    static virtual TSelf FromView(DocumentView view) => TSelf.FromDocument(view.ToDocument());
 }
 
 /// <summary>Generates a <see cref="IFolioDocument{TSelf}"/> implementation for this partial class/struct/record.</summary>

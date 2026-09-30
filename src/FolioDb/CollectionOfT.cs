@@ -15,7 +15,8 @@ public sealed class Collection<T> where T : IFolioDocument<T>
 
     public IReadOnlyList<DocValue> InsertMany(IEnumerable<T> entities) => Untyped.InsertMany(entities.Select(T.ToDocument));
 
-    public T? FindById(DocValue id) => Untyped.FindById(id) is { } d ? T.FromDocument(d) : default;
+    /// <summary>Point read mapped straight from the stored bytes via <see cref="IFolioDocument{TSelf}.FromView"/>.</summary>
+    public T? FindById(DocValue id) => Untyped.TryReadById(id, static v => T.FromView(v), out var entity) ? entity : default;
 
     /// <inheritdoc cref="Collection.TryReadById{TResult}(DocValue, Func{DocumentView, TResult}, out TResult)"/>
     public bool TryReadById<TResult>(DocValue id, Func<DocumentView, TResult> reader, [MaybeNullWhen(false)] out TResult result) =>
@@ -36,19 +37,36 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     /// <inheritdoc cref="Collection.Visit(PreparedFilter, Func{DocumentView, bool})"/>
     public long Visit(PreparedFilter filter, Func<DocumentView, bool> visitor) => Untyped.Visit(filter, visitor);
 
-    public List<T> Find(PreparedFilter filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
+    // Without sort or projection, results are mapped straight from the stored bytes (same plan and order as the
+    // untyped Find); otherwise the untyped Find materializes documents and they are mapped with FromDocument.
 
-    public List<T> Find(Document? filter = null, FindOptions? options = null) => Map(Untyped.Find(filter, options));
-    public List<T> Find(string? filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
+    public List<T> Find(PreparedFilter filter, FindOptions? options = null)
+    {
+        if (!ReadsDirectly(options)) return Map(Untyped.Find(filter, options));
+        var c = new Collector(options);
+        Untyped.Visit(filter, c.Add);
+        return c.Items;
+    }
 
-    public T? FindOne(Document? filter = null, FindOptions? options = null) =>
-        Untyped.FindOne(filter, options) is { } d ? T.FromDocument(d) : default;
+    public List<T> Find(Document? filter = null, FindOptions? options = null)
+    {
+        if (!ReadsDirectly(options)) return Map(Untyped.Find(filter, options));
+        var c = new Collector(options);
+        Untyped.Visit(filter, c.Add);
+        return c.Items;
+    }
 
-    public T? FindOne(string? filter, FindOptions? options = null) =>
-        Untyped.FindOne(filter, options) is { } d ? T.FromDocument(d) : default;
+    public List<T> Find(string? filter, FindOptions? options = null)
+    {
+        if (!ReadsDirectly(options)) return Map(Untyped.Find(filter, options));
+        var c = new Collector(options);
+        Untyped.Visit(filter, c.Add);
+        return c.Items;
+    }
 
-    public T? FindOne(PreparedFilter filter, FindOptions? options = null) =>
-        Untyped.FindOne(filter, options) is { } d ? T.FromDocument(d) : default;
+    public T? FindOne(Document? filter = null, FindOptions? options = null) => First(Find(filter, WithLimitOne(options)));
+    public T? FindOne(string? filter, FindOptions? options = null) => First(Find(filter, WithLimitOne(options)));
+    public T? FindOne(PreparedFilter filter, FindOptions? options = null) => First(Find(filter, WithLimitOne(options)));
 
     public long Count(Document? filter = null) => Untyped.Count(filter);
     public long Count(string? filter) => Untyped.Count(filter);
@@ -84,6 +102,33 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public bool RebuildIndex(string nameOrField) => Untyped.RebuildIndex(nameOrField);
     public bool RebuildIndex(Document keys) => Untyped.RebuildIndex(keys);
     public IReadOnlyList<IndexInfo> GetIndexes() => Untyped.GetIndexes();
+
+    private static bool ReadsDirectly(FindOptions? o) => o is null || (o.Sort is null && o.Projection is null);
+
+    private static FindOptions WithLimitOne(FindOptions? o) =>
+        new() { Sort = o?.Sort, Projection = o?.Projection, Skip = o?.Skip ?? 0, Limit = 1 };
+
+    private static T? First(List<T> items) => items.Count > 0 ? items[0] : default;
+
+    /// <summary>Applies skip/limit exactly like the untyped Find while mapping each visited view.</summary>
+    private sealed class Collector(FindOptions? options)
+    {
+        private readonly int _limit = options?.Limit is int l and > 0 ? l : int.MaxValue;
+        private int _skip = options?.Skip ?? 0;
+
+        public List<T> Items { get; } = options?.Limit is int l and > 0 && l <= 16 ? new(l) : [];
+
+        public bool Add(DocumentView view)
+        {
+            if (_skip > 0)
+            {
+                _skip--;
+                return true;
+            }
+            Items.Add(T.FromView(view));
+            return Items.Count < _limit;
+        }
+    }
 
     private static List<T> Map(List<Document> docs)
     {

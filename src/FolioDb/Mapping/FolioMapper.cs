@@ -85,4 +85,41 @@ public static class FolioMapper
         DocType.Decimal => decimal.ToUInt64(value.AsDecimal),
         _ => checked((ulong)value.AsDouble),
     };
+
+    // Borrowed-view counterparts used by generated FromView; conversions match the DocValue overloads above.
+
+    public static T ReadNested<T>(DocumentView view) where T : IFolioDocument<T> => T.FromView(view);
+
+    public static Guid ReadGuid(DocValueView value) => value.Type switch
+    {
+        DocType.String => Guid.Parse(value.AsUtf8String, null),
+        DocType.Binary when value.AsBinary.Length == 16 => new Guid(value.AsBinary),
+        _ => throw new InvalidCastException($"Cannot read {value.Type} value as Guid."),
+    };
+
+    public static decimal ReadDecimal(DocValueView value) => value.Type switch
+    {
+        DocType.String => decimal.Parse(value.AsUtf8String, NumberStyles.Float, CultureInfo.InvariantCulture),
+        _ => value.AsDecimal,
+    };
+
+    public static DateTimeOffset ReadDateTimeOffset(DocValueView value) => new(value.AsDateTime);
+    public static DateOnly ReadDateOnly(DocValueView value) => DateOnly.FromDateTime(value.AsDateTime);
+    public static TimeSpan ReadTimeSpan(DocValueView value) => TimeSpan.FromTicks(value.AsInt64);
+
+    public static char ReadChar(DocValueView value)
+    {
+        Span<char> chars = stackalloc char[2];
+        return System.Text.Encoding.UTF8.TryGetChars(value.AsUtf8String, chars, out int n) && n == 1
+            ? chars[0]
+            : throw new InvalidCastException("Expected a single-character string.");
+    }
+
+    public static ulong ReadUInt64(DocValueView value) => value.Type switch
+    {
+        DocType.String => ulong.Parse(value.AsUtf8String, CultureInfo.InvariantCulture),
+        DocType.Int32 or DocType.Int64 => checked((ulong)value.AsInt64),
+        DocType.Decimal => decimal.ToUInt64(value.AsDecimal),
+        _ => checked((ulong)value.AsDouble),
+    };
 }
