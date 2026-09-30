@@ -128,7 +128,7 @@ internal sealed class StorageTx : IDisposable
         }
     }
 
-    private void ThrowIfFinished()
+    internal void ThrowIfFinished()
     {
         if (_finished) throw new InvalidOperationException("The transaction has already completed.");
     }

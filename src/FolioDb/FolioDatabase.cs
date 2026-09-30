@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using FolioDb.Engine;
+using FolioDb.Query;
 using FolioDb.Storage;
 
 namespace FolioDb;
@@ -197,7 +198,7 @@ public sealed class Transaction : IDisposable
     private readonly FolioDatabase _db;
     private bool _completed;
     private bool _doomed;
-    // Active TryReadById callbacks. Their views may alias this transaction's private (mutable) pages.
+    // Active borrowed reads. Their views may alias this transaction's private (mutable) pages.
     private int _borrows;
 
     internal Transaction(FolioDatabase db, EngineTx engine)
@@ -276,6 +277,34 @@ public sealed class Transaction : IDisposable
         return true;
     }
 
+    internal long VisitBorrowed(string collection, Filter filter, Func<DocumentView, bool> visitor)
+    {
+        ThrowIfUnusable();
+        bool callbackFailed = false;
+        _borrows++;
+        try
+        {
+            return CollectionEngine.Visit(Engine, Engine.GetCollection(collection), filter, view =>
+            {
+                try { return visitor(view); }
+                catch
+                {
+                    callbackFailed = true;
+                    throw;
+                }
+            });
+        }
+        catch when (!callbackFailed)
+        {
+            _doomed = true;
+            throw;
+        }
+        finally
+        {
+            _borrows--;
+        }
+    }
+
     private void ThrowIfUnusable()
     {
         if (_completed) throw new InvalidOperationException("The transaction has already completed.");
@@ -285,7 +314,7 @@ public sealed class Transaction : IDisposable
     private void ThrowIfBorrowed(string action)
     {
         if (_borrows > 0)
-            throw new InvalidOperationException($"The transaction cannot be {action} while a TryReadById callback is running.");
+            throw new InvalidOperationException($"The transaction cannot be {action} while a borrowed read callback is running.");
     }
 
     public void Commit()
@@ -304,7 +333,7 @@ public sealed class Transaction : IDisposable
         Engine.Dispose();
     }
 
-    /// <summary>Rolls back if not committed. Throws <see cref="InvalidOperationException"/> while a TryReadById callback is running.</summary>
+    /// <summary>Rolls back if not committed. Throws <see cref="InvalidOperationException"/> while a borrowed read callback is running.</summary>
     public void Dispose() => Rollback();
 }
 
@@ -347,11 +376,24 @@ public sealed class Snapshot : IDisposable
         return true;
     }
 
-    /// <summary>Releases the snapshot. Throws <see cref="InvalidOperationException"/> while a TryReadById callback is running.</summary>
+    internal long VisitBorrowed(string collection, Filter filter, Func<DocumentView, bool> visitor)
+    {
+        _borrows++;
+        try
+        {
+            return CollectionEngine.Visit(Engine, Engine.GetCollection(collection), filter, visitor);
+        }
+        finally
+        {
+            _borrows--;
+        }
+    }
+
+    /// <summary>Releases the snapshot. Throws <see cref="InvalidOperationException"/> while a borrowed read callback is running.</summary>
     public void Dispose()
     {
         if (_borrows > 0)
-            throw new InvalidOperationException("The snapshot cannot be disposed while a TryReadById callback is running.");
+            throw new InvalidOperationException("The snapshot cannot be disposed while a borrowed read callback is running.");
         Engine.Dispose();
     }
 }

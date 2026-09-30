@@ -346,6 +346,22 @@ internal static class CollectionEngine
         return result;
     }
 
+    public static long Visit(EngineTx tx, CollectionMeta? meta, Filter filter, Func<DocumentView, bool> visitor)
+    {
+        tx.Storage.ThrowIfFinished();
+        if (meta is null) return 0;
+        long visited = 0;
+        var plan = QueryPlanner.Plan(meta, filter);
+        QueryPlanner.Execute(tx.Storage, meta, plan, (_, bytes) =>
+        {
+            var raw = new RawDocument(bytes);
+            if (!filter.Matches(raw)) return true;
+            visited++;
+            return visitor(new DocumentView(raw));
+        });
+        return visited;
+    }
+
     public static long Count(EngineTx tx, CollectionMeta? meta, Filter filter)
     {
         if (meta is null) return 0;

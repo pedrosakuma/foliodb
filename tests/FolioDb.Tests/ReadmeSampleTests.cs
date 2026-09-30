@@ -82,6 +82,25 @@ public class ReadmeSampleTests
     }
 
     [Fact]
+    public void MaterializedAndBorrowedQueries()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var people = db.GetCollection("people");
+        people.InsertMany([Document.Parse("{_id:1,age:31}"), Document.Parse("{_id:2,age:12}")]);
+        var adults = people.Find("{age:{$gte:18}}");
+        long ageSum = 0;
+        long visited = people.Visit("{age:{$gte:18}}", doc =>
+        {
+            if (!doc.TryGetValue("age", out var age)) throw new InvalidOperationException("Missing age.");
+            ageSum += age.AsInt64;
+            return true;
+        });
+        Assert.Equal(adults.Count, visited);
+        Assert.Equal(adults.Sum(d => d["age"].AsInt64), ageSum);
+    }
+
+    [Fact]
     public void TypedDocuments()
     {
         using var tmp = new TempDb();

@@ -40,6 +40,8 @@ no reflection — typed mapping is done by a source generator).
   when nothing matches) and implies an inclusion projection.
 - **Borrowed point reads**: `TryReadById` hands a synchronous callback a read-only `ref struct` view over the stored
   bytes (scalars, UTF-8 string/binary spans, nested documents/arrays) without building a `Document`; see below.
+- **Optional borrowed queries**: `Visit` uses the existing query planner and filters with a callback per match,
+  early termination and no result list. `Find`/`FindOne` remain the convenient materialized APIs.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Aggregation**: `$match`, `$project`, `$group`, `$sort`, `$skip`, `$limit`, `$count`, `$unwind`; group accumulators
   `$sum`, `$avg`, `$min`, `$max`, `$count`, `$push`, `$first`, `$last`. A leading `$match` uses the query planner/indexes.
@@ -172,6 +174,43 @@ would see there, including uncommitted writes of the transaction.
   (larger than page size − 4 bytes) is first assembled into one temporary buffer, exactly as for `FindById`; its
   fields are still not materialized. The id is encoded into a small key array, and an auto-read call still
   allocates its read transaction and catalog lookup; a capturing (non-`static`) lambda allocates a closure.
+
+### Choosing the query API
+
+Both APIs remain available; borrowed reads are opt-in, not a replacement for `Find`.
+
+```csharp
+// Convenient: independent documents you can keep, modify, sort or pass across await.
+var adults = people.Find("{age:{$gte:18}}");
+
+// Lower allocation: only read fields needed for the calculation.
+long ageSum = 0;
+long visited = people.Visit("{age:{$gte:18}}", doc =>
+{
+    if (!doc.TryGetValue("age", out var age)) throw new InvalidOperationException("Missing age.");
+    ageSum += age.AsInt64;
+    return true; // false stops immediately; that callback still counts in `visited`
+});
+```
+
+`Visit(Document? filter, Func<DocumentView, bool> visitor)` and its JSON-filter overload exist on `Collection`
+and `Collection<T>`. `"{}"` visits everything; a missing collection or no matches returns zero. Each call uses
+one snapshot for its entire scan, not a new snapshot per callback, and reuses existing primary, secondary,
+compound and multikey query plans. It evaluates the full filter before invoking the callback.
+
+There is no sorting, projection, skip/limit option or async callback in this first version. Order is planner-selected,
+not a stable API guarantee. Read selected fields directly, stop by returning false, and call `ToDocument()` only
+for results you need to retain. The full document is fetched even when an index covers the filter; a covered `Find`
+projection can therefore be preferable when it can avoid reading documents altogether.
+
+The borrowed-view lifetime and transaction/snapshot guards described above also apply to `Visit`; nested reads
+are allowed, mutations of the same transaction and disposal of the same scope are rejected. Callback exceptions
+propagate without dooming the transaction; query execution failures doom it like `Find`. Do not dispose the database
+during a scan: an already-borrowed view remains readable, but advancing the scan may need more I/O and fail.
+Slow callbacks keep the snapshot open and can delay checkpoints and grow the WAL. Unlike a materialized list,
+callbacks run progressively: effects from earlier callbacks are not undone if a later read or callback fails.
+Capturing a running sum, as above, allocates a closure per call site evaluation, not per result.
+Parsing/planning, page cache misses, filters such as regex and multi-page overflow may still allocate.
 
 ### Aggregation
 
@@ -740,12 +779,35 @@ otherwise materialize, and callers that need the whole document still pay for `T
 dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*PointReadBenchmarks*' --job short
 ```
 
+### Borrowed query allocation
+
+`VisitBenchmarks` compares the same numeric sum over 1, 100 and 1,000 indexed matches in a 10,000-document
+collection with 1 KiB ASCII payloads. All three paths use implicit read transactions and the same secondary
+index on `bucket`; the projected result contains only `n` (not covered by that index). The visitor delegate is
+cached during setup. Warm reads, BenchmarkDotNet ShortRun, one launch/three iterations, shared Linux/.NET 10 JIT:
+
+| Matches per query | Find: full documents | Find: projected `n` | Visit: borrowed |
+|---|---:|---:|---:|
+| 1 | 6.22 KiB/query | 4.59 KiB/query | 3.63 KiB/query |
+| 100 | 241.85 KiB/query | 26.76 KiB/query | 3.63 KiB/query |
+| 1,000 | 2,379.36 KiB/query | 223.64 KiB/query | 3.63 KiB/query |
+
+In this warm, single-overflow-page workload, visitor allocations did not grow with result count. At 1,000
+matches this is about 99.85% less allocation than full materialization and 98.4% less than projection.
+This is not a zero-allocation guarantee for other plans, filters or document sizes.
+Mean times at 100 matches were 86.1 / 48.6 / 34.0 us, respectively; these short shared-host measurements
+are indicative, not latency guarantees or concurrency measurements.
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*VisitBenchmarks*' --job short
+```
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
 - No full-text search, aggregation disk spilling, joins, or general expression language.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
-- `TryReadById` borrows only for point reads by `_id`; queries (`Find`, aggregation) still materialize documents.
-  Its scope guard detects same-thread reentrancy only (transactions and snapshots are single-threaded objects).
+- `TryReadById` and `Visit` are optional borrowed APIs; `Find` and aggregation still materialize documents.
+  Their scope guard detects same-thread reentrancy only (transactions and snapshots are single-threaded objects).
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

@@ -128,6 +128,34 @@ public sealed class Collection
         }
     }
 
+    /// <summary>
+    /// Visits matching documents in one snapshot without materializing them. Return false from
+    /// <paramref name="visitor"/> to stop. Returns the number of callbacks invoked, including the one that stopped.
+    /// Views are valid only during their callback, with the same borrowing rules as TryReadById.
+    /// Order is chosen by the query planner; sorting and projection are not supported.
+    /// A missing collection or no matches returns zero. Callback exceptions propagate without dooming an
+    /// explicit transaction; query execution failures doom it like Find. Multi-page values still require a buffer.
+    /// </summary>
+    public long Visit(Document? filter, Func<DocumentView, bool> visitor)
+    {
+        ArgumentNullException.ThrowIfNull(visitor);
+        return Visit(FilterParser.Parse(filter), visitor);
+    }
+
+    /// <inheritdoc cref="Visit(Document, Func{DocumentView, bool})"/>
+    public long Visit(string? filter, Func<DocumentView, bool> visitor)
+    {
+        ArgumentNullException.ThrowIfNull(visitor);
+        return Visit(ParseFilter(filter), visitor);
+    }
+
+    private long Visit(Filter filter, Func<DocumentView, bool> visitor) => _scope switch
+    {
+        Transaction t => t.VisitBorrowed(Name, filter, visitor),
+        Snapshot s => s.VisitBorrowed(Name, filter, visitor),
+        _ => _db.Read(tx => CollectionEngine.Visit(tx, tx.GetCollection(Name), filter, visitor)),
+    };
+
     public List<Document> Find(Document? filter = null, FindOptions? options = null)
     {
         var f = FilterParser.Parse(filter);

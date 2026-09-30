@@ -5,7 +5,8 @@ namespace FolioDb;
 
 /// <summary>
 /// Read-only, borrowed view over a stored document, passed to the callback of
-/// <see cref="Collection.TryReadById{TResult}(DocValue, Func{DocumentView, TResult}, out TResult)"/>.
+/// <see cref="Collection.TryReadById{TResult}(DocValue, Func{DocumentView, TResult}, out TResult)"/>
+/// or <see cref="Collection.Visit(Document, Func{DocumentView, bool})"/>.
 /// It points directly into database page memory: it is only valid during that synchronous callback, and as a
 /// <c>ref struct</c> it cannot be stored in fields, captured by lambdas, boxed or used across <c>await</c>.
 /// Use <see cref="ToDocument"/> or <see cref="DocValueView.ToDocValue"/> to obtain owned copies.

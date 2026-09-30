@@ -27,6 +27,12 @@ public sealed class Collection<T> where T : IFolioDocument<T>
         where TState : allows ref struct =>
         Untyped.TryReadById(id, state, reader, out result);
 
+    /// <inheritdoc cref="Collection.Visit(Document, Func{DocumentView, bool})"/>
+    public long Visit(Document? filter, Func<DocumentView, bool> visitor) => Untyped.Visit(filter, visitor);
+
+    /// <inheritdoc cref="Collection.Visit(string, Func{DocumentView, bool})"/>
+    public long Visit(string? filter, Func<DocumentView, bool> visitor) => Untyped.Visit(filter, visitor);
+
     public List<T> Find(Document? filter = null, FindOptions? options = null) => Map(Untyped.Find(filter, options));
     public List<T> Find(string? filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
 
