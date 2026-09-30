@@ -57,6 +57,10 @@ static void Run(string path)
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToArray());
         Check(concurrent.FindById(1)!["n"].AsInt32 == 80, "FIFO concurrent updates");
         concurrent.Drop();
+        var overflow = db.GetCollection("overflow");
+        overflow.Insert(new Document { ["_id"] = 1, ["payload"] = new string('x', 1024) });
+        Check(overflow.FindById(1)!["payload"].AsString == new string('x', 1024), "single-page overflow read");
+        overflow.Drop();
         users.CreateIndex("email", unique: true);
         users.CreateIndex("age");
         for (int i = 0; i < 2000; i++)

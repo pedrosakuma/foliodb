@@ -7,6 +7,50 @@ public class StorageTests
     private static byte[] Key(int i) => KeyEncoder.Encode(i);
 
     [Theory]
+    [InlineData(1024, false)]
+    [InlineData(1024, true)]
+    [InlineData(4096, false)]
+    [InlineData(4096, true)]
+    public void BTree_reads_inline_and_overflow_boundaries(int pageSize, bool checkpoint)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { PageSize = pageSize, AutoCheckpointFrames = 0 });
+        int[] sizes = [0, 16, pageSize / 2, pageSize - 5, pageSize - 4, pageSize - 3, pageSize * 2 + 5];
+        var values = sizes.Select(n => Enumerable.Range(0, n).Select(i => (byte)(i % 251)).ToArray()).ToArray();
+        uint root;
+        using (var tx = db.BeginWrite())
+        {
+            var tree = new BTree(tx.Storage, root = BTree.Create(tx.Storage));
+            for (int i = 0; i < values.Length; i++) tree.Insert(Key(i), values[i], overwrite: false);
+            for (int i = 0; i < values.Length; i++)
+            {
+                Assert.True(tree.TryGet(Key(i), out var value));
+                Assert.True(value.SequenceEqual(values[i]));
+            }
+            tx.Commit();
+        }
+        if (checkpoint) db.Checkpoint();
+        using var read = db.BeginRead();
+        var reader = new BTree(read.Storage, root);
+        var cursor = reader.CreateCursor();
+        for (int i = 0; i < values.Length; i++)
+        {
+            Assert.True(reader.TryGet(Key(i), out var value));
+            Assert.True(value.SequenceEqual(values[i]));
+            Assert.True(cursor.SeekExact(Key(i)));
+            Assert.True(cursor.Value.SequenceEqual(values[i]));
+        }
+        Assert.False(reader.TryGet(Key(values.Length), out _));
+
+        var key = Key(4); // Exactly one full overflow page.
+        for (int i = 0; i < 10; i++) reader.TryGet(key, out _);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 100; i++) reader.TryGet(key, out _);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        Assert.Equal(0, allocated);
+    }
+
+    [Theory]
     [InlineData(1024, 20_000)]
     [InlineData(4096, 20_000)]
     public void BTree_random_insert_delete_matches_reference_model(int pageSize, int ops)

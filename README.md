@@ -623,6 +623,40 @@ Next evidence-backed candidates are reducing full-read allocation/copying and ex
 wakeups instead of PulseAll. Neither was changed by this diagnostic task. Quantifying fsync versus scheduler
 waiting still requires a suitable off-CPU capture; these results alone do not justify changing durability.
 
+### Single-page overflow read allocation
+
+Following the diagnostic captures, reads of values that fit in one overflow page now borrow a span of that
+page instead of allocating and copying a temporary byte array. This is the same internal lifetime rule as
+inline values: consume the span before mutating the transaction. The public API still materializes independent
+documents, including owned binary buffers and nested values. Multi-page overflow assembly is unchanged.
+The shared B+Tree value reader covers both point lookups and cursor-based queries; there is no file-format,
+durability or writer-admission change.
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*PointReadBenchmarks*' --job short
+```
+
+This benchmark uses 10,000 documents, 256 hot IDs, 4 KiB pages, no secondary indexes, and fully materialized
+reads. Payloads are ASCII strings; 128 bytes stays inline, 1,024 bytes uses one overflow page, and 8,192 bytes
+uses multiple pages. Each case warms the hot IDs after checkpointing and measures either a new implicit
+transaction per read or an existing snapshot. On the same shared Linux/.NET 10 JIT host:
+
+| Payload | Read scope | Allocated before | Allocated after |
+|---|---|---:|---:|
+| 128 B | Implicit transaction | 1,624 B/op | 1,624 B/op |
+| 128 B | Existing snapshot | 768 B/op | 768 B/op |
+| 1,024 B | Implicit transaction | 4,504 B/op | 3,416 B/op |
+| 1,024 B | Existing snapshot | 3,648 B/op | 2,560 B/op |
+| 8,192 B | Implicit transaction | 26,008 B/op | 26,008 B/op |
+| 8,192 B | Existing snapshot | 25,152 B/op | 25,152 B/op |
+
+The 1 KiB payload saves **1,088 bytes per read**, reducing allocation by 24.2% with an implicit transaction
+or 29.8% with an existing snapshot. Its short-run means were 1.719 -> 1.687 us and 1.068 -> 0.994 us respectively,
+but confidence intervals overlap: this establishes an allocation reduction, not a reliable latency gain.
+The unchanged multi-page control also had a large timing swing between runs, reinforcing shared-host noise.
+These are per-operation allocation measurements, not predicted concurrent throughput or measured GC-pause
+reductions. Strings, document objects, field names and transaction/delegate allocations remain.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

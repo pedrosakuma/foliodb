@@ -272,9 +272,12 @@ internal readonly struct BTree
         int vpos = off + LeafCellHeader + keyLen;
         if ((page[off + 2] & FlagOverflow) == 0) return page.Slice(vpos, valLen);
 
-        var result = new byte[valLen];
         uint pg = BinaryPrimitives.ReadUInt32LittleEndian(page[vpos..]);
         int chunk = tx.PageSize - 4;
+        // Like inline values, a single overflow page can be borrowed until the next mutation.
+        if (valLen > 0 && valLen <= chunk) return tx.ReadPage(pg).AsSpan(4, valLen);
+
+        var result = new byte[valLen];
         for (int pos = 0; pos < valLen; pos += chunk)
         {
             var op = tx.ReadPage(pg);

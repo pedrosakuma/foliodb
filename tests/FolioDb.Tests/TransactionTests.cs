@@ -2,6 +2,55 @@ namespace FolioDb.Tests;
 
 public class TransactionTests
 {
+    [Theory]
+    [InlineData(128)]
+    [InlineData(1024)]
+    [InlineData(8192)]
+    public void Materialized_reads_own_buffers_and_preserve_overflow_snapshots(int payloadSize)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 0 });
+        var c = db.GetCollection("items");
+        var original = new Document
+        {
+            ["_id"] = 1,
+            ["payload"] = new string('x', payloadSize),
+            ["nested"] = new Document { ["bytes"] = new byte[] { 1, 2, 3 } },
+            ["array"] = new DocArray { new byte[] { 4, 5, 6 } },
+        };
+        c.Insert(original);
+        db.Checkpoint();
+        Document retained;
+        using (var snapshot = db.BeginSnapshot())
+        {
+            var sc = snapshot.GetCollection("items");
+            retained = sc.FindById(1)!;
+            var mutated = Assert.Single(sc.Find());
+            mutated["nested"].AsDocument["bytes"].AsBinary[0] = 99;
+            mutated["array"].AsArray[0].AsBinary[0] = 99;
+            mutated["payload"] = "changed";
+            Assert.Equal(original.ToJson(), sc.FindById(1)!.ToJson());
+            Assert.Equal(original.ToJson(), retained.ToJson());
+
+            using (var tx = db.BeginTransaction())
+            {
+                var tc = tx.GetCollection("items");
+                tc.UpdateOne(new Document { ["_id"] = 1 }, new Document { ["$set"] = new Document { ["payload"] = new string('y', payloadSize) } });
+                var uncommitted = tc.FindById(1)!;
+                Assert.Equal(new string('y', payloadSize), uncommitted["payload"].AsString);
+                tc.DeleteById(1);
+                tc.Insert(new Document { ["_id"] = 1, ["payload"] = new string('z', payloadSize) });
+                Assert.Equal(new string('y', payloadSize), uncommitted["payload"].AsString);
+                tx.Commit();
+            }
+            Assert.Equal(original.ToJson(), sc.FindById(1)!.ToJson());
+            Assert.Equal(new string('z', payloadSize), c.FindById(1)!["payload"].AsString);
+        }
+        db.Checkpoint();
+        db.Dispose();
+        Assert.Equal(original.ToJson(), retained.ToJson());
+    }
+
     [Fact]
     public void Commit_and_rollback()
     {
