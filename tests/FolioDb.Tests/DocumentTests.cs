@@ -118,4 +118,39 @@ public class DocumentTests
         Assert.Single(CollectionEngine.ExtractIndexKeys(bytes, "e", out _));
         Assert.Empty(CollectionEngine.ExtractIndexKeys(bytes, "missing", out _));
     }
+
+    // Materialization presizes by counting elements first. The count pass does not validate decimals or nested
+    // values, so a malformed later element must not replace the error for an earlier invalid one.
+    [Fact]
+    public void Corrupt_document_reports_first_error_in_field_order()
+    {
+        byte[] invalidDecimal = new byte[16];
+        invalidDecimal[14] = 0xFF; // scale 255 > 28
+        byte[] doc =
+        [
+            27, 0, 0, 0,
+            0x13, 1, (byte)'a', .. invalidDecimal,
+            0x10, 1, (byte)'b', 0x00, // Int32 truncated to one byte
+        ];
+
+        var ex = Assert.Throws<CorruptDatabaseException>(() => Document.FromBytes(doc));
+        Assert.Equal("Invalid decimal value.", ex.Message);
+    }
+
+    [Fact]
+    public void Corrupt_array_reports_first_error_in_item_order()
+    {
+        byte[] invalidDecimal = new byte[16];
+        invalidDecimal[14] = 0xFF;
+        byte[] array =
+        [
+            23, 0, 0, 0,
+            0x13, .. invalidDecimal,
+            0x10, 0x00, // Int32 truncated to one byte
+        ];
+        byte[] doc = [.. BitConverter.GetBytes(4 + 3 + array.Length + 1), 0x04, 1, (byte)'t', .. array, 0x00];
+
+        var ex = Assert.Throws<CorruptDatabaseException>(() => Document.FromBytes(doc));
+        Assert.Equal("Invalid decimal value.", ex.Message);
+    }
 }

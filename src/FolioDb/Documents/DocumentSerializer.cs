@@ -248,9 +248,29 @@ internal readonly ref struct RawDocument
         return false;
     }
 
+    /// <summary>Number of fields. Walks element headers only; no value is decoded.</summary>
+    public int Count()
+    {
+        int n = 0;
+        foreach (var _ in this) n++;
+        return n;
+    }
+
+    /// <summary>
+    /// <see cref="Count"/> for presizing, or 0 when the headers are malformed. The count pass validates less than
+    /// materialization does (it skips decimal and nested checks), so a later error must not pre-empt an earlier one:
+    /// on failure the caller falls back to growing, and materialization reports the first error in document order.
+    /// </summary>
+    internal int CapacityHint()
+    {
+        try { return Count(); }
+        catch (Exception) { return 0; }
+    }
+
     public Document ToDocument()
     {
-        var doc = new Document();
+        // Sizing the field list up front avoids the grow-and-copy steps (4, 8, 16...) and their discarded arrays.
+        var doc = new Document(CapacityHint());
         foreach (var f in this) doc.AddUnchecked(Encoding.UTF8.GetString(f.Name), f.Value.ToDocValue());
         return doc;
     }
@@ -302,9 +322,24 @@ internal readonly ref struct RawArray
 
     public Enumerator GetEnumerator() => new(Data);
 
+    /// <summary>Number of items. Walks element headers only; no value is decoded.</summary>
+    public int Count()
+    {
+        int n = 0;
+        foreach (var _ in this) n++;
+        return n;
+    }
+
+    /// <inheritdoc cref="RawDocument.CapacityHint"/>
+    internal int CapacityHint()
+    {
+        try { return Count(); }
+        catch (Exception) { return 0; }
+    }
+
     public DocArray ToArray()
     {
-        var arr = new DocArray();
+        var arr = new DocArray(CapacityHint());
         foreach (var v in this) arr.Add(v.ToDocValue());
         return arr;
     }

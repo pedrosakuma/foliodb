@@ -1209,6 +1209,32 @@ removed:
 Building the filter document itself accounts for 208 B of each figure and is the caller's cost; `PreparedFilter`
 avoids re-parsing for repeated queries. No timing claim is made — see the note above about this host.
 
+### Where read time goes, and presized materialization
+
+A CPU sample of a mixed read loop (20,000 documents; `FindById`, indexed `Find` with limit 20, and `Count` by `_id`)
+put under 1% of samples in `QueryPlanner.Plan`, `BTree.Cursor.SeekExact` and `Pager.ReadPage` combined, and about
+98% under materialization — `RawDocument.ToDocument` for `Find` and `DocumentSerializer.Deserialize` for
+`FindById`. The sampler only landed on GC poll points, so it over-represents allocating code; read it as a
+relative ranking, not as a CPU breakdown. Even so, it is why plan caching was not pursued: planning is not where
+reads spend their time. Building owned `Document`s is, which is also what the borrowed `Visit`/`TryReadById`
+APIs avoid.
+
+The binary format does not store a field count, so materialization started from an empty list and grew it
+(4, 8, 16... slots of 32 bytes each), discarding each outgrown array. `RawDocument.ToDocument` and
+`RawArray.ToArray` now count elements first — walking only the type/name/length headers, decoding nothing — and
+allocate the list at its final size. The count pass validates less than decoding does (decimals and nested
+contents are only checked when materialized), so if it fails the list falls back to growing and materialization
+reports the first error in field order, exactly as before.
+
+| Allocated per operation (7 fields, one 3-item array, one 2-field subdocument) | Before | After |
+|---|---:|---:|
+| `FindById` | 2,056 B | **1,784 B** |
+| `Find` by indexed field, limit 10 | 16,099 B | **13,374 B** |
+
+That is about 272 bytes per materialized document. An interleaved A/B (six alternating runs of each build,
+comparing minimums, host load about 5) found the timing neutral: -0.5% for `FindById` and -0.6% for the
+limit-10 `Find`, within noise. The counting pass costs roughly what the avoided copies did.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
