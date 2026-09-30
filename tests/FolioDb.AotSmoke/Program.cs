@@ -60,6 +60,28 @@ static void Run(string path)
         var overflow = db.GetCollection("overflow");
         overflow.Insert(new Document { ["_id"] = 1, ["payload"] = new string('x', 1024) });
         Check(overflow.FindById(1)!["payload"].AsString == new string('x', 1024), "single-page overflow read");
+        // Borrowed point reads: no Document/string materialization, scope guarded during the callback.
+        overflow.Insert(new Document { ["_id"] = 2, ["n"] = 7L, ["name"] = "ação", ["nested"] = new Document { ["b"] = new byte[] { 1, 2 } } });
+        Check(overflow.TryReadById(2, static d =>
+            d.TryGetValue("n", out var n) && d.TryGetValue("name", out var name) && d.TryGetValue("nested", out var nested)
+                ? n.AsInt64 + (name.StringEquals("ação") ? 1 : 0) + nested.AsDocument.FieldCount
+                : -1, out long borrowed) && borrowed == 9, "borrowed scalar read");
+        Check(overflow.TryReadById(1, "xxx".AsSpan(), static (d, prefix) =>
+            d.TryGetValue("payload", out var p) && p.AsUtf8String.Length == 1024 && p.GetString().StartsWith(prefix), out bool prefixed) && prefixed, "borrowed overflow read");
+        Check(!overflow.TryReadById(3, static d => 0, out _), "borrowed missing id");
+        using (var tx = db.BeginTransaction())
+        {
+            var tc = tx.GetCollection("overflow");
+            bool blocked = false;
+            tc.TryReadById(2, d =>
+            {
+                try { tc.DeleteById(2); }
+                catch (InvalidOperationException) { blocked = true; }
+                return 0;
+            }, out _);
+            Check(blocked && tc.DeleteById(2), "borrowed transaction guard");
+            tx.Commit();
+        }
         overflow.Drop();
         users.CreateIndex("email", unique: true);
         users.CreateIndex("age");

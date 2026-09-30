@@ -60,6 +60,28 @@ public class ReadmeSampleTests
     }
 
     [Fact]
+    public void BorrowedPointReads()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var people = db.GetCollection("people");
+        people.Insert("""{ "_id": 1, "name": "Ana", "age": 31, "address": { "city": "Lisboa" } }""");
+
+        bool found = people.TryReadById(1, static d =>
+            d.TryGetValue("name", out var name) && name.StringEquals("Ana") && d.TryGetValue("age", out var age) ? age.AsInt32 : -1,
+            out int anaAge);
+
+        people.TryReadById(1, "Lisboa".AsSpan(), static (d, city) =>
+            d.TryGetValue("address", out var a) && a.AsDocument.TryGetValue("city", out var c) && c.StringEquals(city),
+            out bool inLisboa);
+
+        Assert.True(found);
+        Assert.Equal(31, anaAge);
+        Assert.True(inLisboa);
+        Assert.False(people.TryReadById(2, static d => 0, out _));
+    }
+
+    [Fact]
     public void TypedDocuments()
     {
         using var tmp = new TempDb();

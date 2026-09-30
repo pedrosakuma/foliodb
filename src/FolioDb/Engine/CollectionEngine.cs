@@ -317,6 +317,21 @@ internal static class CollectionEngine
             : null;
     }
 
+    /// <summary>
+    /// Zero-copy point lookup. The view aliases transaction page memory (or, for documents spanning several overflow
+    /// pages, one freshly assembled buffer); callers must finish with it before the transaction is mutated or completed.
+    /// </summary>
+    public static bool TryBorrowById(EngineTx tx, CollectionMeta? meta, DocValue id, out DocumentView view)
+    {
+        if (meta is not null && new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.Encode(id), out var bytes))
+        {
+            view = new DocumentView(new RawDocument(bytes));
+            return true;
+        }
+        view = default;
+        return false;
+    }
+
     /// <summary>Collects (idKey, document bytes) of matching documents (copies, safe to use while mutating).</summary>
     public static List<(byte[] IdKey, byte[] Bytes)> Match(EngineTx tx, CollectionMeta meta, Filter filter, int limit = int.MaxValue)
     {

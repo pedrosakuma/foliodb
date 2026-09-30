@@ -38,6 +38,8 @@ no reflection — typed mapping is done by a source generator).
   **Projection operators**: `$slice: n | -n | [skip, limit]` trims arrays (alone it keeps every other field; non-arrays
   are returned as is); `$elemMatch: {...}` on a top-level array keeps only the first matching element (field omitted
   when nothing matches) and implies an inclusion projection.
+- **Borrowed point reads**: `TryReadById` hands a synchronous callback a read-only `ref struct` view over the stored
+  bytes (scalars, UTF-8 string/binary spans, nested documents/arrays) without building a `Document`; see below.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push($each) $addToSet $pull $pop $currentDate`, replace, upsert. Same-size scalar updates are patched in place (no document rewrite).
 - **Aggregation**: `$match`, `$project`, `$group`, `$sort`, `$skip`, `$limit`, `$count`, `$unwind`; group accumulators
   `$sum`, `$avg`, `$min`, `$max`, `$count`, `$push`, `$first`, `$last`. A leading `$match` uses the query planner/indexes.
@@ -117,6 +119,59 @@ handle. Do not use a concurrent call to `Dispose()` as a synchronization barrier
 
 The current file format is version 3. Version 2 databases remain readable and are upgraded on the next header write;
 after that, older binaries reject them. Keep a backup before upgrading if you need to return to an older binary.
+
+### Borrowed point reads
+
+```csharp
+var people = db.GetCollection("people");
+people.Insert("""{ "_id": 1, "name": "Ana", "age": 31, "address": { "city": "Lisboa" } }""");
+
+// true + callback result when the id exists; false (callback not invoked, result = default) when the id or
+// collection does not exist. The returned document, field names and string values are not materialized.
+bool found = people.TryReadById(1, static d =>
+    d.TryGetValue("name", out var name) && name.StringEquals("Ana") && d.TryGetValue("age", out var age) ? age.AsInt32 : -1,
+    out int anaAge);
+
+// Pass state explicitly (it may itself be a span) so the lambda stays static and allocation-free.
+people.TryReadById(1, "Lisboa".AsSpan(), static (d, city) =>
+    d.TryGetValue("address", out var a) && a.AsDocument.TryGetValue("city", out var c) && c.StringEquals(city),
+    out bool inLisboa);
+```
+
+`FindById` is unchanged and still returns an independent `Document`. `TryReadById` exists on `Collection` and
+`Collection<T>` in all three scopes (database auto-read, `Transaction`, `Snapshot`) and sees exactly what `FindById`
+would see there, including uncommitted writes of the transaction.
+
+- **Views**: `DocumentView` (`TryGetValue` by `string` or UTF-8 name, top-level only, first occurrence; `ContainsField`,
+  `FieldCount`, field enumeration via `DocFieldView`), `DocValueView` and `DocArrayView`. Missing fields make
+  `TryGetValue` return false. Scalar accessors (`AsInt32`/`AsInt64`/`AsDouble`/`AsDecimal`/`AsBoolean`/`AsDateTime`/
+  `AsUnixMilliseconds`/`AsObjectId`) follow `DocValue`'s conversion rules and throw `InvalidCastException` on a type
+  mismatch. `AsUtf8String`, `AsBinary` and `Utf8Name` return borrowed spans; `StringEquals` (UTF-16 or UTF-8,
+  ordinal) returns false for non-strings and does not allocate. `AsDocument`/`AsArray` return nested views.
+- **Explicit materialization**: `ToDocument()`, `ToDocValue()`, `ToArray()`, `GetString()` and `GetName()` allocate
+  owned copies (binary buffers included) that stay valid after the callback and never alias database pages.
+- **Lifetime**: the views are `ref struct`s and the callback result type cannot be a `ref struct`, so the compiler
+  rejects returning a view or span, capturing it in a lambda or field, boxing it, or using it in an `async` lambda.
+  Unsafe code (pointers, `Unsafe`/`MemoryMarshal` tricks) can bypass this and is unsupported.
+- **Scope guard**: while a callback runs, its `Transaction` rejects writes through any of its collections,
+  `DropCollection`, `Commit`, `Rollback` and `Dispose` with `InvalidOperationException`; its `Snapshot` rejects
+  `Dispose`. The rejected call neither dooms nor completes the scope, and reads (including nested `TryReadById`)
+  stay allowed. This is what makes borrowing inside a writable transaction safe: its private pages are modified in
+  place by later writes, so the view would otherwise change under the reader. It is a per-object counter for
+  same-thread reentrancy; `Transaction` and `Snapshot` are not thread-safe, so calls from another thread during the
+  callback are unsupported rather than reliably detected.
+- **Other scopes**: auto-read and snapshot views point at committed page images, which are never modified. Other
+  writers publish new page versions, `Checkpoint()` returns false while the read is active, and even disposing the
+  `FolioDatabase` inside the callback only closes the handle; the view stays readable until the callback returns.
+  Inside an explicit transaction's callback, auto-commit writes, `Checkpoint()` and `FolioDatabase.Dispose()` on the
+  same database wait for the write lock held by that transaction (busy error / `false` after `BusyTimeout`), as before.
+- **Failures**: exceptions thrown by the callback propagate unchanged, release the implicit read transaction and do
+  **not** doom an explicit transaction (a read cannot have mutated it). Lookup failures (e.g. corruption) doom it
+  exactly like `FindById`. A completed transaction or disposed snapshot throws `InvalidOperationException`.
+- **Copies**: inline and single-overflow-page documents are read in place. A document spanning several overflow pages
+  (larger than page size − 4 bytes) is first assembled into one temporary buffer, exactly as for `FindById`; its
+  fields are still not materialized. The id is encoded into a small key array, and an auto-read call still
+  allocates its read transaction and catalog lookup; a capturing (non-`static`) lambda allocates a closure.
 
 ### Aggregation
 
@@ -215,7 +270,7 @@ folio> .dump > backup.js
 
 | Layer | Files | Notes |
 |---|---|---|
-| Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader, relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
+| Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader (public `DocumentView` wrappers), relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
 | Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
 | Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
 | B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. |
@@ -657,10 +712,40 @@ The unchanged multi-page control also had a large timing swing between runs, rei
 These are per-operation allocation measurements, not predicted concurrent throughput or measured GC-pause
 reductions. Strings, document objects, field names and transaction/delegate allocations remain.
 
+### Borrowed point-read allocation
+
+`PointReadBenchmarks` (same data set and hosts as above) now also computes one comparable scalar per read,
+`n + payload length`, either from `FindById` (materialized `Document` and payload string) or from `TryReadById`
+with a `static` lambda. The existing `FindById` rows were re-measured on the unchanged baseline commit and after this
+change to confirm the materialized path is unaffected (1,624 / 768 / 3,416 / 2,560 / 26,008 / 25,152 B/op both times).
+Short job, one launch, three iterations, shared Linux/.NET 10 JIT host:
+
+| Payload | Read scope | Materialized scalar | Borrowed scalar | Allocation saved |
+|---|---|---:|---:|---:|
+| 128 B | Implicit transaction | 1,624 B/op | 904 B/op | 44% |
+| 128 B | Existing snapshot | 768 B/op | **48 B/op** | 94% |
+| 1,024 B | Implicit transaction | 3,416 B/op | 904 B/op | 74% |
+| 1,024 B | Existing snapshot | 2,560 B/op | **48 B/op** | 98% |
+| 8,192 B | Implicit transaction | 26,008 B/op | 9,160 B/op | 65% |
+| 8,192 B | Existing snapshot | 25,152 B/op | 8,304 B/op | 67% |
+
+The remaining 48 bytes are the encoded id key. The implicit scope additionally allocates its read transaction and
+per-transaction catalog lookup (856 B). Multi-page (8 KiB) documents still assemble one temporary buffer (~8.2 KB).
+Short-run means moved in the same direction (for example 705 -> 514 ns for 128 B and 990 -> 526 ns for 1 KiB in a
+snapshot, 4,349 -> 2,427 ns for 8 KiB implicit), but the three-iteration intervals are wide on a shared host;
+treat them as indicative, not as a latency guarantee. The gain depends on how much of the document the caller would
+otherwise materialize, and callers that need the whole document still pay for `ToDocument()`.
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*PointReadBenchmarks*' --job short
+```
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
 - No full-text search, aggregation disk spilling, joins, or general expression language.
 - Inside an explicit transaction, a failing multi-document statement (`InsertMany`, `UpdateMany`, index backfill) dooms the transaction
   instead of rolling back only that statement (auto-commit mode rolls back the whole statement). A duplicate-key error on a single-document operation does not doom it.
+- `TryReadById` borrows only for point reads by `_id`; queries (`Find`, aggregation) still materialize documents.
+  Its scope guard detects same-thread reentrancy only (transactions and snapshots are single-threaded objects).
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.

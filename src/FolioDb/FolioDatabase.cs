@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using FolioDb.Engine;
 using FolioDb.Storage;
 
@@ -187,12 +188,17 @@ public sealed class FolioDatabase : IDisposable
     }
 }
 
-/// <summary>Explicit read-write transaction. Disposing without <see cref="Commit"/> rolls back.</summary>
+/// <summary>
+/// Explicit read-write transaction. Disposing without <see cref="Commit"/> rolls back. Not thread-safe: use it from
+/// one thread at a time.
+/// </summary>
 public sealed class Transaction : IDisposable
 {
     private readonly FolioDatabase _db;
     private bool _completed;
     private bool _doomed;
+    // Active TryReadById callbacks. Their views may alias this transaction's private (mutable) pages.
+    private int _borrows;
 
     internal Transaction(FolioDatabase db, EngineTx engine)
     {
@@ -215,11 +221,12 @@ public sealed class Transaction : IDisposable
     /// <summary>
     /// atomic: true when the operation raises <see cref="DuplicateKeyException"/> only before mutating anything, so the
     /// transaction remains usable afterwards. Any other failure dooms the transaction (it can only be rolled back).
+    /// write: false for read-only operations, which remain allowed while a borrowed view is active.
     /// </summary>
-    internal T Run<T>(Func<EngineTx, T> action, bool atomic = false)
+    internal T Run<T>(Func<EngineTx, T> action, bool atomic = false, bool write = true)
     {
-        if (_completed) throw new InvalidOperationException("The transaction has already completed.");
-        if (_doomed) throw new FolioException("The transaction failed earlier and must be rolled back.");
+        ThrowIfUnusable();
+        if (write) ThrowIfBorrowed("modified");
         try
         {
             return action(Engine);
@@ -235,10 +242,56 @@ public sealed class Transaction : IDisposable
         }
     }
 
-    public void Commit()
+    /// <summary>Lookup failures doom the transaction like any read; callback exceptions do not (they cannot have mutated it).</summary>
+    internal bool ReadBorrowed<TState, TResult>(string collection, DocValue id, TState state,
+        Func<DocumentView, TState, TResult> reader, [MaybeNullWhen(false)] out TResult result)
+        where TState : allows ref struct
+    {
+        ThrowIfUnusable();
+        bool found;
+        DocumentView view;
+        try
+        {
+            found = CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out view);
+        }
+        catch
+        {
+            _doomed = true;
+            throw;
+        }
+        if (!found)
+        {
+            result = default;
+            return false;
+        }
+        _borrows++;
+        try
+        {
+            result = reader(view, state);
+        }
+        finally
+        {
+            _borrows--;
+        }
+        return true;
+    }
+
+    private void ThrowIfUnusable()
     {
         if (_completed) throw new InvalidOperationException("The transaction has already completed.");
         if (_doomed) throw new FolioException("The transaction failed earlier and must be rolled back.");
+    }
+
+    private void ThrowIfBorrowed(string action)
+    {
+        if (_borrows > 0)
+            throw new InvalidOperationException($"The transaction cannot be {action} while a TryReadById callback is running.");
+    }
+
+    public void Commit()
+    {
+        ThrowIfUnusable();
+        ThrowIfBorrowed("committed");
         _completed = true;
         Engine.Commit();
     }
@@ -246,17 +299,20 @@ public sealed class Transaction : IDisposable
     public void Rollback()
     {
         if (_completed) return;
+        ThrowIfBorrowed("rolled back or disposed");
         _completed = true;
         Engine.Dispose();
     }
 
+    /// <summary>Rolls back if not committed. Throws <see cref="InvalidOperationException"/> while a TryReadById callback is running.</summary>
     public void Dispose() => Rollback();
 }
 
-/// <summary>Read-only snapshot: a consistent point-in-time view across multiple reads.</summary>
+/// <summary>Read-only snapshot: a consistent point-in-time view across multiple reads. Not thread-safe.</summary>
 public sealed class Snapshot : IDisposable
 {
     private readonly FolioDatabase _db;
+    private int _borrows;
 
     internal Snapshot(FolioDatabase db, EngineTx engine)
     {
@@ -269,5 +325,33 @@ public sealed class Snapshot : IDisposable
     public Collection GetCollection(string name) => new(_db, name, this);
     public Collection<T> GetCollection<T>(string name) where T : IFolioDocument<T> => new(GetCollection(name));
     public IReadOnlyList<string> GetCollectionNames() => Engine.ListCollections();
-    public void Dispose() => Engine.Dispose();
+
+    internal bool ReadBorrowed<TState, TResult>(string collection, DocValue id, TState state,
+        Func<DocumentView, TState, TResult> reader, [MaybeNullWhen(false)] out TResult result)
+        where TState : allows ref struct
+    {
+        if (!CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out var view))
+        {
+            result = default;
+            return false;
+        }
+        _borrows++;
+        try
+        {
+            result = reader(view, state);
+        }
+        finally
+        {
+            _borrows--;
+        }
+        return true;
+    }
+
+    /// <summary>Releases the snapshot. Throws <see cref="InvalidOperationException"/> while a TryReadById callback is running.</summary>
+    public void Dispose()
+    {
+        if (_borrows > 0)
+            throw new InvalidOperationException("The snapshot cannot be disposed while a TryReadById callback is running.");
+        Engine.Dispose();
+    }
 }

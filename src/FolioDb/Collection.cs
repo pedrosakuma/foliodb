@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using FolioDb.Engine;
 using FolioDb.Query;
 
@@ -27,7 +28,7 @@ public sealed class Collection
 
     private T Read<T>(Func<EngineTx, CollectionMeta?, T> action) => _scope switch
     {
-        Transaction t => t.Run(tx => action(tx, tx.GetCollection(Name))),
+        Transaction t => t.Run(tx => action(tx, tx.GetCollection(Name)), write: false),
         Snapshot s => action(s.Engine, s.Engine.GetCollection(Name)),
         _ => _db.Read(tx => action(tx, tx.GetCollection(Name))),
     };
@@ -80,6 +81,52 @@ public sealed class Collection
     public List<Document> Aggregate(string pipeline) => Aggregate(Aggregation.Parse(DocJson.Parse(pipeline)));
 
     public Document? FindById(DocValue id) => Read((tx, meta) => CollectionEngine.FindById(tx, meta, id));
+
+    /// <summary>
+    /// Non-materializing point read: looks up <paramref name="id"/> and, if found, synchronously invokes
+    /// <paramref name="reader"/> with a borrowed <see cref="DocumentView"/> over the stored bytes, returning true and
+    /// the callback result. Returns false without invoking the callback when the id or the collection does not exist.
+    /// The view is only valid inside the callback; the scope cannot be mutated, committed, rolled back or disposed
+    /// until the callback returns (such calls throw <see cref="InvalidOperationException"/>). Exceptions thrown by
+    /// the callback propagate unchanged and do not doom an explicit transaction.
+    /// Documents spanning multiple overflow pages still require a temporary contiguous buffer.
+    /// </summary>
+    public bool TryReadById<TResult>(DocValue id, Func<DocumentView, TResult> reader, [MaybeNullWhen(false)] out TResult result)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        return TryReadById(id, reader, static (doc, r) => r(doc), out result);
+    }
+
+    /// <summary>
+    /// Stateful overload of <see cref="TryReadById{TResult}(DocValue, Func{DocumentView, TResult}, out TResult)"/>:
+    /// pass values through <paramref name="state"/> (which may itself be a <c>ref struct</c> such as a span) and use a
+    /// <c>static</c> lambda to avoid closure allocations.
+    /// </summary>
+    public bool TryReadById<TState, TResult>(DocValue id, TState state, Func<DocumentView, TState, TResult> reader,
+        [MaybeNullWhen(false)] out TResult result)
+        where TState : allows ref struct
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+        switch (_scope)
+        {
+            case Transaction t:
+                return t.ReadBorrowed(Name, id, state, reader, out result);
+            case Snapshot s:
+                return s.ReadBorrowed(Name, id, state, reader, out result);
+            default:
+                // Committed page images are immutable, so the implicit read transaction only needs to outlive the callback.
+                using (var tx = _db.BeginRead())
+                {
+                    if (!CollectionEngine.TryBorrowById(tx, tx.GetCollection(Name), id, out var view))
+                    {
+                        result = default;
+                        return false;
+                    }
+                    result = reader(view, state);
+                    return true;
+                }
+        }
+    }
 
     public List<Document> Find(Document? filter = null, FindOptions? options = null)
     {

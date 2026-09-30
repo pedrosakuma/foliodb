@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+
 namespace FolioDb;
 
 /// <summary>Strongly-typed view over a <see cref="Collection"/> using a source-generated mapper.</summary>
@@ -14,6 +16,16 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public IReadOnlyList<DocValue> InsertMany(IEnumerable<T> entities) => Untyped.InsertMany(entities.Select(T.ToDocument));
 
     public T? FindById(DocValue id) => Untyped.FindById(id) is { } d ? T.FromDocument(d) : default;
+
+    /// <inheritdoc cref="Collection.TryReadById{TResult}(DocValue, Func{DocumentView, TResult}, out TResult)"/>
+    public bool TryReadById<TResult>(DocValue id, Func<DocumentView, TResult> reader, [MaybeNullWhen(false)] out TResult result) =>
+        Untyped.TryReadById(id, reader, out result);
+
+    /// <inheritdoc cref="Collection.TryReadById{TState, TResult}(DocValue, TState, Func{DocumentView, TState, TResult}, out TResult)"/>
+    public bool TryReadById<TState, TResult>(DocValue id, TState state, Func<DocumentView, TState, TResult> reader,
+        [MaybeNullWhen(false)] out TResult result)
+        where TState : allows ref struct =>
+        Untyped.TryReadById(id, state, reader, out result);
 
     public List<T> Find(Document? filter = null, FindOptions? options = null) => Map(Untyped.Find(filter, options));
     public List<T> Find(string? filter, FindOptions? options = null) => Map(Untyped.Find(filter, options));
