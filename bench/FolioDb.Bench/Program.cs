@@ -7,6 +7,8 @@ using Microsoft.Data.Sqlite;
 
 if (args.Length > 0 && args[0] == "--profile-writers")
     ConcurrentWorkload.Profile(args[1..]);
+else if (args.Length > 0 && args[0] == "--profile-visit")
+    VisitProfile.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--concurrency")
     ConcurrentWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--sharding")

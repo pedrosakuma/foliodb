@@ -5,13 +5,16 @@ namespace FolioDb.Query;
 
 internal enum PlanKind { FullScan, PrimaryEq, PrimaryRange, IndexEq, IndexRange, CompoundScan }
 
-/// <summary>Access path chosen by the planner. The full filter is always re-applied to fetched documents.</summary>
+/// <summary>
+/// Access path chosen by the planner. Fetched documents are re-checked against the full filter unless the plan is
+/// <see cref="Covered"/>.
+/// </summary>
 internal sealed class QueryPlan
 {
     public PlanKind Kind { get; init; }
     public IndexMeta? Index { get; init; }
     public string? Field { get; init; }
-    /// <summary>Encoded equality keys (sorted, distinct) for Eq/In plans.</summary>
+    /// <summary>Encoded equality keys for Eq/In plans, already sorted and distinct so execution scans them in order.</summary>
     public List<byte[]>? Keys { get; init; }
     public byte TypeTag { get; init; }
     public byte[]? Lower { get; init; }
@@ -66,7 +69,7 @@ internal static class QueryPlanner
         {
             if (c is not FieldFilter f) continue;
             bool primary = f.Path == "_id";
-            var index = primary ? null : meta.Indexes.FirstOrDefault(i => i.IsSimple && i.Field == f.Path);
+            var index = primary ? null : SimpleIndex(meta, f.Path);
             if (!primary && index is null) continue;
 
             QueryPlan? plan = null;
@@ -80,7 +83,7 @@ internal static class QueryPlanner
             }
             else if (f.Op == FieldOp.In && f.Values!.Count > 0 && f.Values.All(Indexable))
             {
-                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = f.Keys!.Distinct(ByteArrayComparer.Instance).ToList(), Covered = exact && conjuncts.Length == 1 };
+                plan = new QueryPlan { Kind = primary ? PlanKind.PrimaryEq : PlanKind.IndexEq, Index = index, Field = f.Path, Keys = SortedDistinct(f.Keys!), Covered = exact && conjuncts.Length == 1 };
                 score = primary ? 95 : 70;
             }
             else if (f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte && Indexable(f.Value))
@@ -95,12 +98,29 @@ internal static class QueryPlanner
                 bestScore = score;
             }
         }
-        foreach (var index in meta.Indexes.Where(i => !i.IsSimple))
+        foreach (var index in meta.Indexes)
         {
+            if (index.IsSimple) continue;
             var plan = BuildCompound(conjuncts, index, out int score);
             if (plan is not null && score > bestScore) { best = plan; bestScore = score; }
         }
         return best ?? new QueryPlan { Kind = PlanKind.FullScan, Covered = ReferenceEquals(filter, Filter.All) };
+    }
+
+    private static IndexMeta? SimpleIndex(CollectionMeta meta, string path)
+    {
+        foreach (var index in meta.Indexes)
+            if (index.IsSimple && index.Field == path) return index;
+        return null;
+    }
+
+    /// <summary>Removes adjacent duplicates from keys that <see cref="FieldFilter"/> already sorted.</summary>
+    private static List<byte[]> SortedDistinct(byte[][] sorted)
+    {
+        var keys = new List<byte[]>(sorted.Length);
+        foreach (var key in sorted)
+            if (keys.Count == 0 || !keys[^1].AsSpan().SequenceEqual(key)) keys.Add(key);
+        return keys;
     }
 
     private static QueryPlan? BuildCompound(Filter[] conjuncts, IndexMeta index, out int score)
@@ -250,7 +270,7 @@ internal static class QueryPlanner
             case PlanKind.PrimaryEq:
             {
                 var seek = primary.CreateCursor();
-                foreach (var key in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                foreach (var key in plan.Keys!)
                     if (seek.SeekExact(key) && !visitor(key, seek.Value)) return;
                 return;
             }
@@ -272,7 +292,7 @@ internal static class QueryPlanner
                 var seen = plan.Index.MultiKey && plan.Keys!.Count > 1 ? new HashSet<byte[]>(ByteArrayComparer.Instance) : null;
                 var cur = index.CreateCursor();
                 var seek = primary.CreateCursor();
-                foreach (var prefix in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                foreach (var prefix in plan.Keys!)
                 {
                     for (bool ok = cur.Seek(prefix); ok && cur.Key.StartsWith(prefix); ok = cur.MoveNext())
                     {
@@ -328,7 +348,7 @@ internal static class QueryPlanner
                 return;
             }
             case PlanKind.PrimaryEq:
-                foreach (var key in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                foreach (var key in plan.Keys!)
                     if (primary.ContainsKey(key) && !visitor(key, key, default)) return;
                 return;
             case PlanKind.PrimaryRange:
@@ -346,7 +366,7 @@ internal static class QueryPlanner
             case PlanKind.IndexEq:
             {
                 var cur = new BTree(tx, plan.Index!.Root).CreateCursor();
-                foreach (var prefix in plan.Keys!.OrderBy(k => k, ByteArrayComparer.Instance))
+                foreach (var prefix in plan.Keys!)
                     for (bool ok = cur.Seek(prefix); ok && cur.Key.StartsWith(prefix); ok = cur.MoveNext())
                         if (!visitor(cur.Key[prefix.Length..], prefix, withHints ? cur.Value : default)) return;
                 return;

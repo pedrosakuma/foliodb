@@ -200,7 +200,8 @@ long visited = people.Visit("{age:{$gte:18}}", doc =>
 `Visit(Document? filter, Func<DocumentView, bool> visitor)` and its JSON-filter overload exist on `Collection`
 and `Collection<T>`. `"{}"` visits everything; a missing collection or no matches returns zero. Each call uses
 one snapshot for its entire scan, not a new snapshot per callback, and reuses existing primary, secondary,
-compound and multikey query plans. It evaluates the full filter before invoking the callback.
+compound and multikey query plans. Only matching documents reach the callback: the full filter is evaluated on
+each fetched document unless the plan is covered (see Explain), in which case the index scan alone already decides it.
 
 There is no sorting, projection, skip/limit option or async callback in this first version. Order is planner-selected,
 not a stable API guarantee. Read selected fields directly, stop by returning false, and call `ToDocument()` only
@@ -873,6 +874,67 @@ not per result: with 1,000 matches, borrowed allocations remained 2.49 vs 1.96 K
 At one match the visitor means were 2.628 vs 2.349 us; at 100 matches they were 34.245 vs 33.604 us with overlapping
 intervals. Shared-host noise and short iterations prevent broad CPU/latency claims, particularly for larger
 result sets where traversal dominates. No concurrent-throughput or profiler-overhead claim is inferred.
+
+### Profiling prepared-filter Visit (1 vs 1,000 matches)
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-visit 1 60
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-visit 1000 60
+```
+
+This bounded entry point builds the `VisitBenchmarks` data set (10,000 documents, 1 KiB payload, index on `bucket`,
+1/100/1,000 matches), then repeats one warm, read-only, single-threaded `Visit(PreparedFilter)` that sums `n`. Every
+query checks its visit count and exact sum. It warms for three seconds, then prints the actual PID and UTC
+`LOAD_START`/`LOAD_END` markers; setup, checkpoint and cleanup stay outside that window. The trailing CSV row is
+queries/s and us/query over the whole window (5-300 s accepted). Run captures **sequentially**, one process each.
+
+On 2026-09-30, `dotnet-diagnostics` MCP took ten-second CPU samples inside 60-second windows at 1 and 1,000
+matches, plus a ten-second allocation sample at one match. No dumps, heap walks, parameter capture or suspension
+were requested; the target reported no off-CPU capability. Findings, with caveats:
+
+- **1,000 matches** (7,398 samples): `QueryPlanner.Execute` self 43.5% (the cursor loop; intermediate frames such
+  as the engine callback and `FieldFilter.Matches` were inlined or missing from stacks), filter re-evaluation
+  (`FieldFilter.Walk`, re-encoding each value for comparison) 12.4% inclusive, primary `SeekExact` 10.8%, overflow
+  `Pager.ReadPage` ~9%, `DocumentView.TryGetValue` 4.7%. The index plan is *covered* (non-multikey, single equality),
+  so that filter re-evaluation was redundant: `Count` already trusts the same plan without reading documents.
+- **1 match**: 99.6% of CPU samples landed in `Thread.PollGCWorker` via `BulkMoveWithWriteBarrier` in
+  `OrderedIterator.MoveNext`, i.e. the per-execution `plan.Keys.OrderBy(...)`. That share is a safe-point sampling
+  artifact, **not** CPU cost (the same site also took 14.5% of the 1,000-match samples); it only shows that each query
+  sorted keys the planner had already sorted.
+- **Allocation** (sampled AllocationTick weights, not an exact census): `OrderBy` machinery (`OrderedIterator`,
+  `EnumerableSorter`, `Int32[]`, `Comparison<int>`, part of `Byte[][]`) was about 18% of sampled bytes and the
+  planner's LINQ closures (`ListWhereIterator`, `Func<IndexMeta,bool>`) about 7%. Cursor stacks, transaction and
+  per-transaction catalog objects make up most of the rest.
+
+Changes: equality/`$in` plan keys are sorted and deduplicated once by the planner (already an invariant) and scanned
+directly; simple-index lookup uses loops instead of LINQ closures; and `Visit`/`Find` skip re-evaluating the filter
+for covered plans, exactly as `Count` already did. Indexed plans are covered only when their bounds exactly
+decide the filter; multikey secondary indexes remain non-covered. Primary-key plans and unfiltered scans can also be covered;
+numeric cross-type equality, type bracketing and multikey/snapshot behavior are covered by regression tests
+comparing indexed and unindexed collections.
+
+BenchmarkDotNet ShortRun (`--filter '*VisitBenchmarks.*Prepared*' '*VisitBenchmarks.Borrowed*' --job short`),
+before -> after on the same shared host:
+
+| Case | Matches | Mean before | Mean after | Allocated before | Allocated after |
+|---|---:|---:|---:|---:|---:|
+| Visit, prepared | 1 | 2.538 us | 2.536 us | 1.96 KB | **1.51 KB** |
+| Visit, prepared | 100 | 35.502 us | 23.674 us | 1.96 KB | 1.51 KB |
+| Visit, prepared | 1,000 | 334.815 us | 258.715 us | 1.96 KB | 1.51 KB |
+| Visit, document filter | 1 / 100 / 1,000 | 4.328 / 35.460 / 325.502 us | 2.457 / 24.752 / 239.017 us | 2.49 KB | 2.04 KB |
+| Find, prepared, full documents | 1,000 | 946.8 us | 996.0 us | 2,377.69 KB | 2,377.23 KB |
+
+Allocation drops by ~460 bytes per query for every result size. Because ShortRun intervals were wide (for example
++-213 us at 1,000 matches), timing was cross-checked with the profile runner, interleaving HEAD and the change
+(three rounds, ten seconds each, one-minute host load 1.6-2.7): **2.38-2.47 -> 2.01-2.04 us** per one-match query
+(-16%) and **327-330 -> 215-231 us** per 1,000-match query (-32%). Materialized `Find` remains dominated by document
+construction and did not measurably change. A post-change CPU sample at 1,000 matches showed no filter or `OrderBy`
+frames; remaining samples are attributed to the cursor loop, page reads (14.8%), key comparisons (12.5%) and the callback's field
+lookup (8.6%). These are single-thread, warm, JIT measurements on a variable shared host (an unrelated compile
+briefly pushed load above 50 and invalidated one run, which was discarded), not AOT, cold-cache or concurrent results.
+
+Next candidates, not changed here: per-query cursor/transaction/catalog allocations, overflow-page lookup cost for
+1 KiB documents, and callers' repeated UTF-8 transcoding of field names in `TryGetValue`.
 
 ## Limitations
 

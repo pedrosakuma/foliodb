@@ -352,10 +352,12 @@ internal static class CollectionEngine
         if (meta is null) return 0;
         long visited = 0;
         var plan = QueryPlanner.Plan(meta, filter);
+        // A covered access path already decides the result exactly (as Count relies on); skip re-evaluation.
+        var check = plan.Covered ? null : filter;
         QueryPlanner.Execute(tx.Storage, meta, plan, (_, bytes) =>
         {
             var raw = new RawDocument(bytes);
-            if (!filter.Matches(raw)) return true;
+            if (check is not null && !check.Matches(raw)) return true;
             visited++;
             return visitor(new DocumentView(raw));
         });
@@ -406,13 +408,14 @@ internal static class CollectionEngine
             return result;
         }
 
+        var check = plan.Covered ? null : filter;
         if (sort is null)
         {
             int skipped = 0;
             QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
             {
                 var raw = new RawDocument(doc);
-                if (!filter.Matches(raw)) return true;
+                if (check is not null && !check.Matches(raw)) return true;
                 if (skipped < skip)
                 {
                     skipped++;
@@ -428,7 +431,7 @@ internal static class CollectionEngine
         QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
         {
             var raw = new RawDocument(doc);
-            if (filter.Matches(raw)) rows.Add((sort.KeysFor(raw), rows.Count, raw.Data.ToArray()));
+            if (check is null || check.Matches(raw)) rows.Add((sort.KeysFor(raw), rows.Count, raw.Data.ToArray()));
             return true;
         });
         // Stable: ties keep scan order. Only the returned window is materialized.
