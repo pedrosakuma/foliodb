@@ -117,6 +117,52 @@ public class TransactionTests
     }
 
     [Fact]
+    public void Leaf_rebalance_preserves_indexes_snapshots_and_rollback()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions
+        {
+            PageSize = 1024,
+            AutoCheckpointFrames = 0,
+            DeleteRebalance = BTreeDeleteRebalanceMode.LeafByteOccupancy,
+        });
+        var c = db.GetCollection("c");
+        c.CreateIndex("group");
+        c.CreateIndex(Document.Parse("{ group: 1, score: -1 }"));
+        c.CreateIndex("tags");
+        c.InsertMany(Enumerable.Range(0, 600).Select(i => new Document
+        {
+            ["_id"] = i,
+            ["group"] = i % 19,
+            ["score"] = i,
+            ["tags"] = new DocArray { $"tag-{i % 23}", $"tag-{i % 29}" },
+            ["payload"] = new string((char)('a' + i % 20), 30 + i % 190),
+        }));
+        Assert.True(db.Checkpoint());
+
+        using var snapshot = db.BeginSnapshot();
+        using (var tx = db.BeginTransaction())
+        {
+            var tc = tx.GetCollection("c");
+            for (int i = 0; i < 450; i++) Assert.True(tc.DeleteById(i));
+            tx.Commit();
+        }
+        Assert.Equal(600, snapshot.GetCollection("c").Count());
+        Assert.Equal(150, c.Count());
+        Assert.Equal(8, c.Count("{ group: 18 }"));
+        db.CheckIntegrity();
+
+        using (var tx = db.BeginTransaction())
+        {
+            var tc = tx.GetCollection("c");
+            for (int i = 450; i < 575; i++) Assert.True(tc.DeleteById(i));
+        }
+        Assert.Equal(150, c.Count());
+        Assert.NotNull(c.FindById(450));
+        db.CheckIntegrity();
+    }
+
+    [Fact]
     public void Uncommitted_writes_are_invisible_to_readers()
     {
         using var tmp = new TempDb();

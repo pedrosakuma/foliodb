@@ -20,6 +20,12 @@ public enum WriterAdmissionMode
     Fifo,
 }
 
+internal enum BTreeDeleteRebalanceMode
+{
+    None,
+    LeafByteOccupancy,
+}
+
 public sealed class FolioOptions
 {
     /// <summary>Page size for new databases (power of two, 1024..32768). Existing databases keep their page size.</summary>
@@ -39,6 +45,8 @@ public sealed class FolioOptions
     /// <summary>Admission timeout shared by writers, checkpoints and disposal. Zero tries immediately; -1 ms waits indefinitely.</summary>
     public TimeSpan BusyTimeout { get; init; } = TimeSpan.FromSeconds(30);
 
+    internal BTreeDeleteRebalanceMode DeleteRebalance { get; init; }
+
     internal void Validate()
     {
         if (PageSize < 1024 || PageSize > 32768 || (PageSize & (PageSize - 1)) != 0)
@@ -47,6 +55,8 @@ public sealed class FolioOptions
         if (AutoCheckpointFrames < 0) throw new ArgumentOutOfRangeException(nameof(AutoCheckpointFrames));
         if (WriterAdmission is not (WriterAdmissionMode.Default or WriterAdmissionMode.Fifo))
             throw new ArgumentOutOfRangeException(nameof(WriterAdmission));
+        if (DeleteRebalance is not (BTreeDeleteRebalanceMode.None or BTreeDeleteRebalanceMode.LeafByteOccupancy))
+            throw new ArgumentOutOfRangeException(nameof(DeleteRebalance));
         if (BusyTimeout != Timeout.InfiniteTimeSpan && (BusyTimeout < TimeSpan.Zero || BusyTimeout.TotalMilliseconds > int.MaxValue))
             throw new ArgumentOutOfRangeException(nameof(BusyTimeout));
     }

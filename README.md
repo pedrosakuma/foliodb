@@ -385,12 +385,14 @@ dotnet run -c Release --project bench/FolioDb.Bench -- --fragmentation 3000 4 3 
 ```
 
 It uses 4 KiB pages, a 1,024-page cache, `SynchronousMode.Normal`, disabled automatic checkpoints, three fresh
-database trials and four churn cycles. Each trial starts with 3,000 documents, a simple `city` index, compound
-`{bucket:1,score:-1}` index and multikey `tags` index. One eighth of documents use overflow values. Every cycle
-deletes 10% from a concentrated key interval and 10% selected randomly, inserts the same number, then swaps equal
-numbers of inline and overflow documents while changing all indexed keys. Thus document count and the approximate
-inline/overflow population stay stable. Integrity checks, checkpoints and all storage statistics run outside timed
-sections; every captured stage has an empty WAL (32-byte header).
+database trials and four churn cycles for both the default policy and an internal leaf-rebalance experiment. Policy
+order alternates by trial and both policies use the same seed. Each trial starts with 3,000 documents, a simple `city`
+index, compound `{bucket:1,score:-1}` index and multikey `tags` index. One eighth of documents use overflow values.
+Every cycle interleaves deletes of 10% from a concentrated key interval and 10% selected randomly, inserts the same
+number, then swaps equal numbers of inline and overflow documents while changing all indexed keys. Thus document
+count and the approximate inline/overflow population stay stable. Integrity checks, checkpoints and all storage
+statistics run outside timed sections; every captured stage has an empty WAL (32-byte header). `DELETE` rows capture
+per-call p50/p95/p99, transaction commit time and WAL frames before that checkpoint.
 
 For slotted B+Tree pages, `live` is the 12-byte header, two bytes per slot and current cell bytes; `fragmented` is
 deleted cell space recorded inside the page; `free` is the remaining immediately usable capacity. These three values
@@ -436,11 +438,11 @@ Matched probes used 2,000 random ID reads, 300 compound indexed ranges and 200 s
 trials establish no defensible latency improvement or regression; they only show no large, repeatable timing cliff in
 this bounded run. Occupancy/page counts are deterministic structural evidence and are the basis for the recommendations:
 
-- **Delete merge/rebalance (#4): first.** Partial leaves persist across every tree; primary and multikey leaves end
-  with only 42.2% and 36.2% live occupancy, and the compound tree gains a level. Implement byte-occupancy-based
-  redistribution/merge (not cell-count thresholds), including separator replacement, root collapse and overflow-safe
-  rollback. Keep page-number dispersion out of the acceptance criteria unless filesystem/I/O measurements later
-  demonstrate a cost.
+- **Delete merge/rebalance (#4): evaluated, not enabled by default.** Partial leaves persist across every tree; primary
+  and multikey leaves end with only 42.2% and 36.2% live occupancy, and the compound tree gains a level. The bounded
+  internal experiment below establishes that byte-based leaf merge/redistribution can recover meaningful space, but
+  does not yet establish a tail-latency win. Keep the default empty-child-only policy and prefer explicit maintenance
+  until representative delete-heavy workloads justify automatic work.
 - **RebuildIndex (#3): second.** It is a useful explicit recovery path for the measured 15.8–31.7% secondary-leaf
   fragmentation and for the compound tree's extra level, but it only repairs one secondary tree at a time and does
   not prevent recurrence. The design needs a temporary root, atomic catalog-root swap, uniqueness validation, failure
@@ -450,6 +452,36 @@ this bounded run. Occupancy/page counts are deterministic structural evidence an
   pages and truncate the tail; checkpoint/freelist cleanup alone cannot do that. Decide whether the first version is
   an offline atomic rewrite to a replacement file (simpler crash safety, requires temporary disk headroom) or an
   in-place page mover (smaller peak space, substantially harder WAL/snapshot/root-reference handling).
+
+#### Issue #4 leaf merge/redistribution experiment
+
+The internal-only candidate triggers when a non-root leaf falls below 30% live bytes. It merges with a sibling only
+when the combined leaf remains at or below 75%, leaving split/merge hysteresis; otherwise it redistributes cells by
+bytes and replaces the parent separator with the exact first key of the right leaf. The root page number remains
+stable. Overflow chains are not copied, and all page rewrites/frees remain transaction-local until the existing WAL
+commit. Interior-page underflow is deliberately deferred, so this is not a complete B+Tree compactor.
+
+Median final structure across the three matched trials:
+
+| Tree | Default leaf pages / live / fragmented | Candidate leaf pages / live / fragmented |
+|---|---:|---:|
+| Primary | 686 / 42.3% / 26.4% | 597 / 48.5% / 18.5% |
+| Simple | 48 / 59.8% / 19.4% | 46 / 62.4% / 18.7% |
+| Compound | 78 / 63.2% / 15.8% | 75 / 65.7% / 14.6% |
+| Multikey | 222 / 36.4% / 31.8% | 148 / 54.5% / 17.2% |
+
+The final database retained 2,071 pages (8,482,816 B) instead of 2,238 pages (9,166,848 B): 167 fewer pages,
+684,032 B or 7.5%. Across the 12 matched delete stages, the candidate wrote 9,649 WAL page images versus 9,573
+(+0.8%) and exposed 3,731 freelist pages versus 3,316 (+12.5%). Median stage values were 814.5 versus 799 page
+images and 310 versus 273.5 pages freed.
+
+Delete-call timing remained too noisy for a production decision on the shared host even with rollback warmup and
+alternating policy order. Medians across the 12 stages (candidate versus default) were p50 11.75 versus 9.65 us,
+p95 25.2 versus 23.6 us, p99 57.3 versus 49.5 us and commit 5,192.8 versus 4,474.3 us, while paired ratios varied
+widely and aggregate elapsed time reversed direction because of host outliers. Matched final probes likewise showed
+no repeatable query-latency effect. The candidate therefore remains an internal benchmark/test hook: the structural
+benefit is valid for this seed, but automatic delete-path work is not promoted without broader latency evidence and
+interior rebalancing.
 
 | Scenario | FolioDb | SQLite + JSON | LiteDB |
 |---|---:|---:|---:|

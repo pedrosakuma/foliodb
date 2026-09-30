@@ -22,6 +22,8 @@ internal readonly struct BTree
     private const int LeafCellHeader = 7;
     private const int InteriorCellHeader = 6;
     private const byte FlagOverflow = 1;
+    private const int DeleteRebalanceLowPercent = 30;
+    private const int DeleteMergeHighPercent = 75;
 
     private readonly StorageTx _tx;
     public readonly uint Root;
@@ -94,6 +96,20 @@ internal readonly struct BTree
         bool ovf = (p[off + 2] & FlagOverflow) != 0;
         int valLen = BinaryPrimitives.ReadInt32LittleEndian(p[(off + 3)..]);
         return LeafCellHeader + keyLen + (ovf ? 4 : valLen);
+    }
+
+    private static int LiveBytes(ReadOnlySpan<byte> page)
+    {
+        int bytes = HeaderSize + 2 * Count(page);
+        for (int i = 0; i < Count(page); i++) bytes += CellSize(page, Slot(page, i));
+        return bytes;
+    }
+
+    private static int BuiltBytes(List<byte[]> cells)
+    {
+        int bytes = HeaderSize + 2 * cells.Count;
+        foreach (var cell in cells) bytes += cell.Length;
+        return bytes;
     }
 
     private static ReadOnlySpan<byte> CellBytes(ReadOnlySpan<byte> p, int i)
@@ -478,8 +494,80 @@ internal readonly struct BTree
         FreeCellOverflow(writable, idx);
         RemoveCell(writable, idx);
         if (Count(writable) == 0 && pg != Root) RemoveEmptyChild(path, pg);
+        else if (_tx.DeleteRebalance == BTreeDeleteRebalanceMode.LeafByteOccupancy)
+            TryRebalanceLeaf(path, pg);
         CollapseRoot();
         return true;
+    }
+
+    private void TryRebalanceLeaf(List<(uint Page, int Index)> path, uint pg)
+    {
+        if (pg == Root || path.Count == 0) return;
+        var leaf = _tx.ReadPage(pg);
+        if (!IsLeaf(leaf) || LiveBytes(leaf) * 100 >= PageSize * DeleteRebalanceLowPercent) return;
+
+        var (parentPg, childIndex) = path[^1];
+        var parent = _tx.ReadPage(parentPg);
+        int childCount = Count(parent) + 1;
+        if (childIndex + 1 < childCount && TryRebalanceLeafPair(parentPg, childIndex, pg, ChildAt(parent, childIndex + 1)))
+            return;
+        if (childIndex > 0)
+            TryRebalanceLeafPair(parentPg, childIndex - 1, ChildAt(parent, childIndex - 1), pg);
+    }
+
+    private bool TryRebalanceLeafPair(uint parentPg, int separatorIndex, uint leftPg, uint rightPg)
+    {
+        var left = _tx.ReadPage(leftPg);
+        var right = _tx.ReadPage(rightPg);
+        if (!IsLeaf(left) || !IsLeaf(right)) return false;
+
+        var cells = ReadCells(left);
+        cells.AddRange(ReadCells(right));
+        int combinedBytes = BuiltBytes(cells);
+        if (combinedBytes * 100 <= PageSize * DeleteMergeHighPercent)
+        {
+            Build(_tx.WritePage(leftPg), LeafType, cells, 0);
+            _tx.FreePage(rightPg);
+            var parent = _tx.WritePage(parentPg);
+            RemoveCell(parent, separatorIndex);
+            SetChildAt(parent, separatorIndex, leftPg);
+            return true;
+        }
+
+        int split = BalancedLeafSplit(cells);
+        if (split < 1) return false;
+        var leftCells = cells.GetRange(0, split);
+        var rightCells = cells.GetRange(split, cells.Count - split);
+        var parentPage = _tx.ReadPage(parentPg);
+        var parentCells = ReadCells(parentPage);
+        parentCells[separatorIndex] = InteriorCell(CellKey(rightCells[0], leaf: true), leftPg);
+        if (BuiltBytes(parentCells) > PageSize) return false;
+
+        Build(_tx.WritePage(leftPg), LeafType, leftCells, 0);
+        Build(_tx.WritePage(rightPg), LeafType, rightCells, 0);
+        Build(_tx.WritePage(parentPg), InteriorType, parentCells, RightChild(parentPage));
+        return true;
+    }
+
+    private int BalancedLeafSplit(List<byte[]> cells)
+    {
+        int best = -1;
+        int bestDifference = int.MaxValue;
+        int leftBytes = HeaderSize;
+        int totalCellBytes = cells.Sum(static cell => cell.Length + 2);
+        for (int i = 1; i < cells.Count; i++)
+        {
+            leftBytes += cells[i - 1].Length + 2;
+            int rightBytes = HeaderSize + totalCellBytes - (leftBytes - HeaderSize);
+            if (leftBytes > PageSize || rightBytes > PageSize) continue;
+            int difference = Math.Abs(leftBytes - rightBytes);
+            if (difference < bestDifference)
+            {
+                best = i;
+                bestDifference = difference;
+            }
+        }
+        return best;
     }
 
     private void RemoveEmptyChild(List<(uint Page, int Index)> path, uint child)

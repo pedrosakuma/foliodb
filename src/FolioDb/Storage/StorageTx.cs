@@ -18,12 +18,18 @@ internal sealed class StorageTx : IDisposable
 
     public bool IsWritable { get; }
     public int PageSize => _pager.PageSize;
+    public BTreeDeleteRebalanceMode DeleteRebalance { get; }
 
-    public StorageTx(Pager pager, bool writable, Action? onDispose = null)
+    public StorageTx(
+        Pager pager,
+        bool writable,
+        Action? onDispose = null,
+        BTreeDeleteRebalanceMode deleteRebalance = BTreeDeleteRebalanceMode.None)
     {
         _pager = pager;
         IsWritable = writable;
         _onDispose = onDispose;
+        DeleteRebalance = deleteRebalance;
         _mark = pager.BeginRead();
         try
         {

@@ -22,17 +22,26 @@ public static class FragmentationWorkload
 
         Console.WriteLine("# Deterministic churn diagnostic; metrics and integrity checks are outside timed sections.");
         Console.WriteLine($"# page={PageSize}; cache={CachePages}; synchronous=Normal; auto-checkpoint=0; documents={documents}; cycles={cycles}; repeats={repeats}");
+        Console.WriteLine("# Policies are paired on identical seeds; execution order alternates by trial. leaf-bytes is internal-only: trigger <30%, merge <=75%, otherwise redistribute.");
         Console.WriteLine("# Initial documents: 1/8 overflow (~9KB payload), otherwise inline; simple city, compound bucket/score, multikey tags indexes.");
-        Console.WriteLine("# Each cycle deletes 10% concentrated + 10% random, inserts the same count, then swaps equal inline/overflow populations while changing index keys.");
-        Console.WriteLine("METRIC,trial,stage,tree,kind,multikey,height,entries,leaf_pages,interior_pages,overflow_pages,leaf_live,leaf_cells,leaf_fragmented,leaf_free,interior_live,interior_cells,interior_fragmented,interior_free,overflow_live,overflow_payload,overflow_free,page_runs,page_span,max_page_gap,total_pages,free_pages,db_bytes,wal_bytes");
-        Console.WriteLine("PERF,trial,stage,point_ops,point_us_op,range_ops,range_us_op,write_ops,write_us_op,checksum");
+        Console.WriteLine("# Each cycle interleaves 10% concentrated and 10% seeded-random deletes, inserts the same count, then swaps equal inline/overflow populations while changing index keys.");
+        Console.WriteLine("METRIC,policy,trial,stage,tree,kind,multikey,height,entries,leaf_pages,interior_pages,overflow_pages,leaf_live,leaf_cells,leaf_fragmented,leaf_free,interior_live,interior_cells,interior_fragmented,interior_free,overflow_live,overflow_payload,overflow_free,page_runs,page_span,max_page_gap,total_pages,free_pages,db_bytes,wal_bytes");
+        Console.WriteLine("DELETE,policy,trial,cycle,deletes,delete_total_us,delete_p50_us,delete_p95_us,delete_p99_us,commit_us,page_writes,wal_bytes,free_pages_added");
+        Console.WriteLine("PERF,policy,trial,stage,point_ops,point_us_op,range_ops,range_us_op,write_ops,write_us_op,checksum");
 
-        for (int trial = 1; trial <= repeats; trial++) RunTrial(documents, cycles, trial);
+        for (int trial = 1; trial <= repeats; trial++)
+        {
+            var policies = trial % 2 == 0
+                ? new[] { BTreeDeleteRebalanceMode.LeafByteOccupancy, BTreeDeleteRebalanceMode.None }
+                : new[] { BTreeDeleteRebalanceMode.None, BTreeDeleteRebalanceMode.LeafByteOccupancy };
+            foreach (var policy in policies) RunTrial(documents, cycles, trial, policy);
+        }
     }
 
-    private static void RunTrial(int documents, int cycles, int trial)
+    private static void RunTrial(int documents, int cycles, int trial, BTreeDeleteRebalanceMode policy)
     {
         string path = Workload.TempFile(".folio");
+        string policyName = policy == BTreeDeleteRebalanceMode.None ? "none" : "leaf-bytes";
         try
         {
             using var db = FolioDatabase.Open(path, new FolioOptions
@@ -41,6 +50,7 @@ public static class FragmentationWorkload
                 CacheSizePages = CachePages,
                 Synchronous = SynchronousMode.Normal,
                 AutoCheckpointFrames = 0,
+                DeleteRebalance = policy,
             });
             var alive = new HashSet<int>();
             var overflow = new HashSet<int>();
@@ -59,8 +69,9 @@ public static class FragmentationWorkload
                 tx.Commit();
             }
 
-            Capture(db, trial, "baseline");
-            Measure(db, alive, trial, "baseline");
+            WarmDeletePath(db, alive);
+            Capture(db, policyName, trial, "baseline");
+            Measure(db, alive, policyName, trial, "baseline");
             int nextId = documents;
             var random = new Random(0x5F0110 + trial);
             for (int cycle = 1; cycle <= cycles; cycle++)
@@ -73,18 +84,46 @@ public static class FragmentationWorkload
                 Shuffle(afterConcentrated, random);
                 var scattered = afterConcentrated.Take(Math.Min(target, afterConcentrated.Length)).ToArray();
 
+                var deleteOrder = Interleave(concentrated, scattered);
+                long freePagesBeforeDelete = db.GetStats().FreePages;
+                var deleteMicros = new double[deleteOrder.Length];
+                double commitMicros;
                 using (var tx = db.BeginTransaction())
                 {
                     var collection = tx.GetCollection("items");
-                    foreach (int id in concentrated) AssertDeleted(collection, id);
-                    foreach (int id in scattered) AssertDeleted(collection, id);
+                    for (int i = 0; i < deleteOrder.Length; i++)
+                    {
+                        long started = Stopwatch.GetTimestamp();
+                        AssertDeleted(collection, deleteOrder[i]);
+                        deleteMicros[i] = Stopwatch.GetElapsedTime(started).TotalMicroseconds;
+                    }
+                    long commitStarted = Stopwatch.GetTimestamp();
                     tx.Commit();
+                    commitMicros = Stopwatch.GetElapsedTime(commitStarted).TotalMicroseconds;
                 }
                 alive.ExceptWith(concentrated);
                 alive.ExceptWith(scattered);
                 overflow.ExceptWith(concentrated);
                 overflow.ExceptWith(scattered);
-                Capture(db, trial, $"cycle{cycle}-delete");
+                var deleteStats = db.GetStats();
+                Array.Sort(deleteMicros);
+                Console.WriteLine(string.Join(',', new[]
+                {
+                    "DELETE",
+                    policyName,
+                    trial.ToString(CultureInfo.InvariantCulture),
+                    cycle.ToString(CultureInfo.InvariantCulture),
+                    deleteMicros.Length.ToString(CultureInfo.InvariantCulture),
+                    deleteMicros.Sum().ToString("F3", CultureInfo.InvariantCulture),
+                    Percentile(deleteMicros, 0.50).ToString("F3", CultureInfo.InvariantCulture),
+                    Percentile(deleteMicros, 0.95).ToString("F3", CultureInfo.InvariantCulture),
+                    Percentile(deleteMicros, 0.99).ToString("F3", CultureInfo.InvariantCulture),
+                    commitMicros.ToString("F3", CultureInfo.InvariantCulture),
+                    deleteStats.WalFrames.ToString(CultureInfo.InvariantCulture),
+                    deleteStats.WalFileBytes.ToString(CultureInfo.InvariantCulture),
+                    (deleteStats.FreePages - freePagesBeforeDelete).ToString(CultureInfo.InvariantCulture),
+                }));
+                Capture(db, policyName, trial, $"cycle{cycle}-delete");
 
                 int insertCount = concentrated.Length + scattered.Length;
                 using (var tx = db.BeginTransaction())
@@ -99,7 +138,7 @@ public static class FragmentationWorkload
                     }
                     tx.Commit();
                 }
-                Capture(db, trial, $"cycle{cycle}-insert");
+                Capture(db, policyName, trial, $"cycle{cycle}-insert");
 
                 var shrinkIds = overflow.ToArray();
                 var growIds = alive.Where(id => !overflow.Contains(id)).ToArray();
@@ -131,11 +170,11 @@ public static class FragmentationWorkload
                 }
                 overflow.ExceptWith(shrinkIds.Take(swapCount));
                 overflow.UnionWith(growIds.Take(swapCount));
-                Capture(db, trial, $"cycle{cycle}-update");
+                Capture(db, policyName, trial, $"cycle{cycle}-update");
             }
 
-            Capture(db, trial, "final");
-            Measure(db, alive, trial, "final");
+            Capture(db, policyName, trial, "final");
+            Measure(db, alive, policyName, trial, "final");
             if (db.GetCollection("items").Count() != documents) throw new InvalidOperationException("Document count changed.");
             db.CheckIntegrity();
         }
@@ -171,7 +210,15 @@ public static class FragmentationWorkload
         if (!collection.DeleteById(id)) throw new InvalidOperationException($"Delete failed for {id}.");
     }
 
-    private static void Capture(FolioDatabase db, int trial, string stage)
+    private static void WarmDeletePath(FolioDatabase db, HashSet<int> alive)
+    {
+        using var tx = db.BeginTransaction();
+        var collection = tx.GetCollection("items");
+        foreach (int id in alive.Order().Where((_, index) => index % 5 == 0))
+            AssertDeleted(collection, id);
+    }
+
+    private static void Capture(FolioDatabase db, string policy, int trial, string stage)
     {
         if (!db.Checkpoint()) throw new InvalidOperationException("Checkpoint was blocked.");
         db.CheckIntegrity();
@@ -182,6 +229,7 @@ public static class FragmentationWorkload
             Console.WriteLine(string.Join(',', new[]
             {
                 "METRIC",
+                policy,
                 trial.ToString(CultureInfo.InvariantCulture),
                 stage,
                 item.Name,
@@ -214,7 +262,7 @@ public static class FragmentationWorkload
         }
     }
 
-    private static void Measure(FolioDatabase db, HashSet<int> alive, int trial, string stage)
+    private static void Measure(FolioDatabase db, HashSet<int> alive, string policy, int trial, string stage)
     {
         if (!db.Checkpoint()) throw new InvalidOperationException("Checkpoint was blocked.");
         var collection = db.GetCollection("items");
@@ -259,6 +307,7 @@ public static class FragmentationWorkload
         Console.WriteLine(string.Join(',', new[]
         {
             "PERF",
+            policy,
             trial.ToString(CultureInfo.InvariantCulture),
             stage,
             probes.Length.ToString(CultureInfo.InvariantCulture),
@@ -279,5 +328,24 @@ public static class FragmentationWorkload
             int j = random.Next(i + 1);
             (values[i], values[j]) = (values[j], values[i]);
         }
+    }
+
+    private static int[] Interleave(int[] first, int[] second)
+    {
+        var result = new int[first.Length + second.Length];
+        int write = 0;
+        for (int i = 0; i < Math.Max(first.Length, second.Length); i++)
+        {
+            if (i < first.Length) result[write++] = first[i];
+            if (i < second.Length) result[write++] = second[i];
+        }
+        return result;
+    }
+
+    private static double Percentile(double[] sorted, double percentile)
+    {
+        if (sorted.Length == 0) return 0;
+        int index = (int)Math.Ceiling(percentile * sorted.Length) - 1;
+        return sorted[Math.Clamp(index, 0, sorted.Length - 1)];
     }
 }

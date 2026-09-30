@@ -39,7 +39,7 @@ public sealed class FolioDatabase : IDisposable
     internal EngineTx BeginRead()
     {
         ThrowIfDisposed();
-        return new EngineTx(new StorageTx(_pager, writable: false));
+        return new EngineTx(new StorageTx(_pager, writable: false, deleteRebalance: _options.DeleteRebalance));
     }
 
     internal EngineTx BeginWrite()
@@ -50,7 +50,11 @@ public sealed class FolioDatabase : IDisposable
         try
         {
             ThrowIfDisposed();
-            return new EngineTx(new StorageTx(_pager, writable: true, onDispose: () => _writeLock.Release()));
+            return new EngineTx(new StorageTx(
+                _pager,
+                writable: true,
+                onDispose: () => _writeLock.Release(),
+                deleteRebalance: _options.DeleteRebalance));
         }
         catch
         {

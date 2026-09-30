@@ -51,12 +51,19 @@ public class StorageTests
     }
 
     [Theory]
-    [InlineData(1024, 20_000)]
-    [InlineData(4096, 20_000)]
-    public void BTree_random_insert_delete_matches_reference_model(int pageSize, int ops)
+    [InlineData(1024, 20_000, false)]
+    [InlineData(1024, 20_000, true)]
+    [InlineData(4096, 20_000, false)]
+    [InlineData(4096, 20_000, true)]
+    public void BTree_random_insert_delete_matches_reference_model(int pageSize, int ops, bool rebalance)
     {
         using var tmp = new TempDb();
-        using var db = tmp.Open(new FolioOptions { PageSize = pageSize, Synchronous = SynchronousMode.Off });
+        using var db = tmp.Open(new FolioOptions
+        {
+            PageSize = pageSize,
+            Synchronous = SynchronousMode.Off,
+            DeleteRebalance = rebalance ? BTreeDeleteRebalanceMode.LeafByteOccupancy : BTreeDeleteRebalanceMode.None,
+        });
         var rnd = new Random(pageSize);
         var model = new SortedDictionary<int, byte[]>();
         uint root;
@@ -142,6 +149,67 @@ public class StorageTests
         }
     }
 
+    [Theory]
+    [InlineData(1024)]
+    [InlineData(2048)]
+    [InlineData(4096)]
+    [InlineData(8192)]
+    [InlineData(16384)]
+    [InlineData(32768)]
+    public void Leaf_byte_rebalance_handles_variable_keys_at_every_page_size(int pageSize)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions
+        {
+            PageSize = pageSize,
+            Synchronous = SynchronousMode.Off,
+            DeleteRebalance = BTreeDeleteRebalanceMode.LeafByteOccupancy,
+        });
+        var expected = new SortedDictionary<byte[], byte[]>(Comparer<byte[]>.Create(
+            static (x, y) => x.AsSpan().SequenceCompareTo(y)));
+        uint root;
+        using (var tx = db.BeginWrite())
+        {
+            var tree = new BTree(tx.Storage, root = BTree.Create(tx.Storage));
+            for (int i = 0; i < 600; i++)
+            {
+                var key = VariableKey(i, 1 + i * 37 % Math.Min(180, BTree.MaxKeySize(pageSize) - 4));
+                var value = Enumerable.Repeat((byte)(i % 251), i * 29 % (pageSize + 97)).ToArray();
+                tree.Insert(key, value, overwrite: false);
+                expected.Add(key, value);
+            }
+            Assert.Equal(expected.Count, tree.Verify());
+            Assert.Equal(root, tree.Diagnose().RootPage);
+            tx.Commit();
+        }
+
+        using (var tx = db.BeginWrite())
+        {
+            var tree = new BTree(tx.Storage, root);
+            foreach (var key in expected.Keys.Where((_, index) => index % 3 != 0).ToArray())
+            {
+                Assert.True(tree.Delete(key));
+                expected.Remove(key);
+            }
+            Assert.Equal(expected.Count, tree.Verify());
+            Assert.Equal(root, tree.Diagnose().RootPage);
+            tx.Commit();
+        }
+
+        using var read = db.BeginRead();
+        var reader = new BTree(read.Storage, root);
+        var cursor = reader.CreateCursor();
+        using var expectedItems = expected.GetEnumerator();
+        for (bool ok = cursor.SeekFirst(); ok; ok = cursor.MoveNext())
+        {
+            Assert.True(expectedItems.MoveNext());
+            Assert.Equal(expectedItems.Current.Key, cursor.Key.ToArray());
+            Assert.Equal(expectedItems.Current.Value, cursor.Value.ToArray());
+        }
+        Assert.False(expectedItems.MoveNext());
+        Assert.Equal(expected.Count, reader.Verify());
+    }
+
     [Fact]
     public void Insert_without_overwrite_reports_existing_key()
     {
@@ -225,6 +293,39 @@ public class StorageTests
     }
 
     [Fact]
+    public void Torn_rebalancing_delete_commit_is_discarded_on_recovery()
+    {
+        using var tmp = new TempDb();
+        var options = new FolioOptions
+        {
+            PageSize = 1024,
+            AutoCheckpointFrames = 0,
+            DeleteRebalance = BTreeDeleteRebalanceMode.LeafByteOccupancy,
+        };
+        var db = tmp.Open(options);
+        var col = db.GetCollection("c");
+        col.CreateIndex(Document.Parse("{ group: 1, score: -1 }"));
+        col.CreateIndex("tags");
+        col.InsertMany(Enumerable.Range(0, 500).Select(i => new Document
+        {
+            ["_id"] = i,
+            ["group"] = i % 17,
+            ["score"] = i,
+            ["tags"] = new DocArray { $"a-{i % 11}", $"b-{i % 13}" },
+            ["payload"] = new string('x', 20 + i % 180),
+        }));
+        Assert.True(db.Checkpoint());
+
+        db.Pager.TestTornWriteBytes = 4000;
+        Assert.Throws<IOException>(() => col.DeleteMany("{ score: { $lt: 350 } }"));
+        db.SimulateCrash();
+
+        using var reopened = tmp.Open(options);
+        Assert.Equal(500, reopened.GetCollection("c").Count());
+        reopened.CheckIntegrity();
+    }
+
+    [Fact]
     public void Checkpoint_moves_wal_into_main_file_and_resets_it()
     {
         using var tmp = new TempDb();
@@ -292,5 +393,13 @@ public class StorageTests
             Assert.Equal(16384, db.GetStats().PageSize);
             Assert.Equal(1, db.GetCollection("c").Count());
         }
+    }
+
+    private static byte[] VariableKey(int value, int suffixLength)
+    {
+        var key = new byte[4 + suffixLength];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(key, value);
+        key.AsSpan(4).Fill((byte)(value % 251));
+        return key;
     }
 }

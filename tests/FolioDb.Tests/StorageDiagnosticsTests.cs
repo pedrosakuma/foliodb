@@ -50,6 +50,18 @@ public sealed class StorageDiagnosticsTests
     }
 
     [Fact]
+    public void Leaf_byte_rebalance_reclaims_partially_occupied_pages()
+    {
+        var current = MeasureDelete(BTreeDeleteRebalanceMode.None);
+        var candidate = MeasureDelete(BTreeDeleteRebalanceMode.LeafByteOccupancy);
+
+        Assert.Equal(current.EntryCount, candidate.EntryCount);
+        Assert.Equal(current.RootPage, candidate.RootPage);
+        Assert.True(candidate.LeafPages < current.LeafPages);
+        Assert.True(candidate.LeafFragmentedBytes < current.LeafFragmentedBytes);
+    }
+
+    [Fact]
     public void Overflow_pages_report_payload_metadata_and_tail_space()
     {
         using var tmp = new TempDb();
@@ -97,5 +109,24 @@ public sealed class StorageDiagnosticsTests
             Assert.True(tree.Tree.Height >= 1);
             Assert.True(tree.Tree.LeafPages >= 1);
         });
+    }
+
+    private static BTreeStorageDiagnostics MeasureDelete(BTreeDeleteRebalanceMode mode)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions
+        {
+            PageSize = 1024,
+            Synchronous = SynchronousMode.Off,
+            DeleteRebalance = mode,
+        });
+        using var tx = db.BeginWrite();
+        var tree = new BTree(tx.Storage, BTree.Create(tx.Storage));
+        for (int i = 0; i < 1200; i++) tree.Insert(Key(i), new byte[20 + i % 100], overwrite: false);
+        for (int i = 0; i < 1200; i++)
+            if (i % 4 != 0)
+                Assert.True(tree.Delete(Key(i)));
+        Assert.Equal(300, tree.Verify());
+        return tree.Diagnose();
     }
 }
