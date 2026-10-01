@@ -1298,6 +1298,15 @@ does. Other inserts still split evenly, so random and descending patterns are un
 The `city` index keys (`city`, `_id`) grow at the end of each city's range, not at the end of the tree, so that
 index still splits evenly. Page and file counts are deterministic; times are relative to a shared host.
 
+### One primary descent per insert
+
+Insert checked for a duplicate `_id` with one B+Tree descent and then inserted with a second one. It now locates
+the slot once (`BTree.TryLocateNew`), validates the secondary indexes (read-only, so the slot stays valid) and
+inserts there (`InsertNew`). Error precedence is unchanged: a duplicate `_id` is still reported before index errors
+and nothing is written when validation fails. In an interleaved A/B (minimum of three runs, 200,000 typed inserts,
+commit excluded) the insert went from ~1.08-1.14 to ~0.99-1.01 µs with sequential `_id`s, ~5.3-5.8 to ~4.9-5.1 µs
+with shuffled `_id`s and ~2.38-2.55 to ~2.23-2.33 µs with an index on `city`; relative figures on a shared host.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

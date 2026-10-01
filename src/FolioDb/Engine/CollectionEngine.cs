@@ -222,10 +222,11 @@ internal static class CollectionEngine
         if (bytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
 
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
-        if (primary.ContainsKey(idKey))
+        if (!primary.TryLocateNew(idKey, out var primaryPosition))
             throw new DuplicateKeyException($"Duplicate key in collection '{meta.Name}': _id {DocJson.WriteValue(id)}.");
 
         // Validate every index before mutating anything, so a failed insert leaves the transaction untouched.
+        // Validation only reads, so the primary position stays valid.
         List<(IndexMeta Index, List<IndexKey> Keys, bool Multi)>? perIndex = null;
         foreach (var index in meta.Indexes)
         {
@@ -239,7 +240,7 @@ internal static class CollectionEngine
             (perIndex ??= new(meta.Indexes.Count)).Add((index, keys, multi));
         }
 
-        primary.Insert(idKey, bytes, overwrite: false);
+        primary.InsertNew(primaryPosition, idKey, bytes);
         if (perIndex is null) return id;
 
         var idHint = IndexHint.ForId(bytes);

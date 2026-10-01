@@ -467,6 +467,43 @@ internal readonly struct BTree
     /// <summary>Inserts or replaces. Returns false (and does nothing) if the key exists and <paramref name="overwrite"/> is false.</summary>
     public bool Insert(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool overwrite)
     {
+        var position = Locate(key, out bool exists);
+        if (exists && !overwrite) return false;
+        InsertAt(position, key, value, exists);
+        return true;
+    }
+
+    /// <summary>Where a key goes: the leaf, its slot and the interior path to it. Valid until this tree is modified.</summary>
+    public readonly struct InsertPosition
+    {
+        internal InsertPosition(List<(uint Page, int Index)> path, uint leaf, int index)
+        {
+            Path = path;
+            Leaf = leaf;
+            Index = index;
+        }
+
+        internal List<(uint Page, int Index)> Path { get; }
+        internal uint Leaf { get; }
+        internal int Index { get; }
+    }
+
+    /// <summary>
+    /// Single descent for an insert that must not overwrite: false if <paramref name="key"/> exists, otherwise the
+    /// position to pass to <see cref="InsertNew"/>. Nothing may modify this tree in between.
+    /// </summary>
+    public bool TryLocateNew(ReadOnlySpan<byte> key, out InsertPosition position)
+    {
+        position = Locate(key, out bool exists);
+        return !exists;
+    }
+
+    /// <summary>Inserts a key known to be absent at the position returned by <see cref="TryLocateNew"/>.</summary>
+    public void InsertNew(in InsertPosition position, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) =>
+        InsertAt(position, key, value, exists: false);
+
+    private InsertPosition Locate(ReadOnlySpan<byte> key, out bool exists)
+    {
         if (key.Length > MaxKeySize(PageSize))
             throw new FolioException($"Key of {key.Length} bytes exceeds the maximum of {MaxKeySize(PageSize)} bytes for page size {PageSize}.");
 
@@ -481,10 +518,15 @@ internal readonly struct BTree
             pg = ChildAt(page, ci);
         }
 
-        var leaf = _tx.ReadPage(pg);
-        int idx = LowerBound(leaf, key, out bool exists);
-        if (exists && !overwrite) return false;
+        int idx = LowerBound(_tx.ReadPage(pg), key, out exists);
+        return new InsertPosition(path, pg, idx);
+    }
 
+    private void InsertAt(in InsertPosition position, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool exists)
+    {
+        var path = position.Path;
+        uint pg = position.Leaf;
+        int idx = position.Index;
         var writable = _tx.WritePage(pg);
         if (exists)
         {
@@ -494,7 +536,6 @@ internal readonly struct BTree
         var cell = LeafCell(key, value);
         if (!TryInsertCell(writable, idx, cell))
             SplitAndInsert(path, pg, idx, cell, append: idx == Count(writable) && IsRightmostPath(path));
-        return true;
     }
 
     private bool IsRightmostPath(List<(uint Page, int Index)> path)

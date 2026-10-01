@@ -147,6 +147,25 @@ public class CollectionTests : IDisposable
     }
 
     [Fact]
+    public void Duplicate_id_is_reported_before_index_errors_and_leaves_transaction_usable()
+    {
+        _people.CreateIndex("name", unique: true);
+        using var tx = _db.BeginTransaction();
+        var people = tx.GetCollection("people");
+        // _id 2 exists and 'Ana' belongs to _id 1: the primary duplicate wins, then an oversized index key.
+        var both = Assert.Throws<DuplicateKeyException>(() => people.Insert("{ _id: 2, name: 'Ana' }"));
+        Assert.Contains("_id", both.Message);
+        Assert.Throws<DuplicateKeyException>(() => people.Insert(new Document { ["_id"] = 2, ["name"] = new string('x', 10_000) }));
+        people.Insert("{ _id: 501, name: 'Nova' }");
+        tx.Commit();
+
+        Assert.Throws<FolioException>(() => _people.Insert(new Document { ["_id"] = 500, ["name"] = new string('x', 10_000) }));
+        Assert.Null(_people.FindById(500));
+        Assert.Equal("Nova", _people.FindById(501)!["name"].AsString);
+        _db.CheckIntegrity();
+    }
+
+    [Fact]
     public void Multikey_index_tracks_array_changes()
     {
         _people.CreateIndex("tags");
