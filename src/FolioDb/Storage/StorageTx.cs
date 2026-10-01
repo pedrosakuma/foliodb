@@ -18,6 +18,7 @@ internal sealed class StorageTx : IDisposable
     // reads, so short transactions allocate nothing, and bounded so long scans don't pin evicted pages.
     private Dictionary<uint, byte[]>? _clean;
     private int _pagerReads;
+    private int _pagerMisses;
     private const int CleanMemoAfterReads = 8;
     private const int CleanMemoCapacity = 256;
     private readonly Action? _onDispose;
@@ -56,6 +57,12 @@ internal sealed class StorageTx : IDisposable
     public uint PageCount => _header.PageCount;
     public uint FreePageCount => _header.FreePageCount;
 
+    /// <summary>
+    /// Starts a new operation in a long-lived transaction: scan detection counts misses per operation, so a snapshot
+    /// running many small lookups keeps warming the cache while one large query inside it does not flush it.
+    /// </summary>
+    public void BeginOperation() => _pagerMisses = 0;
+
     /// <summary>Page image for reading. Must not be mutated.</summary>
     public byte[] ReadPage(uint pgno)
     {
@@ -68,7 +75,8 @@ internal sealed class StorageTx : IDisposable
     {
         if (_clean is not null && _clean.TryGetValue(pgno, out var c)) return c;
         if (pgno >= _header.PageCount) throw new CorruptDatabaseException($"Page {pgno} is out of range ({_header.PageCount} pages).");
-        var page = _pager.ReadPage(pgno, _mark);
+        var page = _pager.ReadPage(pgno, _mark, admit: _pagerMisses < _pager.ScanMissThreshold, out bool missed);
+        if (missed) _pagerMisses++;
         if (_clean is not null)
         {
             if (_clean.Count < CleanMemoCapacity) _clean[pgno] = page;

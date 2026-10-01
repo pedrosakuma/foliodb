@@ -187,8 +187,23 @@ internal sealed class Pager : IDisposable
     }
 
     /// <summary>Returns the immutable image of <paramref name="pgno"/> as of snapshot <paramref name="mark"/>. Callers must not mutate it.</summary>
-    public byte[] ReadPage(uint pgno, long mark)
+    public byte[] ReadPage(uint pgno, long mark) => ReadPage(pgno, mark, admit: true, out _);
+
+    /// <summary>
+    /// Transactions that miss more than this many pages are treated as scans: their further misses are not added to
+    /// the cache, so one large scan cannot evict the working set of everyone else.
+    /// </summary>
+    internal int CachedPages => _cache.Count;
+
+    public int ScanMissThreshold => Math.Max(64, _options.CacheSizePages / 8);
+
+    /// <summary>
+    /// Like <see cref="ReadPage(uint, long)"/>. <paramref name="missed"/> reports a cache miss; with
+    /// <paramref name="admit"/> false a missed page is returned without being cached.
+    /// </summary>
+    public byte[] ReadPage(uint pgno, long mark, bool admit, out bool missed)
     {
+        missed = false;
         long frame = 0;
         // Frame numbers start at 1, so an empty snapshot (mark 0) reads straight from the main file.
         if (mark > 0 && _walIndex.TryGetValue(pgno, out var frames)) frame = frames.LatestAtOrBefore(mark);
@@ -196,6 +211,7 @@ internal sealed class Pager : IDisposable
         long cacheKey = frame > 0 ? frame : -(long)pgno - 1;
         if (_cache.TryGet(cacheKey, out var data)) return data;
 
+        missed = true;
         data = _cache.RentPage();
         if (frame > 0)
         {
@@ -207,7 +223,7 @@ internal sealed class Pager : IDisposable
             int n = RandomAccess.Read(_dbHandle, data, (long)pgno * PageSize);
             if (n < PageSize) data.AsSpan(Math.Max(n, 0)).Clear(); // pages past EOF read as zeros
         }
-        _cache.Add(cacheKey, data);
+        if (admit) _cache.Add(cacheKey, data);
         return data;
     }
 

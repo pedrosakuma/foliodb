@@ -1578,6 +1578,25 @@ database (3 rounds each, medians):
 A long full scan barely changes: its snapshot is open while it evicts the whole cache, so its own epoch cannot
 drain until it ends, and the pages it evicts go to the GC once limbo is full.
 
+### Scan resistance
+
+A full scan used to push every page it read through the cache, evicting the working set of everyone else. Now each
+transaction counts its cache misses per operation. Past `max(64, CacheSizePages / 8)` misses, an operation is
+treated as a scan, and its further misses are returned without entering the cache (the page memory still comes from
+the recycle pool). The counter restarts at every operation, so a long-lived snapshot or transaction running many
+small lookups keeps warming the cache, and repeated scans of a table that fits in the cache still load it a slice
+at a time. With the 151 MiB database, a 16 MiB cache and a 20k-document hot set (100k `FindById` calls, counting
+`read` syscalls):
+
+| | Before the scan | After one full scan |
+|---|---:|---:|
+| Before | 14 reads | **2,158 reads** (hot set flushed) |
+| After | 14 reads | **14 reads** |
+
+With 6 point readers and one thread scanning continuously on a quiet host, the readers went from 0.70-0.87M/s
+(-35-45% because of the scan) to 1.11-1.28M/s. The scanner itself ran ~1.8× more scans, and gen2 collections
+fell from ~140 to 4 per 8 s run, because pages that never enter the cache die young.
+
 ### GC settings when the data does not fit in the cache
 
 Before page recycling, disabling background GC in the host application (a process-wide setting) roughly doubled

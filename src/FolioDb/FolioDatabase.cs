@@ -267,10 +267,13 @@ public sealed class Transaction : IDisposable
     internal Transaction(FolioDatabase db, EngineTx engine)
     {
         _db = db;
-        Engine = engine;
+        _engine = engine;
     }
 
-    internal EngineTx Engine { get; }
+    private readonly EngineTx _engine;
+
+    // Every operation starts by fetching the engine, so this is where scan detection restarts (see StorageTx).
+    internal EngineTx Engine { get { _engine.Storage.BeginOperation(); return _engine; } }
 
     public Collection GetCollection(string name)
     {
@@ -412,10 +415,13 @@ public sealed class Snapshot : IDisposable
     internal Snapshot(FolioDatabase db, EngineTx engine)
     {
         _db = db;
-        Engine = engine;
+        _engine = engine;
     }
 
-    internal EngineTx Engine { get; }
+    private readonly EngineTx _engine;
+
+    // Every operation starts by fetching the engine, so this is where scan detection restarts (see StorageTx).
+    internal EngineTx Engine { get { _engine.Storage.BeginOperation(); return _engine; } }
 
     public Collection GetCollection(string name) => new(_db, name, this);
     public Collection<T> GetCollection<T>(string name) where T : IFolioDocument<T> => new(GetCollection(name));
