@@ -208,7 +208,7 @@ internal sealed class Pager : IDisposable
         // Frame numbers start at 1, so an empty snapshot (mark 0) reads straight from the main file.
         if (mark > 0 && _walIndex.TryGetValue(pgno, out var frames)) frame = frames.LatestAtOrBefore(mark);
 
-        long cacheKey = frame > 0 ? frame : -(long)pgno - 1;
+        long cacheKey = frame > 0 ? frame : MainFileKey(pgno);
         if (_cache.TryGet(cacheKey, out var data)) return data;
 
         missed = true;
@@ -226,6 +226,8 @@ internal sealed class Pager : IDisposable
         if (admit) _cache.Add(cacheKey, data);
         return data;
     }
+
+    private static long MainFileKey(uint pgno) => -(long)pgno - 1;
 
     private void AppendFrame(uint pgno, long frame)
     {
@@ -477,12 +479,17 @@ internal sealed class Pager : IDisposable
 
         if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
 
+        var latest = new List<(uint, long)>(pgnos.Length);
+        foreach (uint pgno in pgnos) latest.Add((pgno, _walIndex[pgno].Last));
+
         _checkpointSeq++;
         WriteNewWalHeader();
         _walIndex.Clear();
         _committedFrames = 0;
         _writtenFrames = 0;
-        _cache.Clear();
+        // Frame numbers restart, so frame-keyed entries must go; the latest image of each page is now its main-file
+        // image, which keeps the cache warm across checkpoints.
+        _cache.PromoteCheckpointed(latest, MainFileKey);
         return true;
     }
 

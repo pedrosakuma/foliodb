@@ -135,6 +135,42 @@ internal sealed class PageCache
         }
     }
 
+    /// <summary>
+    /// After a checkpoint copied the WAL into the main file and reset it: cached images of each page's latest frame
+    /// stay cached as that page's main-file image (<paramref name="mainFileKey"/>), and every other WAL frame entry,
+    /// plus any older main-file image of those pages, is dropped. Keys of WAL frames are positive; main-file keys
+    /// negative. Must run while no reader is registered; dropped images are left to the GC, never recycled.
+    /// </summary>
+    public void PromoteCheckpointed(IReadOnlyCollection<(uint Pgno, long LatestFrame)> pages, Func<uint, long> mainFileKey)
+    {
+        lock (_lock)
+        {
+            foreach (var (pgno, _) in pages) _map.TryRemove(mainFileKey(pgno), out _);
+            var promoted = new Dictionary<long, long>(pages.Count);
+            foreach (var (pgno, frame) in pages) promoted[frame] = mainFileKey(pgno);
+            for (int i = 0; i < _ring.Length; i++)
+            {
+                var entry = _ring[i];
+                if (entry is null) continue;
+                if (entry.Key >= 0)
+                {
+                    _map.TryRemove(entry.Key, out _);
+                    if (promoted.TryGetValue(entry.Key, out long key))
+                    {
+                        var moved = new Entry(key, entry.Data) { Referenced = entry.Referenced };
+                        _ring[i] = moved;
+                        _map[key] = moved;
+                    }
+                    else _ring[i] = null;
+                }
+                else if (!_map.TryGetValue(entry.Key, out var current) || !ReferenceEquals(current, entry))
+                {
+                    _ring[i] = null; // a stale main-file image removed above
+                }
+            }
+        }
+    }
+
     public void Clear()
     {
         lock (_lock)

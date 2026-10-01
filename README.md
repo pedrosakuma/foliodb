@@ -1597,6 +1597,17 @@ With 6 point readers and one thread scanning continuously on a quiet host, the r
 (-35-45% because of the scan) to 1.11-1.28M/s. The scanner itself ran ~1.8× more scans, and gen2 collections
 fell from ~140 to 4 per 8 s run, because pages that never enter the cache die young.
 
+### Keeping the cache warm across checkpoints
+
+A checkpoint used to clear the whole page cache, because WAL frame numbers restart and frame-keyed entries become
+invalid. With a write-heavy workload checkpointing every 1,000 frames, readers kept starting from a cold cache. Now
+the cached image of each page's latest frame is re-keyed as that page's main-file image (which the checkpoint just
+wrote), and only older frames and stale main-file images are dropped. With the 151 MiB database fully cached, one
+writer (`Normal`) and one reader doing `FindById` (8 s, two interleaved runs), reads went from 22-26k/s to 32-38k/s
+(~1.45×) and writer p99 from 0.76-0.86 ms to 0.24-0.31 ms. Readers still wait while a checkpoint runs, since it
+holds the pager lock through the copy and fsync. Checkpoints also still need a moment with no active readers: with
+4 continuous readers none ran in 8 s and the WAL reached 1.1 GiB.
+
 ### GC settings when the data does not fit in the cache
 
 Before page recycling, disabling background GC in the host application (a process-wide setting) roughly doubled

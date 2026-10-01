@@ -14,9 +14,9 @@ public sealed class ScanResistanceTests
     public void A_large_scan_admits_a_bounded_number_of_pages()
     {
         using var tmp = new TempDb();
-        using var db = tmp.Open(new FolioOptions { CacheSizePages = 128, Synchronous = SynchronousMode.Off });
-        Fill(db, "big", 10_000); // ~1000 leaf pages
-        Assert.True(db.Checkpoint()); // empties the cache
+        var options = new FolioOptions { CacheSizePages = 128, Synchronous = SynchronousMode.Off };
+        using (var setup = tmp.Open(options)) Fill(setup, "big", 10_000); // ~1000 leaf pages
+        using var db = tmp.Open(options); // cold cache
         int threshold = db.Pager.ScanMissThreshold;
 
         Assert.Equal(0, db.GetCollection("big").Count("""{ "pad": "nope" }"""));
@@ -27,9 +27,9 @@ public sealed class ScanResistanceTests
     public void Repeated_scans_of_a_table_that_fits_still_warm_up_the_cache()
     {
         using var tmp = new TempDb();
-        using var db = tmp.Open(new FolioOptions { CacheSizePages = 512, Synchronous = SynchronousMode.Off });
-        Fill(db, "mid", 2_500); // more pages than one scan admits, fewer than the cache holds
-        Assert.True(db.Checkpoint());
+        var options = new FolioOptions { CacheSizePages = 512, Synchronous = SynchronousMode.Off };
+        using (var setup = tmp.Open(options)) Fill(setup, "mid", 2_500); // more pages than one scan admits, fewer than the cache holds
+        using var db = tmp.Open(options); // cold cache
         var mid = db.GetCollection("mid");
 
         mid.Count();
@@ -43,9 +43,9 @@ public sealed class ScanResistanceTests
     public void Many_lookups_in_one_long_snapshot_keep_warming_the_cache()
     {
         using var tmp = new TempDb();
-        using var db = tmp.Open(new FolioOptions { CacheSizePages = 2048, Synchronous = SynchronousMode.Off });
-        Fill(db, "docs", 10_000);
-        Assert.True(db.Checkpoint());
+        var options = new FolioOptions { CacheSizePages = 2048, Synchronous = SynchronousMode.Off };
+        using (var setup = tmp.Open(options)) Fill(setup, "docs", 10_000);
+        using var db = tmp.Open(options); // cold cache
 
         // Each lookup misses a page or two; together they miss far more than one operation may admit.
         using (var snap = db.BeginSnapshot())
