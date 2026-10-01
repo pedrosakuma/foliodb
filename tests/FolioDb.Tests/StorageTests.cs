@@ -265,6 +265,37 @@ public class StorageTests
         Assert.Equal(5000, new BTree(read.Storage, descending).Verify());
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Overwrites_and_deleting_everything_leave_only_the_root(bool rebalance)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions
+        {
+            DeleteRebalance = rebalance ? BTreeDeleteRebalanceMode.LeafByteOccupancy : BTreeDeleteRebalanceMode.None,
+        });
+        using var tx = db.BeginWrite();
+        var tree = new BTree(tx.Storage, BTree.Create(tx.Storage));
+        uint used = tx.Storage.PageCount - tx.Storage.FreePageCount;
+
+        for (int i = 0; i < 3000; i++) tree.Insert(Key(i), new byte[60], overwrite: false);
+        tree.Insert(Key(7), new byte[3 * tx.Storage.PageSize], overwrite: true);
+        tree.Insert(Key(7), [1, 2, 3], overwrite: true);
+        Assert.True(tree.TryGet(Key(7), out var v));
+        Assert.Equal([1, 2, 3], v.ToArray());
+
+        var order = Enumerable.Range(5, 2995).OrderBy(i => (i * 7919) % 3000).ToList();
+        foreach (int i in order) Assert.True(tree.Delete(Key(i)));
+        // Keys 0-4 share one leaf: once every other leaf is gone the root must have collapsed into it.
+        var shape = tree.Diagnose();
+        Assert.Equal(5, shape.EntryCount);
+        Assert.Equal(0, shape.InteriorPages);
+        for (int i = 0; i < 5; i++) Assert.True(tree.Delete(Key(i)));
+        Assert.Equal(0, tree.Verify());
+        Assert.Equal(used, tx.Storage.PageCount - tx.Storage.FreePageCount);
+    }
+
     [Fact]
     public void Insert_without_overwrite_reports_existing_key()
     {

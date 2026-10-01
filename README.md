@@ -1366,6 +1366,15 @@ still take precedence. Same workload, interleaved A/B:
 | Time, no secondary index | ~0.91-0.93 µs | **~0.77-0.83 µs** |
 | Time, index on `city` | ~3.18-3.34 µs | **~2.66-3.09 µs** |
 
+### Index entry deletes and inserts without a path list
+
+Every changed index key is one B+Tree delete and one insert. Both used to allocate the list of interior pages on
+the way down (needed only to split, merge or remove pages), the insert also built the cell in its own array, and
+every delete re-read the root to check whether it should collapse. Now a delete records the path, by descending
+again, only when the leaf empties or delete rebalancing is on, and only then checks the root; an insert of a small
+inline cell builds it on the stack and takes the path-recording route only when the leaf is full. With the index
+on `city`: 1,527 → **1,214 B** per update, ~6% less time.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

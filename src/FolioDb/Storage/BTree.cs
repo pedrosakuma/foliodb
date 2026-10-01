@@ -339,6 +339,15 @@ internal readonly struct BTree
         return cell;
     }
 
+    private static void WriteInlineLeafCell(Span<byte> cell, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+    {
+        BinaryPrimitives.WriteUInt16LittleEndian(cell, (ushort)key.Length);
+        cell[2] = 0;
+        BinaryPrimitives.WriteInt32LittleEndian(cell[3..], value.Length);
+        key.CopyTo(cell[LeafCellHeader..]);
+        value.CopyTo(cell[(LeafCellHeader + key.Length)..]);
+    }
+
     private byte[] LeafCell(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
     {
         bool overflow = LeafCellHeader + key.Length + value.Length > MaxInlineCell;
@@ -489,6 +498,24 @@ internal readonly struct BTree
     /// <summary>Inserts or replaces. Returns false (and does nothing) if the key exists and <paramref name="overwrite"/> is false.</summary>
     public bool Insert(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value, bool overwrite)
     {
+        // Fast path for small inline cells: no path list and no cell array; only a full leaf takes the split path.
+        int cellLength = LeafCellHeader + key.Length + value.Length;
+        if (cellLength <= StackCellLimit && cellLength <= MaxInlineCell && key.Length <= MaxKeySize(PageSize))
+        {
+            uint pg = DescendToLeaf(key);
+            int idx = LowerBound(_tx.ReadPage(pg), key, out bool found);
+            if (found && !overwrite) return false;
+            var writable = _tx.WritePage(pg);
+            if (found)
+            {
+                FreeCellOverflow(writable, idx);
+                RemoveCell(writable, idx);
+            }
+            Span<byte> cell = stackalloc byte[cellLength];
+            WriteInlineLeafCell(cell, key, value);
+            if (TryInsertCell(writable, idx, cell)) return true;
+        }
+
         var position = Locate(key, out bool exists);
         if (exists && !overwrite) return false;
         InsertAt(position, key, value, exists);
@@ -523,6 +550,19 @@ internal readonly struct BTree
     /// <summary>Inserts a key known to be absent at the position returned by <see cref="TryLocateNew"/>.</summary>
     public void InsertNew(in InsertPosition position, ReadOnlySpan<byte> key, ReadOnlySpan<byte> value) =>
         InsertAt(position, key, value, exists: false);
+
+    private const int StackCellLimit = 512;
+
+    private uint DescendToLeaf(ReadOnlySpan<byte> key)
+    {
+        uint pg = Root;
+        while (true)
+        {
+            var page = _tx.ReadPage(pg);
+            if (IsLeaf(page)) return pg;
+            pg = ChildAt(page, ChildIndex(page, key));
+        }
+    }
 
     private InsertPosition Locate(ReadOnlySpan<byte> key, out bool exists)
     {
@@ -627,25 +667,27 @@ internal readonly struct BTree
 
     public bool Delete(ReadOnlySpan<byte> key)
     {
-        var path = new List<(uint Page, int Index)>(8);
-        uint pg = Root;
-        while (true)
-        {
-            var page = _tx.ReadPage(pg);
-            if (IsLeaf(page)) break;
-            int ci = ChildIndex(page, key);
-            path.Add((pg, ci));
-            pg = ChildAt(page, ci);
-        }
-
-        var leaf = _tx.ReadPage(pg);
-        int idx = LowerBound(leaf, key, out bool found);
+        uint pg = DescendToLeaf(key);
+        int idx = LowerBound(_tx.ReadPage(pg), key, out bool found);
         if (!found) return false;
 
         var writable = _tx.WritePage(pg);
         FreeCellOverflow(writable, idx);
         RemoveCell(writable, idx);
-        if (Count(writable) == 0 && pg != Root) RemoveEmptyChild(path, pg);
+        bool emptied = Count(writable) == 0 && pg != Root;
+        // Interior pages (and so the root) only change when a leaf empties or is rebalanced.
+        if (!emptied && _tx.DeleteRebalance == BTreeDeleteRebalanceMode.None) return true;
+
+        var path = new List<(uint Page, int Index)>(8);
+        uint at = Root;
+        while (at != pg)
+        {
+            var page = _tx.ReadPage(at);
+            int ci = ChildIndex(page, key);
+            path.Add((at, ci));
+            at = ChildAt(page, ci);
+        }
+        if (emptied) RemoveEmptyChild(path, pg);
         else if (_tx.DeleteRebalance == BTreeDeleteRebalanceMode.LeafByteOccupancy)
             TryRebalanceLeaf(path, pg);
         CollapseRoot();
