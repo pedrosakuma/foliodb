@@ -187,28 +187,37 @@ internal sealed class Pager : IDisposable
         long firstFrame;
         lock (_gate) firstFrame = _committedFrames + 1;
 
-        var buf = new byte[pages.Count * _frameSize];
+        // Frame headers live in one small buffer; page images are written in place (gather write),
+        // so a commit never copies its pages into a large contiguous frame buffer.
+        var headers = new byte[pages.Count * FrameHeaderSize];
+        var segments = new ReadOnlyMemory<byte>[pages.Count * 2];
         ulong chain = _chain;
         for (int i = 0; i < pages.Count; i++)
         {
-            var frame = buf.AsSpan(i * _frameSize, _frameSize);
-            BinaryPrimitives.WriteUInt32LittleEndian(frame[8..], pages[i].Key);
-            BinaryPrimitives.WriteUInt32LittleEndian(frame[12..], i == pages.Count - 1 ? dbPageCount : 0);
-            BinaryPrimitives.WriteUInt32LittleEndian(frame[16..], _salt1);
-            BinaryPrimitives.WriteUInt32LittleEndian(frame[20..], _salt2);
-            pages[i].Value.CopyTo(frame[FrameHeaderSize..]);
-            chain = XxHash64.HashToUInt64(frame[8..], unchecked((long)chain));
-            BinaryPrimitives.WriteUInt64LittleEndian(frame, chain);
+            var page = pages[i].Value;
+            if (page.Length != PageSize) throw new InvalidOperationException("Dirty page has the wrong size.");
+            var header = headers.AsSpan(i * FrameHeaderSize, FrameHeaderSize);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[8..], pages[i].Key);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[12..], i == pages.Count - 1 ? dbPageCount : 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[16..], _salt1);
+            BinaryPrimitives.WriteUInt32LittleEndian(header[20..], _salt2);
+            chain = ChainHash(chain, header[8..], page);
+            BinaryPrimitives.WriteUInt64LittleEndian(header, chain);
+            segments[2 * i] = headers.AsMemory(i * FrameHeaderSize, FrameHeaderSize);
+            segments[2 * i + 1] = page;
         }
 
         long offset = FrameOffset(firstFrame);
         if (TestTornWriteBytes is int torn)
         {
             TestTornWriteBytes = null;
-            RandomAccess.Write(_walHandle, buf.AsSpan(0, Math.Min(torn, buf.Length)), offset);
+            var flat = new byte[pages.Count * _frameSize];
+            int pos = 0;
+            foreach (var s in segments) { s.Span.CopyTo(flat.AsSpan(pos)); pos += s.Length; }
+            RandomAccess.Write(_walHandle, flat.AsSpan(0, Math.Min(torn, flat.Length)), offset);
             throw new IOException("Simulated torn write.");
         }
-        RandomAccess.Write(_walHandle, buf, offset);
+        RandomAccess.Write(_walHandle, segments, offset);
         if (_options.Synchronous == SynchronousMode.Full) _wal.Flush(flushToDisk: true);
 
         lock (_gate)
@@ -224,6 +233,15 @@ internal sealed class Pager : IDisposable
             _chain = chain;
         }
 
+    }
+
+    /// <summary>Chained frame checksum: XxHash64 of (frame header after the checksum, page), seeded with the previous one.</summary>
+    private static ulong ChainHash(ulong previous, ReadOnlySpan<byte> header, ReadOnlySpan<byte> page)
+    {
+        var hasher = new XxHash64(unchecked((long)previous));
+        hasher.Append(header);
+        hasher.Append(page);
+        return hasher.GetCurrentHashAsUInt64();
     }
 
     /// <summary>Runs a checkpoint when the WAL exceeds the configured size. Caller must hold the write lock.</summary>
@@ -245,14 +263,25 @@ internal sealed class Pager : IDisposable
             if (_activeReaders > 0) return false;
             if (_committedFrames == 0) return true;
 
-            var page = new byte[PageSize];
-            foreach (var (pgno, frames) in _walIndex.OrderBy(static kv => kv.Key))
+            var pgnos = new uint[_walIndex.Count];
+            _walIndex.Keys.CopyTo(pgnos, 0);
+            Array.Sort(pgnos);
+
+            // Latest image of each page, taken from the cache when still resident; runs of
+            // consecutive page numbers go to the main file in a single gather write.
+            var run = new List<ReadOnlyMemory<byte>>();
+            uint runStart = 0;
+            foreach (uint pgno in pgnos)
             {
-                long frame = frames[^1];
-                if (RandomAccess.Read(_walHandle, page, FrameOffset(frame) + FrameHeaderSize) != PageSize)
-                    throw new CorruptDatabaseException($"Short read of WAL frame {frame} during checkpoint.");
-                RandomAccess.Write(_dbHandle, page, (long)pgno * PageSize);
+                if (run.Count > 0 && pgno != runStart + (uint)run.Count)
+                {
+                    RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
+                    run.Clear();
+                }
+                if (run.Count == 0) runStart = pgno;
+                run.Add(LatestCommittedImage(_walIndex[pgno][^1]));
             }
+            if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
 
             if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
 
@@ -263,6 +292,15 @@ internal sealed class Pager : IDisposable
             _cache.Clear();
             return true;
         }
+    }
+
+    private byte[] LatestCommittedImage(long frame)
+    {
+        if (_cache.TryGet(frame, out var cached)) return cached;
+        var page = new byte[PageSize];
+        if (RandomAccess.Read(_walHandle, page, FrameOffset(frame) + FrameHeaderSize) != PageSize)
+            throw new CorruptDatabaseException($"Short read of WAL frame {frame} during checkpoint.");
+        return page;
     }
 
     private void WriteNewWalHeader()

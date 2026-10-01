@@ -1261,6 +1261,25 @@ A hand-written single-pass reader for the same type allocated 928 B and took ~2.
 that bound. Times come from three runs on a shared host (load about 4) and are relative, not guarantees; the
 allocation figures are the reproducible ones. Typed reads are now cheaper than untyped `Document` reads.
 
+### WAL commit without a frame buffer
+
+Commit used to copy every dirty page into a single `pages × (24 + page size)` buffer, hash it and write it. With
+~224 dirty pages per 1,000-insert transaction that was a ~920 KB large-object allocation per commit; in isolation
+the allocation (with its zeroing and the gen2 collections it triggers) cost more than the copy and the hash
+together. Commit now writes a small header buffer plus the page images themselves through one gather write
+(`pwritev`), computing the same chained XxHash64 incrementally, so the WAL format is unchanged. Checkpoint
+writes the latest image of each page from the page cache when it is still resident (reading the WAL otherwise)
+and sends runs of consecutive page numbers in a single gather write.
+
+| Per insert (typed, index on `city`, 1,000 per transaction, `SynchronousMode.Off`) | Before | After |
+|---|---:|---:|
+| Allocated | 5,368 B | **4,530 B** |
+| Commit share (incl. automatic checkpoints) | ~2.5 µs | **~1.7 µs** |
+| Insert + commit | ~6.6 µs | **~5.6 µs** |
+| Gen2 collections in a 6 s loop | ~200 | **~55** |
+
+Three runs of each build on a shared host (load 3-5); times are relative, the allocation figures reproducible.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
