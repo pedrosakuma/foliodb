@@ -317,17 +317,15 @@ internal static class CollectionEngine
                 && (index.Fields.Length == 1 || FieldsInOrder(oldBytes, index.Paths) == FieldsInOrder(newBytes, index.Paths))) continue;
             var oldKeys = ExtractIndexKeys(oldBytes, index, out _);
             var newKeys = ExtractIndexKeys(newBytes, index, out bool multi);
-            var removed = oldKeys.Where(o => !newKeys.Exists(n => n.Key.AsSpan().SequenceEqual(o.Key))).Select(o => o.Key).ToList();
-            var added = newKeys.Where(n => !oldKeys.Exists(o => o.Key.AsSpan().SequenceEqual(n.Key))).ToList();
-            // Same key but a different type (5 -> 5L) or _id type: the entry is rewritten with the new hint.
-            var rehinted = newKeys.Where(n => oldKeys.Exists(o => o.Key.AsSpan().SequenceEqual(n.Key) && (idHintChanged || !o.Hint.AsSpan().SequenceEqual(n.Hint)))).ToList();
-            foreach (var (k, _) in added)
+            var (removed, written, addedCount) = DiffKeys(oldKeys, newKeys, idHintChanged);
+            for (int i = 0; i < addedCount; i++)
             {
+                var k = written[i].Key;
                 CheckKeySize(tx, index, k.Length + idKey.Length);
                 if (index.Unique && ConflictsInUniqueIndex(new BTree(tx.Storage, index.Root), k, idKey))
                     throw new DuplicateKeyException($"Duplicate key in unique index '{index.Name}' of '{meta.Name}': {index.DescribeKey(k)}.");
             }
-            (changes ??= new(meta.Indexes.Count)).Add((index, removed, [.. added, .. rehinted], multi));
+            (changes ??= new(meta.Indexes.Count)).Add((index, removed, written, multi));
         }
 
         if (changes is null)
@@ -354,6 +352,41 @@ internal static class CollectionEngine
         new BTree(tx.Storage, meta.PrimaryRoot).Update(idKey, newBytes);
         if (metaChanged) tx.SaveCollection(meta);
         return true;
+    }
+
+    /// <summary>
+    /// Index entries to change when a document's keys go from <paramref name="oldKeys"/> to <paramref name="newKeys"/>:
+    /// keys only in the old version are removed; written holds the keys only in the new version (the first
+    /// <c>AddedCount</c> items) followed by kept keys whose hint changed (5 -> 5L, or a new <c>_id</c> type).
+    /// </summary>
+    private static (List<byte[]> Removed, List<IndexKey> Written, int AddedCount) DiffKeys(List<IndexKey> oldKeys, List<IndexKey> newKeys, bool idHintChanged)
+    {
+        var removed = new List<byte[]>(oldKeys.Count);
+        foreach (var o in oldKeys)
+            if (IndexOfKey(newKeys, o.Key, 0) < 0) removed.Add(o.Key);
+        var written = new List<IndexKey>(newKeys.Count);
+        foreach (var n in newKeys)
+            if (IndexOfKey(oldKeys, n.Key, 0) < 0) written.Add(n);
+        int addedCount = written.Count;
+        foreach (var n in newKeys)
+        {
+            for (int i = IndexOfKey(oldKeys, n.Key, 0); i >= 0; i = IndexOfKey(oldKeys, n.Key, i + 1))
+            {
+                if (idHintChanged || !oldKeys[i].Hint.AsSpan().SequenceEqual(n.Hint))
+                {
+                    written.Add(n);
+                    break;
+                }
+            }
+        }
+        return (removed, written, addedCount);
+    }
+
+    private static int IndexOfKey(List<IndexKey> keys, byte[] key, int start)
+    {
+        for (int i = start; i < keys.Count; i++)
+            if (keys[i].Key.AsSpan().SequenceEqual(key)) return i;
+        return -1;
     }
 
     private static bool SameFields(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b, byte[][] names)

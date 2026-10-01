@@ -1336,6 +1336,22 @@ bytes are stored directly, instead of `ToDocument`, a filter, a planned match an
 `_id`. Same entity shape, 20,000 updates per transaction: **2.6 KB → 1.05 KB** allocated per update without
 secondary indexes and **4.6 KB → 3.0 KB** with an index on `city`.
 
+### Replacing documents: index diff and page compaction
+
+A CPU sample of 20,000 typed updates with an index on `city` put most self time in `CollectionEngine.Replace` and in
+byte copies and zeroing under B+Tree page compaction; Stopwatch phases attributed ~0.8 µs of each update to the LINQ
+key diff (`Where`/`Exists` closures, allocated on every `Replace`, even without indexes). The diff is now plain loops
+with the same order and semantics. Compacting a fragmented page used to copy every cell into its own array, clear
+the whole page and rebuild it; it now lays the cells out through a per-thread scratch page and clears only the free
+gap, producing the same page bytes. Same workload (commit excluded, best of 12 rounds, interleaved A/B):
+
+| Per update | Before | After |
+|---|---:|---:|
+| Allocated, no secondary index | 792 B | **599 B** |
+| Allocated, index on `city` | 2,783 B | **1,525 B** |
+| Time, no secondary index | ~1.21-1.29 µs | **~0.92-1.03 µs** |
+| Time, index on `city` | ~3.87-4.22 µs | **~3.41-3.59 µs** |
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

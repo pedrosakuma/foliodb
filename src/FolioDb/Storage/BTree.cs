@@ -269,10 +269,32 @@ internal readonly struct BTree
         else SetFrag(page, Frag(page) + size);
     }
 
+    [ThreadStatic] private static byte[]? t_defragScratch;
+
+    /// <summary>
+    /// Compacts the cell content in place (same bytes as rebuilding the page from its cells): cells are laid out
+    /// from the end in slot order through a per-thread scratch page, and only the free gap is zeroed.
+    /// </summary>
     private void Defragment(byte[] page)
     {
-        var cells = ReadCells(page);
-        Build(page, page[0], cells, RightChild(page));
+        var scratch = t_defragScratch;
+        if (scratch is null || scratch.Length < PageSize) t_defragScratch = scratch = new byte[PageSize];
+        int n = Count(page);
+        int pos = PageSize;
+        for (int i = 0; i < n; i++)
+        {
+            int off = Slot(page, i);
+            int size = CellSize(page, off);
+            pos -= size;
+            page.AsSpan(off, size).CopyTo(scratch.AsSpan(pos));
+            SetSlot(page, i, pos);
+        }
+        scratch.AsSpan(pos, PageSize - pos).CopyTo(page.AsSpan(pos));
+        int slotsEnd = HeaderSize + 2 * n;
+        page.AsSpan(slotsEnd, pos - slotsEnd).Clear();
+        page[1] = 0;
+        SetContentStart(page, pos, PageSize);
+        SetFrag(page, 0);
     }
 
     private static List<byte[]> ReadCells(ReadOnlySpan<byte> page)
