@@ -610,6 +610,26 @@ Numeric representation (`NumericBenchmarks`; a 10k-doc collection with an index 
 
 The string representation is only shown for cost comparison: it sorts lexicographically (`"10" < "9"`), so it is not a valid option.
 
+Mixed numeric types (`NumericMixBenchmarks`; "stored/literal" types, 10k docs, `Decimal` stored with scale 2 such as
+`5.00m`, `DecimalFrac` stores fractional values such as `500.25m`; short job on a shared host, so differences under
+~10% are noise). Every comparison goes through the ordered key, so mixing types costs nothing extra: what matters is
+encoding the stored value on scans, where `decimal` is ~50% slower. Index lookups encode the literal once and compare
+bytes, so they cost the same for every combination:
+
+| Stored/literal | `CompareTo` | Scan, equality | Scan, range | Index, equality | Index, range |
+|---|---:|---:|---:|---:|---:|
+| Int32/Int32 | 41 ns | 1.07 ms | 1.80 ms | 2.07 µs | 4.03 µs |
+| Int32/Double | 47 ns | 1.14 ms | 1.64 ms | 2.03 µs | 4.65 µs |
+| Int32/Decimal | 99 ns | 1.06 ms | 1.51 ms | 2.02 µs | 4.29 µs |
+| Double/Double | 39 ns | 1.04 ms | 1.52 ms | 2.12 µs | 4.14 µs |
+| Double/Int32 | 49 ns | 1.14 ms | 1.62 ms | 2.07 µs | 4.03 µs |
+| Decimal/Decimal | 147 ns | 1.63 ms | 2.34 ms | 2.25 µs | 4.59 µs |
+| Decimal/Int32 | 101 ns | 1.56 ms | 2.52 ms | 2.15 µs | 4.07 µs |
+| DecimalFrac/DecimalFrac | 144 ns | 1.77 ms | 3.21 ms | 2.07 µs | 4.25 µs |
+| DecimalFrac/Int32 | 103 ns | 2.30 ms | 2.56 ms | 1.96 µs | 4.71 µs |
+
+`CompareTo` encodes both sides, so any `decimal` operand adds ~55 ns; filters encode their constant once.
+
 Update rewrite cost (`UpdateRewriteBenchmarks`, one `$inc` per document). When an operator update only overwrites existing
 scalars with values of the same encoded size (`$inc`/`$mul`/`$min`/`$max`/`$set` without type growth, `$currentDate`), the
 stored bytes are patched in place and only the B+Tree leaf or the overflow pages that actually changed are written to the WAL.
