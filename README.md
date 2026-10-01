@@ -406,6 +406,12 @@ materializes and calls `FromDocument`. `FromView` can also be called inside `Try
 Because typed reads map inside that borrowed read, mappers (and property setters/constructors they call) must not
 write to the database; such writes throw `InvalidOperationException`, as in any borrowed callback.
 
+For writes it emits `WriteTo(T, DocumentWriter)`, which serializes the members straight into the stored format.
+Typed `Insert`/`InsertMany` use it (before the write transaction starts, like `ToDocument` did) and store exactly
+the bytes `Insert(ToDocument(x))` would, including a generated `ObjectId` written first when the entity has no
+`_id`. `ReplaceOne` still goes through `ToDocument`. Hand-written implementations inherit a default `WriteTo` that
+writes `ToDocument(value)`; an override must write each field once (a repeated top-level `_id` is rejected).
+
 ### Options
 
 ```csharp
@@ -1306,6 +1312,21 @@ inserts there (`InsertNew`). Error precedence is unchanged: a duplicate `_id` is
 and nothing is written when validation fails. In an interleaved A/B (minimum of three runs, 200,000 typed inserts,
 commit excluded) the insert went from ~1.08-1.14 to ~0.99-1.01 µs with sequential `_id`s, ~5.3-5.8 to ~4.9-5.1 µs
 with shuffled `_id`s and ~2.38-2.55 to ~2.23-2.33 µs with an index on `city`; relative figures on a shared host.
+
+### Typed inserts without an intermediate `Document`
+
+Typed inserts built a `Document` (a field list, a `DocArray` per collection, a `Document` per nested entity) only to
+serialize it right away. The generated `WriteTo` writes the bytes directly. Same typed 7-field entity with a list and
+a nested entity, 200,000 inserts in transactions of 1,000, commit excluded, interleaved A/B (minimum of four runs):
+
+| Per insert | `ToDocument` | `WriteTo` |
+|---|---:|---:|
+| Allocated, no secondary index | 1,669 B | **1,093 B** |
+| Allocated, index on `city` | 2,913 B | **2,337 B** |
+| Time, no secondary index | ~1.24-1.33 µs | **~0.90-0.93 µs** |
+| Time, index on `city` | ~2.87-2.96 µs | **~2.22-2.23 µs** |
+
+Allocation figures are reproducible; times are relative to a shared host.
 
 ## Limitations
 

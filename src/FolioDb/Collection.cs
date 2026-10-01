@@ -55,6 +55,18 @@ public sealed class Collection
 
     public DocValue Insert(string json) => Insert(Document.Parse(json));
 
+    internal DocValue InsertSerialized(DocValue id, byte[] bytes) =>
+        Write(tx => CollectionEngine.InsertSerialized(tx, tx.GetOrCreateCollection(Name), id, bytes), atomic: true);
+
+    internal IReadOnlyList<DocValue> InsertManySerialized(List<(DocValue Id, byte[] Bytes)> items) =>
+        Write(tx =>
+        {
+            var meta = tx.GetOrCreateCollection(Name);
+            var ids = new List<DocValue>(items.Count);
+            foreach (var (id, bytes) in items) ids.Add(CollectionEngine.InsertSerialized(tx, meta, id, bytes));
+            return ids;
+        }, atomic: items.Count <= 1);
+
     /// <summary>Inserts all documents atomically (all or nothing when used outside an explicit transaction).</summary>
     public IReadOnlyList<DocValue> InsertMany(IEnumerable<Document> documents)
     {

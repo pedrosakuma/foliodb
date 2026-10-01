@@ -11,9 +11,23 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public string Name => Untyped.Name;
 
     /// <summary>Inserts the entity and returns the stored <c>_id</c> (generated if the entity had none).</summary>
-    public DocValue Insert(T entity) => Untyped.Insert(T.ToDocument(entity));
+    public DocValue Insert(T entity)
+    {
+        var bytes = DocumentWriter.Serialize(entity, out var id);
+        return Untyped.InsertSerialized(id, bytes);
+    }
 
-    public IReadOnlyList<DocValue> InsertMany(IEnumerable<T> entities) => Untyped.InsertMany(entities.Select(T.ToDocument));
+    public IReadOnlyList<DocValue> InsertMany(IEnumerable<T> entities)
+    {
+        ArgumentNullException.ThrowIfNull(entities);
+        var items = entities is IReadOnlyCollection<T> c ? new List<(DocValue, byte[])>(c.Count) : new List<(DocValue, byte[])>();
+        foreach (var entity in entities)
+        {
+            var bytes = DocumentWriter.Serialize(entity, out var id);
+            items.Add((id, bytes));
+        }
+        return Untyped.InsertManySerialized(items);
+    }
 
     /// <summary>Point read mapped straight from the stored bytes via <see cref="IFolioDocument{TSelf}.FromView"/>.</summary>
     public T? FindById(DocValue id) => Untyped.TryReadById(id, static v => T.FromView(v), out var entity) ? entity : default;

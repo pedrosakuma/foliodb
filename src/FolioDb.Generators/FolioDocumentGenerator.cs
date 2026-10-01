@@ -410,6 +410,67 @@ public sealed class FolioDocumentGenerator : IIncrementalGenerator
         throw new InvalidOperationException();
     }
 
+    /// <summary>
+    /// Statements writing <paramref name="x"/> through a DocumentWriter, as a named field (<paramref name="name"/> is a
+    /// UTF-8 literal or a string expression) or, when <paramref name="name"/> is null, as an array item. Values are
+    /// converted exactly as <see cref="WriteExpr"/> does; nested entities and collections are written in place.
+    /// </summary>
+    private static void EmitWrite(StringBuilder sb, string ind, ITypeSymbol type, string x, string? name, ref int n)
+    {
+        string Put(string value) => name is null ? $"writer.WriteItem({value});" : $"writer.Write({name}, {value});";
+        string Begin(bool array) => name is null
+            ? (array ? "writer.BeginArrayItem();" : "writer.BeginDocumentItem();")
+            : (array ? $"writer.BeginArray({name});" : $"writer.BeginDocument({name});");
+        const string Null = "global::FolioDb.DocValue.Null";
+        string i1 = ind + "    ";
+        var kind = Classify(type, out var el);
+        switch (kind)
+        {
+            case Kind.Simple:
+            case Kind.Enum:
+                sb.Append(ind).AppendLine(Put(WriteExpr(type, x, 0, "")));
+                return;
+            case Kind.Nullable:
+            case Kind.Nested when !type.IsValueType:
+            case Kind.List:
+            case Kind.Array:
+            case Kind.HashSet:
+            case Kind.Map:
+            {
+                string v = "w" + n++;
+                sb.Append(ind).Append("if (").Append(x).Append(" is { } ").Append(v).AppendLine(")");
+                sb.Append(ind).AppendLine("{");
+                if (kind == Kind.Nullable) EmitWrite(sb, i1, el!, v, name, ref n);
+                else if (kind == Kind.Nested) EmitNested(sb, i1, type, v, Begin(false));
+                else
+                {
+                    string e = "w" + n++;
+                    sb.Append(i1).AppendLine(Begin(kind != Kind.Map));
+                    sb.Append(i1).Append("foreach (var ").Append(e).Append(" in ").Append(v).AppendLine(")");
+                    sb.Append(i1).AppendLine("{");
+                    if (kind == Kind.Map) EmitWrite(sb, i1 + "    ", el!, e + ".Value", e + ".Key", ref n);
+                    else EmitWrite(sb, i1 + "    ", el!, e, null, ref n);
+                    sb.Append(i1).AppendLine("}");
+                    sb.Append(i1).AppendLine("writer.End();");
+                }
+                sb.Append(ind).AppendLine("}");
+                sb.Append(ind).Append("else ").AppendLine(Put(Null));
+                return;
+            }
+            case Kind.Nested:
+                EmitNested(sb, ind, type, x, Begin(false));
+                return;
+        }
+        throw new InvalidOperationException();
+    }
+
+    private static void EmitNested(StringBuilder sb, string ind, ITypeSymbol type, string x, string begin)
+    {
+        sb.Append(ind).AppendLine(begin);
+        sb.Append(ind).Append("global::FolioDb.Mapping.FolioMapper.WriteNested<").Append(Fq(type).TrimEnd('?')).Append(">(").Append(x).AppendLine(", writer);");
+        sb.Append(ind).AppendLine("writer.End();");
+    }
+
     private static string ReadExpr(ITypeSymbol type, string v, int depth, string p)
     {
         const string M = "global::FolioDb.Mapping.FolioMapper";
@@ -599,6 +660,27 @@ public sealed class FolioDocumentGenerator : IIncrementalGenerator
             else sb.Append(i2).AppendLine(add);
         }
         sb.Append(i2).AppendLine("return doc;");
+        sb.Append(i1).AppendLine("}");
+        sb.AppendLine();
+        // WriteTo
+        sb.Append(i1).Append("public static void WriteTo(").Append(self).AppendLine(" value, global::FolioDb.DocumentWriter writer)");
+        sb.Append(i1).AppendLine("{");
+        if (!type.IsValueType) sb.Append(i2).AppendLine("global::System.ArgumentNullException.ThrowIfNull(value);");
+        int wn = 0;
+        foreach (var m in members.OrderBy(m => m.IsId ? 0 : 1))
+        {
+            string access = "value." + m.Name;
+            string? unset = m.IsId ? UnsetIdCondition(m.Type, access) : null;
+            string name = Literal(m.Field) + "u8";
+            if (unset is not null)
+            {
+                sb.Append(i2).Append("if (!(").Append(unset).AppendLine("))");
+                sb.Append(i2).AppendLine("{");
+                EmitWrite(sb, i3, m.Type, access, name, ref wn);
+                sb.Append(i2).AppendLine("}");
+            }
+            else EmitWrite(sb, i2, m.Type, access, name, ref wn);
+        }
         sb.Append(i1).AppendLine("}");
         sb.AppendLine();
 

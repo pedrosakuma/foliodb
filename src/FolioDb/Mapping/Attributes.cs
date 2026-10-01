@@ -15,6 +15,13 @@ public interface IFolioDocument<TSelf> where TSelf : IFolioDocument<TSelf>
     /// Typed collection reads call it inside a borrowed read, so it must not write to the database.
     /// </summary>
     static virtual TSelf FromView(DocumentView view) => TSelf.FromDocument(view.ToDocument());
+
+    /// <summary>
+    /// Writes the entity's fields into the current document, without building a <see cref="Document"/>. Generated
+    /// mappers write every member directly; the default writes <see cref="ToDocument"/>. Typed inserts call it before
+    /// the write transaction starts. Each field may be written at most once.
+    /// </summary>
+    static virtual void WriteTo(TSelf value, DocumentWriter writer) => writer.WriteFields(TSelf.ToDocument(value));
 }
 
 /// <summary>Generates a <see cref="IFolioDocument{TSelf}"/> implementation for this partial class/struct/record.</summary>

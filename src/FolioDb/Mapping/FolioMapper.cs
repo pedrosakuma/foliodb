@@ -15,6 +15,8 @@ public static class FolioMapper
         return arr;
     }
 
+    public static void WriteNested<T>(T value, DocumentWriter writer) where T : IFolioDocument<T> => T.WriteTo(value, writer);
+
     public static List<T> ReadList<T>(DocValue value, Func<DocValue, T> read)
     {
         if (value.IsNull) return null!;

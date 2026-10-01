@@ -220,7 +220,21 @@ internal static class CollectionEngine
         CheckKeySize(tx, null, idKey.Length);
         var bytes = DocumentSerializer.Serialize(doc);
         if (bytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
+        return InsertEncoded(tx, meta, id, idKey, bytes);
+    }
 
+    /// <summary>Inserts an already serialized document whose top-level <c>_id</c> is <paramref name="id"/>.</summary>
+    public static DocValue InsertSerialized(EngineTx tx, CollectionMeta meta, DocValue id, byte[] bytes)
+    {
+        if (id.Type == DocType.Array) throw new FolioException("_id cannot be an array.");
+        var idKey = KeyEncoder.Encode(id);
+        CheckKeySize(tx, null, idKey.Length);
+        if (bytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
+        return InsertEncoded(tx, meta, id, idKey, bytes);
+    }
+
+    private static DocValue InsertEncoded(EngineTx tx, CollectionMeta meta, DocValue id, byte[] idKey, byte[] bytes)
+    {
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
         if (!primary.TryLocateNew(idKey, out var primaryPosition))
             throw new DuplicateKeyException($"Duplicate key in collection '{meta.Name}': _id {DocJson.WriteValue(id)}.");
