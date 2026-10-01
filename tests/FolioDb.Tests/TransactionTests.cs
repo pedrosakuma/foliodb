@@ -285,4 +285,56 @@ public class TransactionTests
         Assert.True(db.Checkpoint());
         db.CheckIntegrity();
     }
+
+    [Fact]
+    public async Task Short_snapshots_racing_frequent_checkpoints_stay_consistent()
+    {
+        // Readers register without the pager gate; checkpoints must never reset the WAL under a registered reader.
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 8, Synchronous = SynchronousMode.Off });
+        var accounts = db.GetCollection("accounts");
+        for (int i = 0; i < 10; i++) accounts.Insert(new Document { ["_id"] = i, ["balance"] = 100 });
+        var token = TestContext.Current.CancellationToken;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        long violations = 0, reads = 0, checkpoints = 0;
+        var writer = Task.Run(() =>
+        {
+            var rnd = new Random(1);
+            while (!cts.IsCancellationRequested)
+            {
+                int from = rnd.Next(10), to = rnd.Next(10);
+                using (var tx = db.BeginTransaction())
+                {
+                    var c = tx.GetCollection("accounts");
+                    c.UpdateOne(new Document { ["_id"] = from }, Document.Parse("{ $inc: { balance: -1 } }"));
+                    c.UpdateOne(new Document { ["_id"] = to }, Document.Parse("{ $inc: { balance: 1 } }"));
+                    tx.Commit();
+                }
+                if (db.Pager.WalFrameCount == 0) Interlocked.Increment(ref checkpoints);
+            }
+        }, token);
+        var readers = Enumerable.Range(0, 4).Select(r => Task.Run(() =>
+        {
+            var rnd = new Random(r + 10);
+            while (!cts.IsCancellationRequested)
+            {
+                using (var snap = db.BeginSnapshot())
+                {
+                    var c = snap.GetCollection("accounts");
+                    long total = 0;
+                    for (int i = 0; i < 10; i++) total += c.FindById(i)!["balance"].AsInt64;
+                    if (total != 1000) Interlocked.Increment(ref violations);
+                }
+                Interlocked.Increment(ref reads);
+                if (rnd.Next(4) == 0) Thread.Yield();
+            }
+        }, token)).ToList();
+
+        await Task.WhenAll(readers.Append(writer));
+        Assert.Equal(0, violations);
+        Assert.True(reads > 100, $"reads={reads}");
+        Assert.True(checkpoints > 0, $"checkpoints={checkpoints}");
+        db.CheckIntegrity();
+    }
 }

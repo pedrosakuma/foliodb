@@ -1537,6 +1537,21 @@ In the mixed `--concurrency` workload the result was within noise on a quiet hos
 average 23-32), the scenarios with readers and writers read 2.4-4.5× faster, because a preempted thread no longer
 holds a lock every other reader needs.
 
+### Reader registration without the pager lock
+
+Every snapshot still took the pager's gate lock twice, to register as a reader (so a checkpoint cannot reset the
+WAL under it) and to unregister. Registration is now lock-free, Dekker-style: a reader increments the active-reader
+count and then checks a `checkpointing` flag; a checkpoint sets the flag and then checks the count. Both use full
+fences, so at least one side sees the other: either the checkpoint backs off, or the reader undoes its increment
+and registers under the gate, which the checkpoint holds until the WAL is reset. The writer still registers under
+the gate. Interleaved runs on a loaded host (load average 15-32), `FindById` from 8 threads:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| 50k docs, every page in the WAL | 1.23-1.74M/s | **1.92-3.04M/s (~1.7×)** |
+| Same, plus 1 writer: reads | 0.61-1.27M/s | **1.28-2.02M/s (~1.7×)** |
+| 151 MiB, all cached, empty WAL | median 0.86M/s | median 0.87M/s (indexed ranges and scans ~1.1-1.3×, noisy) |
+
 ### Memory-mapped reads: measured, not adopted
 
 With the same 151 MiB database and a 16 MiB cache (~9.5× smaller), a prototype that served cache misses from a

@@ -51,8 +51,13 @@ internal sealed class Pager : IDisposable
     private Exception? _flushFailure;
     private ulong _chain;
     private uint _salt1, _salt2, _checkpointSeq;
+    // Readers register without the gate (Dekker-style): a reader increments _activeReaders and then checks
+    // _checkpointing; a checkpoint sets _checkpointing and then checks _activeReaders. Both are full fences, so at
+    // least one side sees the other. A reader that sees a checkpoint backs out and registers under the gate, which
+    // the checkpoint holds until it has reset the WAL.
     private int _activeReaders;
-    private bool _disposed;
+    private int _checkpointing;
+    private volatile bool _disposed;
 
     public int PageSize { get; }
     public string Path { get; }
@@ -139,10 +144,19 @@ internal sealed class Pager : IDisposable
 
     public long BeginRead()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        Interlocked.Increment(ref _activeReaders);
+        if (_disposed)
+        {
+            Interlocked.Decrement(ref _activeReaders);
+            throw new ObjectDisposedException(GetType().FullName);
+        }
+        if (Volatile.Read(ref _checkpointing) == 0) return Volatile.Read(ref _committedFrames);
+        Interlocked.Decrement(ref _activeReaders);
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            _activeReaders++;
+            Interlocked.Increment(ref _activeReaders);
             return _committedFrames;
         }
     }
@@ -158,7 +172,7 @@ internal sealed class Pager : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfFlushFailed();
-            _activeReaders++;
+            Interlocked.Increment(ref _activeReaders);
             seenSeq = _appendedSeq;
             return _writtenFrames;
         }
@@ -166,7 +180,7 @@ internal sealed class Pager : IDisposable
 
     public void EndRead()
     {
-        lock (_gate) _activeReaders--;
+        Interlocked.Decrement(ref _activeReaders);
     }
 
     public long WalFrameCount
@@ -313,7 +327,7 @@ internal sealed class Pager : IDisposable
             if (!groupCommit)
             {
                 // Normal/Off: durability is not per commit, so the frames are published right away.
-                _committedFrames = _writtenFrames;
+                Volatile.Write(ref _committedFrames, _writtenFrames);
                 Volatile.Write(ref _durableSeq, _appendedSeq);
             }
             _chain = chain;
@@ -361,7 +375,7 @@ internal sealed class Pager : IDisposable
             _flushing = false;
             if (failure is null)
             {
-                lock (_gate) _committedFrames = upToFrame;
+                lock (_gate) Volatile.Write(ref _committedFrames, upToFrame);
                 Volatile.Write(ref _durableSeq, upToSeq);
             }
             else _flushFailure = failure;
@@ -412,42 +426,49 @@ internal sealed class Pager : IDisposable
     public bool TryCheckpoint()
     {
         // Readers block a checkpoint anyway: don't fsync under the write lock for nothing (it would serialize commits).
-        lock (_gate) if (_activeReaders > 0) return false;
+        if (Volatile.Read(ref _activeReaders) > 0) return false;
         FlushWritten();
         lock (_gate)
         {
-            if (_activeReaders > 0) return false;
-            if (_committedFrames == 0) return true;
-
-            var pgnos = _walIndex.Keys.ToArray();
-            Array.Sort(pgnos);
-
-            // Latest image of each page, taken from the cache when still resident; runs of
-            // consecutive page numbers go to the main file in a single gather write.
-            var run = new List<ReadOnlyMemory<byte>>();
-            uint runStart = 0;
-            foreach (uint pgno in pgnos)
-            {
-                if (run.Count > 0 && pgno != runStart + (uint)run.Count)
-                {
-                    RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
-                    run.Clear();
-                }
-                if (run.Count == 0) runStart = pgno;
-                run.Add(LatestCommittedImage(_walIndex[pgno].Last));
-            }
-            if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
-
-            if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
-
-            _checkpointSeq++;
-            WriteNewWalHeader();
-            _walIndex.Clear();
-            _committedFrames = 0;
-            _writtenFrames = 0;
-            _cache.Clear();
-            return true;
+            Interlocked.Exchange(ref _checkpointing, 1);
+            try { return CheckpointLocked(); }
+            finally { Volatile.Write(ref _checkpointing, 0); }
         }
+    }
+
+    private bool CheckpointLocked()
+    {
+        if (Volatile.Read(ref _activeReaders) > 0) return false;
+        if (_committedFrames == 0) return true;
+
+        var pgnos = _walIndex.Keys.ToArray();
+        Array.Sort(pgnos);
+
+        // Latest image of each page, taken from the cache when still resident; runs of
+        // consecutive page numbers go to the main file in a single gather write.
+        var run = new List<ReadOnlyMemory<byte>>();
+        uint runStart = 0;
+        foreach (uint pgno in pgnos)
+        {
+            if (run.Count > 0 && pgno != runStart + (uint)run.Count)
+            {
+                RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
+                run.Clear();
+            }
+            if (run.Count == 0) runStart = pgno;
+            run.Add(LatestCommittedImage(_walIndex[pgno].Last));
+        }
+        if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
+
+        if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
+
+        _checkpointSeq++;
+        WriteNewWalHeader();
+        _walIndex.Clear();
+        _committedFrames = 0;
+        _writtenFrames = 0;
+        _cache.Clear();
+        return true;
     }
 
     private byte[] LatestCommittedImage(long frame)
