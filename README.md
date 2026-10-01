@@ -178,19 +178,21 @@ after checkpoint. Process working set was sampled at 94.8 MiB before and 95.5 Mi
 attributable allocation measurement**; the implementation's material bound is its transaction's dirty compact-output
 pages plus sort buffers/runs, so measure peak memory and disk on the deployment volume before scheduling large copies.
 
-#### Optional FIFO writer admission
+#### FIFO writer admission (default)
 
 ```csharp
 using var db = FolioDatabase.Open("app.folio", new FolioOptions
 {
-    WriterAdmission = WriterAdmissionMode.Fifo,
+    WriterAdmission = WriterAdmissionMode.Unordered, // opt out of the default FIFO admission
     BusyTimeout = TimeSpan.FromSeconds(30),
 });
 ```
 
-`WriterAdmissionMode.Default` retains the original semaphore policy (no ordering guarantee) and remains the
-default. `Fifo` admits pending callers in the order they enqueue under the admission monitor. It can improve
-per-writer progress under contention, at a possible throughput cost. This is per opened database, not persisted
+`WriterAdmissionMode.Fifo` is the default: pending callers are admitted in the order they enqueue, with direct
+handoff and up to two briefly spinning successors (see "FIFO handoff with spinning successors" below), giving
+even per-writer progress at throughput on par with the semaphore at the cost of roughly one extra core while
+contended. `WriterAdmissionMode.Unordered` (formerly `Default`) keeps the original semaphore policy: no ordering
+guarantee and no spinning. This is per opened database, not persisted
 in the file, and works with every durability mode.
 
 Automatic writes, explicit transactions, explicit `Checkpoint()` and `Dispose()` share the selected admission
@@ -942,7 +944,7 @@ whole `Normal` update transaction (~30–40 us). The lock now:
   next waiter asleep; with two, about a fifth did.
 
 A wake that is interrupted after a grant is retried, and the interrupt is re-raised afterwards, so a granted
-waiter can't be left parked. Default (semaphore) admission is unchanged.
+waiter can't be left parked. The semaphore admission (now `Unordered`) is unchanged; FIFO became the default after this round.
 
 `--fairness 3 1 normal`, before vs after, medians of two interleaved runs (updates/s):
 

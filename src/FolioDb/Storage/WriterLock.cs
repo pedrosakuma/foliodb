@@ -38,7 +38,7 @@ internal sealed class WriterLock
 
     public WriterLock(WriterAdmissionMode mode)
     {
-        if (mode == WriterAdmissionMode.Default) _semaphore = new SemaphoreSlim(1, 1);
+        if (mode == WriterAdmissionMode.Unordered) _semaphore = new SemaphoreSlim(1, 1);
     }
 
     internal int WaitingCount { get { lock (_gate) return _queue.Count; } }

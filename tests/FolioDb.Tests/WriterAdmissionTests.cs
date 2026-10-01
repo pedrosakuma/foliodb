@@ -80,7 +80,7 @@ public sealed class WriterAdmissionTests
     }
 
     [Theory]
-    [InlineData(WriterAdmissionMode.Default)]
+    [InlineData(WriterAdmissionMode.Unordered)]
     [InlineData(WriterAdmissionMode.Fifo)]
     public async Task ZeroAndInfiniteTimeouts(WriterAdmissionMode mode)
     {
@@ -215,7 +215,7 @@ public sealed class WriterAdmissionTests
     }
 
     [Theory]
-    [InlineData(WriterAdmissionMode.Default)]
+    [InlineData(WriterAdmissionMode.Unordered)]
     [InlineData(WriterAdmissionMode.Fifo)]
     public void DisposalTimeoutRestoresUsabilityAndFailuresReleaseLock(WriterAdmissionMode mode)
     {
@@ -297,7 +297,7 @@ public sealed class WriterAdmissionTests
     public void InvalidOptionsFailAtOpen()
     {
         using var tmp = new TempDb();
-        Assert.Equal(WriterAdmissionMode.Default, new FolioOptions().WriterAdmission);
+        Assert.Equal(WriterAdmissionMode.Fifo, new FolioOptions().WriterAdmission);
         Assert.Throws<ArgumentOutOfRangeException>(() => tmp.Open(new FolioOptions { WriterAdmission = (WriterAdmissionMode)99 }));
         foreach (var timeout in new[] { TimeSpan.FromMilliseconds(-2), TimeSpan.FromTicks(-1), TimeSpan.FromMilliseconds((double)int.MaxValue + 1) })
             Assert.Throws<ArgumentOutOfRangeException>(() => tmp.Open(new FolioOptions { BusyTimeout = timeout }));

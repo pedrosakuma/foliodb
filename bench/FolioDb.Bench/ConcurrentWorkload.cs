@@ -118,7 +118,7 @@ public static class ConcurrentWorkload
             {
                 Synchronous = mode, AutoCheckpointFrames = 1000, BusyTimeout = TimeSpan.FromSeconds(1),
                 CacheSizePages = 4096 / shards,
-                WriterAdmission = fifo == "integrated" ? WriterAdmissionMode.Fifo : WriterAdmissionMode.Default,
+                WriterAdmission = fifo == "integrated" ? WriterAdmissionMode.Fifo : WriterAdmissionMode.Unordered,
             }));
             for (int shard = 0; shard < shards; shard++)
             {

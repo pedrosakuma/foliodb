@@ -186,7 +186,7 @@ public class TransactionTests
     }
 
     [Theory]
-    [InlineData(WriterAdmissionMode.Default)]
+    [InlineData(WriterAdmissionMode.Unordered)]
     [InlineData(WriterAdmissionMode.Fifo)]
     public async Task Concurrent_readers_and_writers_keep_consistent_invariants(WriterAdmissionMode admission)
     {
