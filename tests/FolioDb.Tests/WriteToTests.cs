@@ -272,6 +272,23 @@ public class WriteToTests
             Assert.Equal("Bia", p.FindById(1)!.Name);
         }
         Assert.Equal("Ana", people.FindById(1)!.Name);
+
+        // Stored documents read in place from the page (inline, one overflow page, an overflow chain), also when the
+        // leaf is already dirty in the transaction, while the indexed yrs changes.
+        people.CreateIndex("yrs");
+        using (var tx = db.BeginTransaction())
+        {
+            var p = tx.GetCollection<Person>("people");
+            foreach (int size in new[] { 10, 3000, 20000, 10 })
+            {
+                for (int i = 100; i < 140; i++) p.Update(new Person { Id = i, Name = new string((char)('a' + i % 7), size) }, upsert: true);
+                for (int i = 100; i < 140; i++) Assert.True(p.Update(new Person { Id = i, Name = new string((char)('a' + i % 5), size), Age = size + i }));
+            }
+            tx.Commit();
+        }
+        Assert.Equal(8, people.Count($"{{ name: '{new string('c', 10)}' }}"));
+        Assert.Equal(40, people.Count("{ yrs: { $gte: 110, $lt: 150 } }"));
+        Assert.Equal(0, people.Count("{ yrs: { $gte: 150 } }"));
         db.CheckIntegrity();
     }
 }

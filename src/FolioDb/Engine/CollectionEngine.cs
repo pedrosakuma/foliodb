@@ -297,7 +297,8 @@ internal static class CollectionEngine
         Replace(tx, meta, idKey, oldBytes, DocumentSerializer.Serialize(newDoc));
 
     /// <summary>Replaces a stored document with already serialized bytes. Returns false if they are identical.</summary>
-    public static bool Replace(EngineTx tx, CollectionMeta meta, byte[] idKey, byte[] oldBytes, byte[] newBytes)
+    /// <remarks><paramref name="oldBytes"/> may be borrowed from a page: it is only read before any tree is modified.</remarks>
+    public static bool Replace(EngineTx tx, CollectionMeta meta, ReadOnlySpan<byte> idKey, ReadOnlySpan<byte> oldBytes, byte[] newBytes)
     {
         if (newBytes.AsSpan().SequenceEqual(oldBytes)) return false;
         if (newBytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
@@ -456,18 +457,9 @@ internal static class CollectionEngine
             : null;
     }
 
-    /// <summary>Copies the encoded key and stored bytes of the document with <paramref name="id"/>, if any.</summary>
-    public static bool TryCopyById(EngineTx tx, CollectionMeta meta, DocValue id, out byte[] idKey, out byte[] bytes)
-    {
-        idKey = KeyEncoder.Encode(id);
-        if (new BTree(tx.Storage, meta.PrimaryRoot).TryGet(idKey, out var stored))
-        {
-            bytes = stored.ToArray();
-            return true;
-        }
-        bytes = [];
-        return false;
-    }
+    /// <summary>Stored bytes of the document with encoded key <paramref name="idKey"/>, borrowed until the next mutation.</summary>
+    public static bool TryBorrowBytes(EngineTx tx, CollectionMeta meta, ReadOnlySpan<byte> idKey, out ReadOnlySpan<byte> bytes) =>
+        new BTree(tx.Storage, meta.PrimaryRoot).TryGet(idKey, out bytes);
 
     /// <summary>
     /// True when <paramref name="replacement"/> starts with an <c>_id</c> byte-identical to the one in

@@ -41,6 +41,13 @@ public sealed class Collection
         _ => _db.Write(action),
     };
 
+    private T Write<TState, T>(TState state, Func<EngineTx, TState, T> action, bool atomic) => _scope switch
+    {
+        Transaction t => t.Run(state, action, atomic),
+        Snapshot => throw new InvalidOperationException("Snapshots are read-only."),
+        _ => _db.Write(state, action),
+    };
+
     private static Filter ParseFilter(string? filter) =>
         string.IsNullOrWhiteSpace(filter) ? Filter.All : FilterParser.Parse(Document.Parse(filter));
 
@@ -72,17 +79,24 @@ public sealed class Collection
     /// as a top-level field. Same outcome as <c>ReplaceOne({_id: id}, replacement(), upsert)</c>; the
     /// <see cref="Document"/> is only built when the stored <c>_id</c> is not byte-identical to the new one.
     /// </summary>
-    internal UpdateResult ReplaceByIdSerialized(DocValue id, byte[] bytes, bool upsert, Func<Document> replacement) =>
-        Write(tx =>
+    internal UpdateResult ReplaceByIdSerialized<TEntity>(DocValue id, byte[] bytes, bool upsert, TEntity entity)
+        where TEntity : IFolioDocument<TEntity> =>
+        Write((Collection: this, Id: id, Bytes: bytes, Upsert: upsert, Entity: entity), static (tx, s) =>
         {
-            var meta = upsert ? tx.GetOrCreateCollection(Name) : tx.GetCollection(Name);
+            var meta = s.Upsert ? tx.GetOrCreateCollection(s.Collection.Name) : tx.GetCollection(s.Collection.Name);
             if (meta is null) return new UpdateResult(0, 0, null);
-            if (!CollectionEngine.TryCopyById(tx, meta, id, out var idKey, out var stored))
-                return new UpdateResult(0, 0, upsert ? CollectionEngine.InsertSerialized(tx, meta, id, bytes) : (DocValue?)null);
-            var newBytes = CollectionEngine.StartsWithSameId(stored, bytes)
-                ? bytes
-                : UpdateApplier.ApplyReplacement(stored, replacement());
-            return new UpdateResult(1, CollectionEngine.Replace(tx, meta, idKey, stored, newBytes) ? 1 : 0, null);
+            var tempKey = KeyEncoder.EncodeTemporary(s.Id);
+            Span<byte> idKey = tempKey.Length <= 256 ? stackalloc byte[tempKey.Length] : new byte[tempKey.Length];
+            tempKey.CopyTo(idKey);
+            // Borrowed from the page: Replace reads it only before it modifies any tree.
+            if (!CollectionEngine.TryBorrowBytes(tx, meta, idKey, out var stored))
+                return new UpdateResult(0, 0, s.Upsert ? CollectionEngine.InsertSerialized(tx, meta, s.Id, s.Bytes) : (DocValue?)null);
+            if (CollectionEngine.StartsWithSameId(stored, s.Bytes))
+                return new UpdateResult(1, CollectionEngine.Replace(tx, meta, idKey, stored, s.Bytes) ? 1 : 0, null);
+            // User code (ToDocument) runs on a copy.
+            var copy = stored.ToArray();
+            var newBytes = UpdateApplier.ApplyReplacement(copy, TEntity.ToDocument(s.Entity));
+            return new UpdateResult(1, CollectionEngine.Replace(tx, meta, idKey, copy, newBytes) ? 1 : 0, null);
         }, atomic: true);
 
     /// <summary>Inserts all documents atomically (all or nothing when used outside an explicit transaction).</summary>

@@ -1383,6 +1383,21 @@ most one key per document, so the replace now reads both keys straight from the 
 the same result (removed key, added key checked for size and uniqueness, rehinted key); arrays and compound indexes
 keep the general path. 1,214 → **974 B** per update, ~5-15% less time.
 
+### Typed update without closures or a stored copy
+
+What remained outside the B+Trees was plumbing: the lambda passed to the write scope (a closure plus a delegate),
+the fallback lambda that builds a `Document` when the stored `_id` differs, the encoded `_id` array and a copy of the
+stored document. The write scope now takes a state value and a static lambda, the fallback calls the generated
+`ToDocument` directly, the key is encoded on the stack, and the stored document is read in place from its page
+(`Replace` reads it only before modifying any tree; the fallback copies it before running user code).
+
+| Per update | Before | After |
+|---|---:|---:|
+| Allocated, no secondary index | 700 B | **214 B** |
+| Allocated, index on `city` | 974 B | **598 B** |
+| Time, no secondary index | ~0.84-0.89 µs | **~0.75-0.76 µs** |
+| Time, index on `city` | ~2.52-2.67 µs | **~1.91-2.08 µs** |
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

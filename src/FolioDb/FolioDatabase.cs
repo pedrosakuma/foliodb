@@ -71,10 +71,13 @@ public sealed class FolioDatabase : IDisposable
         return action(tx);
     }
 
-    internal T Write<T>(Func<EngineTx, T> action)
+    internal T Write<T>(Func<EngineTx, T> action) => Write(action, static (tx, a) => a(tx));
+
+    /// <summary>State-passing <see cref="Write{T}(Func{EngineTx, T})"/>, so hot paths can use static (non-allocating) lambdas.</summary>
+    internal T Write<TState, T>(TState state, Func<EngineTx, TState, T> action)
     {
         using var tx = BeginWrite();
-        var result = action(tx);
+        var result = action(tx, state);
         tx.Commit();
         return result;
     }
@@ -284,13 +287,16 @@ public sealed class Transaction : IDisposable
     /// transaction remains usable afterwards. Any other failure dooms the transaction (it can only be rolled back).
     /// write: false for read-only operations, which remain allowed while a borrowed view is active.
     /// </summary>
-    internal T Run<T>(Func<EngineTx, T> action, bool atomic = false, bool write = true)
+    internal T Run<T>(Func<EngineTx, T> action, bool atomic = false, bool write = true) =>
+        Run(action, static (tx, a) => a(tx), atomic, write);
+
+    internal T Run<TState, T>(TState state, Func<EngineTx, TState, T> action, bool atomic = false, bool write = true)
     {
         ThrowIfUnusable();
         if (write) ThrowIfBorrowed("modified");
         try
         {
-            return action(Engine);
+            return action(Engine, state);
         }
         catch (DuplicateKeyException) when (atomic)
         {

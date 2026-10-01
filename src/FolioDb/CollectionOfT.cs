@@ -99,7 +99,7 @@ public sealed class Collection<T> where T : IFolioDocument<T>
         catch (FolioException) { return UpdateViaDocument(entity, upsert); }
         if (bytes is null || id.IsNull) throw new FolioException("Entity has no _id.");
         if (operatorName || id.Type == DocType.Array || IsOperatorDocument(id)) return UpdateViaDocument(entity, upsert);
-        var r = Untyped.ReplaceByIdSerialized(id, bytes, upsert, () => T.ToDocument(entity));
+        var r = Untyped.ReplaceByIdSerialized(id, bytes, upsert, entity);
         return r.MatchedCount > 0 || r.UpsertedId is not null;
     }
 
