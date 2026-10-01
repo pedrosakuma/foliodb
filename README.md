@@ -1496,6 +1496,34 @@ stored document. The write scope now takes a state value and a static lambda, th
 | Time, no secondary index | ~0.84-0.89 µs | **~0.75-0.76 µs** |
 | Time, index on `city` | ~2.52-2.67 µs | **~1.91-2.08 µs** |
 
+### Lock-free page cache hits (CLOCK)
+
+The page cache was an LRU list behind one lock, and every hit moved its page to the front, so concurrent readers
+serialized on it even with everything cached: with 8 threads a hit took ~3-6 µs instead of ~0.2 µs, 70-77% of a
+point read. It is now a CLOCK cache: a hit is a lock-free `ConcurrentDictionary` lookup plus a reference bit that is
+only written when clear; inserts and eviction (second chance sweep over a ring) still take a lock. Readers whose
+snapshot has no WAL frames (`mark == 0`, e.g. after a checkpoint) also skip the pager's gate lock for the WAL index
+lookup. 151 MiB database (300k documents, index on `score`), interleaved runs, medians of 3:
+
+| Scenario | Point read by `_id` | Indexed range (~50 docs) | Full scan |
+|---|---:|---:|---:|
+| All cached (65,536 pages), 8 threads | 306k → **1,022k/s (3.3×)** | 11.8k → **38.4k/s (3.3×)** | 60 → **93/s (1.6×)** |
+| Cache 4,096 pages (~10% of data), 8 threads | 180k → **263k/s (1.46×)** | 4.46k → **5.15k/s (1.15×)** | ≈ |
+| All cached, 1 thread | 113k → **147k/s (1.3×)** | 6.45k → **7.7k/s (1.19×)** | ≈ |
+
+Of the 8-thread all-cached point read, CLOCK alone gave 2.0× and the `mark == 0` shortcut the rest. In the mixed
+`--concurrency` workload, readers-only runs went 2.8× faster; with writers, reads went 1.24-1.44× faster and read
+p99 dropped from 32-44 µs to 9-19 µs, with updates unchanged or better (1.0-1.4×, Full-mode runs are fsync-noisy).
+
+### Memory-mapped reads: measured, not adopted
+
+With the same 151 MiB database and a 16 MiB cache (~9.5× smaller), a prototype that served cache misses from a
+read-only `mmap` of the main file instead of `pread` was not faster (0-10% slower). Copying a page out of a mapping
+costs ~0.4 µs against ~1.3 µs for `pread`, but a miss is dominated by what surrounds the read: allocating the page,
+the GC it causes and the cache insert. Serving pages zero-copy from the mapping would need page lifetimes tied to
+the mapping (remapping on growth while snapshots hold spans, `SIGBUS` on truncation or I/O errors), so it stays out
+of scope; the cache lock above was the actual bottleneck.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

@@ -109,7 +109,7 @@ public sealed class WriterAdmissionTests
         var tasks = new List<Task>();
         try
         {
-            var expired = Run(() => Assert.False(gate.Wait(TimeSpan.FromMilliseconds(50))));
+            var expired = Run(() => Assert.False(gate.Wait(TimeSpan.FromMilliseconds(200))));
             Until(() => gate.WaitingCount == 1);
             for (int i = 0; i < 3; i++)
             {
@@ -120,7 +120,13 @@ public sealed class WriterAdmissionTests
                     try { order.Add(id); }
                     finally { gate.Release(); }
                 }));
-                Until(() => gate.WaitingCount == id + 2);
+                // On a loaded host the head may already have expired; ordering must hold either way.
+                Until(() =>
+                {
+                    // Sample completion first: once observed, the expired head has already left the queue.
+                    bool headGone = expired.IsCompleted;
+                    return gate.WaitingCount == id + (headGone ? 1 : 2);
+                });
             }
             await expired.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
             Assert.Equal(3, gate.WaitingCount);

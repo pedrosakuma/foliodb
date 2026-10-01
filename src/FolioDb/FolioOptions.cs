@@ -38,7 +38,7 @@ public sealed class FolioOptions
     /// <summary>Page size for new databases (power of two, 1024..32768). Existing databases keep their page size.</summary>
     public int PageSize { get; init; } = 4096;
 
-    /// <summary>Maximum number of pages kept in the in-memory page cache.</summary>
+    /// <summary>Maximum number of pages kept in the in-memory page cache (CLOCK eviction; hits are lock-free).</summary>
     public int CacheSizePages { get; init; } = 4096;
 
     /// <summary>Automatically checkpoint when the WAL holds at least this many frames (0 disables).</summary>

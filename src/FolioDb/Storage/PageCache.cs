@@ -1,33 +1,41 @@
+using System.Collections.Concurrent;
+
 namespace FolioDb.Storage;
 
-/// <summary>Thread-safe LRU cache of immutable page images.</summary>
+/// <summary>
+/// Thread-safe CLOCK cache of immutable page images. Hits are lock-free (a concurrent dictionary lookup plus a
+/// reference bit that is only written when clear); insertions and eviction serialize on a lock.
+/// </summary>
 internal sealed class PageCache
 {
-    private readonly int _capacity;
-    private readonly Dictionary<long, LinkedListNode<(long Key, byte[] Data)>> _map;
-    private readonly LinkedList<(long Key, byte[] Data)> _lru = new();
+    private sealed class Entry(long key, byte[] data)
+    {
+        public readonly long Key = key;
+        public volatile byte[] Data = data;
+        public volatile bool Referenced;
+    }
+
+    private readonly ConcurrentDictionary<long, Entry> _map;
+    private readonly Entry?[] _ring;
+    private int _hand;
     private readonly Lock _lock = new();
 
     public PageCache(int capacity)
     {
-        _capacity = capacity;
-        _map = new Dictionary<long, LinkedListNode<(long, byte[])>>(capacity);
+        _ring = new Entry?[capacity];
+        _map = new ConcurrentDictionary<long, Entry>(Environment.ProcessorCount, capacity);
     }
+
+    internal int Count => _map.Count;
 
     public bool TryGet(long key, out byte[] data)
     {
-        lock (_lock)
+        if (_map.TryGetValue(key, out var entry))
         {
-            if (_map.TryGetValue(key, out var node))
-            {
-                if (node != _lru.First)
-                {
-                    _lru.Remove(node);
-                    _lru.AddFirst(node);
-                }
-                data = node.Value.Data;
-                return true;
-            }
+            // Avoid dirtying a shared cache line on every hit.
+            if (!entry.Referenced) entry.Referenced = true;
+            data = entry.Data;
+            return true;
         }
         data = null!;
         return false;
@@ -39,16 +47,29 @@ internal sealed class PageCache
         {
             if (_map.TryGetValue(key, out var existing))
             {
-                existing.Value = (key, data);
+                existing.Data = data;
                 return;
             }
-            if (_map.Count >= _capacity)
+
+            // Each sweep step either clears a reference bit or stops, so this finds a slot within two revolutions.
+            int hand = _hand;
+            while (true)
             {
-                var last = _lru.Last!;
-                _lru.RemoveLast();
-                _map.Remove(last.Value.Key);
+                var victim = _ring[hand];
+                if (victim is null) break;
+                if (!victim.Referenced)
+                {
+                    _map.TryRemove(victim.Key, out _);
+                    break;
+                }
+                victim.Referenced = false;
+                hand = hand + 1 == _ring.Length ? 0 : hand + 1;
             }
-            _map[key] = _lru.AddFirst((key, data));
+
+            var entry = new Entry(key, data);
+            _ring[hand] = entry;
+            _map[key] = entry;
+            _hand = hand + 1 == _ring.Length ? 0 : hand + 1;
         }
     }
 
@@ -57,7 +78,8 @@ internal sealed class PageCache
         lock (_lock)
         {
             _map.Clear();
-            _lru.Clear();
+            Array.Clear(_ring);
+            _hand = 0;
         }
     }
 }

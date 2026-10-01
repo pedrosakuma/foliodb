@@ -175,9 +175,13 @@ internal sealed class Pager : IDisposable
     public byte[] ReadPage(uint pgno, long mark)
     {
         long frame = 0;
-        lock (_gate)
+        // Frame numbers start at 1, so an empty snapshot (mark 0) reads straight from the main file.
+        if (mark > 0)
         {
-            if (_walIndex.TryGetValue(pgno, out var frames)) frame = LatestFrameAtOrBefore(frames, mark);
+            lock (_gate)
+            {
+                if (_walIndex.TryGetValue(pgno, out var frames)) frame = LatestFrameAtOrBefore(frames, mark);
+            }
         }
 
         long cacheKey = frame > 0 ? frame : -(long)pgno - 1;
