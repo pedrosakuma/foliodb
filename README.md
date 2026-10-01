@@ -1552,6 +1552,23 @@ the gate. Interleaved runs on a loaded host (load average 15-32), `FindById` fro
 | Same, plus 1 writer: reads | 0.61-1.27M/s | **1.28-2.02M/s (~1.7×)** |
 | 151 MiB, all cached, empty WAL | median 0.86M/s | median 0.87M/s (indexed ranges and scans ~1.1-1.3×, noisy) |
 
+### GC settings when the data does not fit in the cache
+
+Each page cache miss allocates a 4 KiB page that the cache keeps until it is evicted, so pages survive gen0 and
+die later, which with the default background (concurrent) GC triggers frequent gen2 collections. With a 151 MiB
+database and the default 16 MiB cache, GC pauses were 50-58% of wall time with 8 reader threads (19-24% with one).
+Disabling background GC in the host application, a process-wide setting, helped the most (same probe, two runs):
+
+| Setting | 8 threads: by `_id` / indexed range | 1 thread: by `_id` / indexed range |
+|---|---:|---:|
+| Default (concurrent workstation GC) | 221k / 4.2k per s | 94k / 3.0k per s |
+| `<ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>` | **406-424k / 10-14k** | **112-115k / 3.7-4.1k** |
+| `DOTNET_GCgen0size=0x4000000` (64 MiB gen0) | 355-483k / 7.4-10.6k | 105-115k / 3.8-4.3k |
+| Server GC | worse | ≈ |
+
+The MSBuild property also applies to Native AOT. A larger `CacheSizePages` avoids the misses altogether when memory
+allows. With everything cached there is no such churn and the setting makes no material difference.
+
 ### Memory-mapped reads: measured, not adopted
 
 With the same 151 MiB database and a 16 MiB cache (~9.5× smaller), a prototype that served cache misses from a
