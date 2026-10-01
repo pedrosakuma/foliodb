@@ -445,7 +445,7 @@ folio> .dump > backup.js
 | Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader (public `DocumentView` wrappers), relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
 | Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
 | Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
-| B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. |
+| B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. Splits are balanced, except an insert past the last key of the rightmost leaf, which starts a new leaf (SQLite-style quick balance) so ascending keys fill pages. |
 | Catalog / engine | `Engine/*` | Collections and index metadata in a catalog tree; index maintenance on insert/update/delete; unique constraints. |
 | Query | `Query/*` | Filter compiler over raw documents, planner (`IDHACK` / `IXSCAN` / `COLLSCAN`), update applier. |
 
@@ -1279,6 +1279,24 @@ and sends runs of consecutive page numbers in a single gather write.
 | Gen2 collections in a 6 s loop | ~200 | **~55** |
 
 Three runs of each build on a shared host (load 3-5); times are relative, the allocation figures reproducible.
+
+### Packed leaves for ascending inserts
+
+Every leaf split used to divide the cells evenly, so keys arriving in ascending order (sequential `_id`s,
+timestamps) left each leaf half full and never touched again. When the new key goes past the last key of the
+rightmost leaf, the full leaf is now kept as is and the new key starts the next leaf, as SQLite's quick balance
+does. Other inserts still split evenly, so random and descending patterns are unchanged.
+
+| 300,000 sequential typed inserts, 1,000 per transaction | Before | After |
+|---|---:|---:|
+| No secondary index: file size | 97.7 MiB | **51.5 MiB** |
+| No secondary index: WAL pages per commit | 87.3 | **47.5** |
+| Index on `city` (100 values): file size | 119.8 MiB | **73.5 MiB** |
+| Index on `city`: WAL pages per commit | 216.1 | **176.2** |
+| Insert + commit, with index (two runs) | ~4.3-4.5 µs | **~4.0-4.3 µs** |
+
+The `city` index keys (`city`, `_id`) grow at the end of each city's range, not at the end of the tree, so that
+index still splits evenly. Page and file counts are deterministic; times are relative to a shared host.
 
 ## Limitations
 

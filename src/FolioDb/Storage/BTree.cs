@@ -492,11 +492,21 @@ internal readonly struct BTree
             RemoveCell(writable, idx);
         }
         var cell = LeafCell(key, value);
-        if (!TryInsertCell(writable, idx, cell)) SplitAndInsert(path, pg, idx, cell);
+        if (!TryInsertCell(writable, idx, cell))
+            SplitAndInsert(path, pg, idx, cell, append: idx == Count(writable) && IsRightmostPath(path));
         return true;
     }
 
-    private void SplitAndInsert(List<(uint Page, int Index)> path, uint pg, int index, byte[] cell)
+    private bool IsRightmostPath(List<(uint Page, int Index)> path)
+    {
+        foreach (var (page, index) in path)
+            if (index != Count(_tx.ReadPage(page))) return false;
+        return true;
+    }
+
+    // append: the cell goes past the last key of the tree's rightmost leaf. Like SQLite's quick balance, the full
+    // leaf is left as is and the new cell starts a new leaf, so ascending inserts pack leaves instead of half-filling them.
+    private void SplitAndInsert(List<(uint Page, int Index)> path, uint pg, int index, byte[] cell, bool append = false)
     {
         var page = _tx.WritePage(pg);
         bool leaf = IsLeaf(page);
@@ -523,7 +533,7 @@ internal readonly struct BTree
         byte[] separator;
         if (leaf)
         {
-            int k = SplitPoint(cells, total, 1, cells.Count - 1);
+            int k = append ? cells.Count - 1 : SplitPoint(cells, total, 1, cells.Count - 1);
             separator = CellKey(cells[k], leaf: true).ToArray();
             Build(page, LeafType, cells.GetRange(0, k), 0);
             Build(newPage, LeafType, cells.GetRange(k, cells.Count - k), 0);

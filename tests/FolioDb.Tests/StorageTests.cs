@@ -210,6 +210,61 @@ public class StorageTests
         Assert.Equal(expected.Count, reader.Verify());
     }
 
+    [Theory]
+    [InlineData(1024)]
+    [InlineData(4096)]
+    public void Ascending_inserts_fill_leaves_while_other_patterns_stay_correct(int pageSize)
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { PageSize = pageSize, Synchronous = SynchronousMode.Off });
+        uint ascending, descending;
+        var rnd = new Random(pageSize);
+        var model = new SortedDictionary<int, byte[]>();
+        using (var tx = db.BeginWrite())
+        {
+            var asc = new BTree(tx.Storage, ascending = BTree.Create(tx.Storage));
+            var desc = new BTree(tx.Storage, descending = BTree.Create(tx.Storage));
+            for (int i = 0; i < 5000; i++)
+            {
+                var value = new byte[rnd.Next(10, 60)];
+                rnd.NextBytes(value);
+                Assert.True(asc.Insert(Key(i), value, overwrite: false));
+                Assert.True(desc.Insert(Key(5000 - i), value, overwrite: false));
+                model[i] = value;
+            }
+            Assert.Equal(5000, asc.Verify());
+            Assert.Equal(5000, desc.Verify());
+
+            var stats = asc.Diagnose();
+            Assert.True(stats.LeafFreeBytes < stats.LeafPages * (long)pageSize / 5,
+                $"ascending leaves are {stats.LeafFreeBytes * 100 / (stats.LeafPages * pageSize)}% free");
+
+            // Interleave appends with inserts below the maximum key: packed leaves then split normally.
+            for (int i = 0; i < 4000; i++)
+            {
+                int k = i % 2 == 0 ? 5000 + i : rnd.Next(5000);
+                var value = new byte[rnd.Next(10, 60)];
+                rnd.NextBytes(value);
+                asc.Insert(Key(k), value, overwrite: true);
+                model[k] = value;
+            }
+            Assert.Equal(model.Count, asc.Verify());
+            tx.Commit();
+        }
+
+        using var read = db.BeginRead();
+        var cursor = new BTree(read.Storage, ascending).CreateCursor();
+        using var expected = model.GetEnumerator();
+        for (bool ok = cursor.SeekFirst(); ok; ok = cursor.MoveNext())
+        {
+            Assert.True(expected.MoveNext());
+            Assert.Equal(Key(expected.Current.Key), cursor.Key.ToArray());
+            Assert.Equal(expected.Current.Value, cursor.Value.ToArray());
+        }
+        Assert.False(expected.MoveNext());
+        Assert.Equal(5000, new BTree(read.Storage, descending).Verify());
+    }
+
     [Fact]
     public void Insert_without_overwrite_reports_existing_key()
     {
