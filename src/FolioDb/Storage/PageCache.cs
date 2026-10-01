@@ -5,6 +5,12 @@ namespace FolioDb.Storage;
 /// <summary>
 /// Thread-safe CLOCK cache of immutable page images. Hits are lock-free (a concurrent dictionary lookup plus a
 /// reference bit that is only written when clear); insertions and eviction serialize on a lock.
+/// <para>
+/// With a <see cref="ReaderEpoch"/>, evicted page images are recycled instead of left to the GC: they wait in a limbo
+/// list until every reader that might still hold one has finished (see <see cref="ReaderEpoch"/>), then go to a small
+/// free pool that <see cref="RentPage"/> serves cache misses from. Images displaced by a newer copy under the same key,
+/// or dropped by <see cref="Clear"/>, are never recycled.
+/// </para>
 /// </summary>
 internal sealed class PageCache
 {
@@ -20,13 +26,44 @@ internal sealed class PageCache
     private int _hand;
     private readonly Lock _lock = new();
 
-    public PageCache(int capacity)
+    private readonly ReaderEpoch? _epoch;
+    private readonly int _pageSize;
+    private readonly int _batch;
+    private readonly int _poolCap;
+    private List<byte[]> _limbo = [];
+    private List<byte[]> _pending = [];
+    private long _pendingEpoch;
+    private readonly Stack<byte[]> _free = new();
+
+    /// <summary>Test hook: overwrite recycled images before reuse, so a reader still holding one sees garbage.</summary>
+    internal static bool PoisonRecycled;
+
+    public PageCache(int capacity, ReaderEpoch? epoch = null, int pageSize = 0)
     {
         _ring = new Entry?[capacity];
         _map = new ConcurrentDictionary<long, Entry>(Environment.ProcessorCount, capacity);
+        _epoch = epoch;
+        _pageSize = pageSize;
+        _batch = Math.Clamp(capacity / 16, 1, 256);
+        _poolCap = _batch * 4;
     }
 
     internal int Count => _map.Count;
+
+    internal int PooledCount { get { lock (_lock) return _free.Count; } }
+
+    /// <summary>A page-sized array with unspecified contents, reused from evicted images when possible.</summary>
+    public byte[] RentPage()
+    {
+        if (_epoch is not null)
+        {
+            lock (_lock)
+            {
+                if (_free.TryPop(out var page)) return page;
+            }
+        }
+        return GC.AllocateUninitializedArray<byte>(_pageSize);
+    }
 
     public bool TryGet(long key, out byte[] data)
     {
@@ -60,6 +97,7 @@ internal sealed class PageCache
                 if (!victim.Referenced)
                 {
                     _map.TryRemove(victim.Key, out _);
+                    if (_epoch is not null) Retire(victim.Data);
                     break;
                 }
                 victim.Referenced = false;
@@ -70,6 +108,30 @@ internal sealed class PageCache
             _ring[hand] = entry;
             _map[key] = entry;
             _hand = hand + 1 == _ring.Length ? 0 : hand + 1;
+        }
+    }
+
+    // Called under _lock, after the image was removed from the map.
+    private void Retire(byte[] data)
+    {
+        var epoch = _epoch!;
+        if (_pending.Count > 0 && epoch.Drained(_pendingEpoch))
+        {
+            foreach (var page in _pending)
+            {
+                if (_free.Count >= _poolCap) break;
+                if (PoisonRecycled) page.AsSpan().Fill(0xDB);
+                _free.Push(page);
+            }
+            _pending.Clear();
+        }
+        if (data.Length == _pageSize && _limbo.Count < _poolCap) _limbo.Add(data);
+        // Only one batch waits for a grace period at a time, so at most two epochs have readers.
+        if (_pending.Count == 0 && _limbo.Count >= _batch)
+        {
+            _pendingEpoch = epoch.Current;
+            epoch.Advance();
+            (_limbo, _pending) = (_pending, _limbo);
         }
     }
 

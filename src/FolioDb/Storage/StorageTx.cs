@@ -11,6 +11,7 @@ internal sealed class StorageTx : IDisposable
     private readonly Pager _pager;
     private readonly long _mark;
     private readonly long _seenSeq;
+    private readonly int _readerSlot;
     private readonly Dictionary<uint, byte[]>? _dirty;
     // Clean page images already resolved at _mark. They are immutable and fixed for the snapshot, so repeated
     // descents (root, interior pages) skip the pager's WAL index and LRU locks. Started only after a few pager
@@ -38,14 +39,14 @@ internal sealed class StorageTx : IDisposable
         IsWritable = writable;
         _onDispose = onDispose;
         DeleteRebalance = deleteRebalance;
-        _mark = writable ? pager.BeginWrite(out _seenSeq) : pager.BeginRead();
+        _mark = writable ? pager.BeginWrite(out _seenSeq, out _readerSlot) : pager.BeginRead(out _readerSlot);
         try
         {
             _header = DbHeader.Read(pager.ReadPage(0, _mark));
         }
         catch
         {
-            pager.EndRead();
+            pager.EndRead(_readerSlot);
             throw;
         }
         if (writable) _dirty = new Dictionary<uint, byte[]>();
@@ -147,7 +148,7 @@ internal sealed class StorageTx : IDisposable
         if (_finished) return;
         _finished = true;
         _clean = null;
-        _pager.EndRead();
+        _pager.EndRead(_readerSlot);
         try
         {
             if (IsWritable) _pager.MaybeAutoCheckpoint();

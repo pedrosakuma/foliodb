@@ -89,4 +89,35 @@ public sealed class PageCacheTests
         await Task.WhenAll(tasks);
         Assert.InRange(cache.Count, 1, 64);
     }
+
+    [Fact]
+    public void Evicted_pages_are_reused_only_after_readers_of_their_epoch_finish()
+    {
+        var epoch = new ReaderEpoch();
+        var cache = new PageCache(16, epoch, pageSize: 8);
+        for (long k = 0; k < 16; k++) cache.Add(k, Page(k));
+
+        // A reader registered before the evictions may still hold any evicted image.
+        int slot = epoch.Enter();
+        cache.TryGet(0, out var held);
+        for (long k = 16; k < 200; k++) cache.Add(k, Page(k));
+        Assert.Equal(0, cache.PooledCount);
+        Assert.Equal(0L, BitConverter.ToInt64(held));
+
+        epoch.Exit(slot);
+        for (long k = 200; k < 400; k++) cache.Add(k, Page(k));
+        Assert.True(cache.PooledCount > 0);
+        var rented = cache.RentPage();
+        Assert.Equal(8, rented.Length);
+        Assert.All(rented, b => Assert.Equal(0xDB, b)); // poisoned by TestSetup
+    }
+
+    [Fact]
+    public void Without_an_epoch_nothing_is_recycled()
+    {
+        var cache = new PageCache(16, epoch: null, pageSize: 8);
+        for (long k = 0; k < 200; k++) cache.Add(k, Page(k));
+        Assert.Equal(0, cache.PooledCount);
+        Assert.Equal(8, cache.RentPage().Length);
+    }
 }

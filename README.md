@@ -1552,22 +1552,47 @@ the gate. Interleaved runs on a loaded host (load average 15-32), `FindById` fro
 | Same, plus 1 writer: reads | 0.61-1.27M/s | **1.28-2.02M/s (~1.7×)** |
 | 151 MiB, all cached, empty WAL | median 0.86M/s | median 0.87M/s (indexed ranges and scans ~1.1-1.3×, noisy) |
 
+### Recycling evicted pages (epoch-based reclamation)
+
+Each page cache miss used to allocate a 4 KiB page that the cache kept until eviction, so pages survived gen0 and
+died later; with the default background GC that meant frequent gen2 collections. With a 151 MiB database and the
+default 16 MiB cache, GC pauses were 50-58% of wall time with 8 reader threads (19-24% with one).
+
+Evicted images are now reused for later misses. The catch is that a reader may still be walking a page the cache
+just evicted, so reuse waits for a grace period, tracked by a two-bucket reader epoch (SRCU-style) that replaces
+the active-reader counter. A reader registers in the current epoch's bucket. Evicted pages collect in a limbo list.
+A full batch is stamped with the current epoch and the epoch advances. Once that epoch's bucket drains, the batch
+moves to a small free pool that misses take from. Every reader that could hold one of those pages registered
+before the page left the cache, so it is in that bucket or older ones, which are already gone. Images replaced
+under the same key or dropped by a checkpoint are left to the GC. Tests overwrite recycled pages with a poison
+pattern, and the whole suite passes with the cache forced down to 16 pages. Interleaved runs with the same
+database (3 rounds each, medians):
+
+| 151 MiB, 16 MiB cache | Before | After | Alloc/op | GC pause share |
+|---|---:|---:|---:|---:|
+| `FindById`, 8 threads | 259k/s | **391k/s (1.51×)** | 5.8 → 2.2 KB | 50% → 13% |
+| Indexed range (~50 docs), 8 threads | 5.1k/s | **9.3k/s (1.83×)** | 280 → 96 KB | 58% → 20% |
+| `FindById`, 1 thread | 97k/s | **115k/s (1.18×)** | 5.8 → 2.1 KB | 17% → 3% |
+| Indexed range, 1 thread | 3.1k/s | **4.8k/s (1.52×)** | 279 → 83 KB | 26% → 5% |
+
+A long full scan barely changes: its snapshot is open while it evicts the whole cache, so its own epoch cannot
+drain until it ends, and the pages it evicts go to the GC once limbo is full.
+
 ### GC settings when the data does not fit in the cache
 
-Each page cache miss allocates a 4 KiB page that the cache keeps until it is evicted, so pages survive gen0 and
-die later, which with the default background (concurrent) GC triggers frequent gen2 collections. With a 151 MiB
-database and the default 16 MiB cache, GC pauses were 50-58% of wall time with 8 reader threads (19-24% with one).
-Disabling background GC in the host application, a process-wide setting, helped the most (same probe, two runs):
+Before page recycling, disabling background GC in the host application (a process-wide setting) roughly doubled
+throughput at 8 threads in the scenario above:
 
-| Setting | 8 threads: by `_id` / indexed range | 1 thread: by `_id` / indexed range |
+| Setting (before recycling) | 8 threads: by `_id` / indexed range | 1 thread: by `_id` / indexed range |
 |---|---:|---:|
 | Default (concurrent workstation GC) | 221k / 4.2k per s | 94k / 3.0k per s |
 | `<ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>` | **406-424k / 10-14k** | **112-115k / 3.7-4.1k** |
 | `DOTNET_GCgen0size=0x4000000` (64 MiB gen0) | 355-483k / 7.4-10.6k | 105-115k / 3.8-4.3k |
 | Server GC | worse | ≈ |
 
-The MSBuild property also applies to Native AOT. A larger `CacheSizePages` avoids the misses altogether when memory
-allows. With everything cached there is no such churn and the setting makes no material difference.
+With recycling the default GC already reaches those numbers, and turning background GC off no longer pays off
+(8 threads, two runs: 346-359k by `_id` and 9.4-11.3k range with it off, against 403-437k and 9.6k by default). It can still help hosts whose own allocations are heavy or
+that hold long scans open. A larger `CacheSizePages` avoids the misses altogether when memory allows.
 
 ### Memory-mapped reads: measured, not adopted
 

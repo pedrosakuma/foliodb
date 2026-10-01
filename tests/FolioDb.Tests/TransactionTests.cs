@@ -337,4 +337,70 @@ public class TransactionTests
         Assert.True(checkpoints > 0, $"checkpoints={checkpoints}");
         db.CheckIntegrity();
     }
+
+    [Fact]
+    public async Task Recycled_pages_never_reach_readers_that_may_still_hold_them()
+    {
+        // A tiny cache evicts constantly, so page images are recycled while readers walk the tree. Recycled images
+        // are poisoned (TestSetup), so a reader handed one too early sees corrupt documents or wrong sums.
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { CacheSizePages = 16, AutoCheckpointFrames = 64, Synchronous = SynchronousMode.Off });
+        var accounts = db.GetCollection("accounts");
+        accounts.CreateIndex("balance");
+        const int n = 400;
+        using (var tx = db.BeginTransaction())
+        {
+            var c = tx.GetCollection("accounts");
+            for (int i = 0; i < n; i++) c.Insert(new Document { ["_id"] = i, ["balance"] = 100, ["pad"] = new string('x', 200) });
+            tx.Commit();
+        }
+        var token = TestContext.Current.CancellationToken;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        long violations = 0, reads = 0, errors = 0;
+        var writer = Task.Run(() =>
+        {
+            var rnd = new Random(1);
+            while (!cts.IsCancellationRequested)
+            {
+                int from = rnd.Next(n), to = rnd.Next(n);
+                using var tx = db.BeginTransaction();
+                var c = tx.GetCollection("accounts");
+                c.UpdateOne(new Document { ["_id"] = from }, Document.Parse("{ $inc: { balance: -1 } }"));
+                c.UpdateOne(new Document { ["_id"] = to }, Document.Parse("{ $inc: { balance: 1 } }"));
+                tx.Commit();
+            }
+        }, token);
+        var readers = Enumerable.Range(0, 4).Select(r => Task.Run(() =>
+        {
+            var rnd = new Random(r + 10);
+            while (!cts.IsCancellationRequested)
+            {
+                try
+                {
+                    using var snap = db.BeginSnapshot();
+                    var c = snap.GetCollection("accounts");
+                    long total = 0;
+                    if (r % 2 == 0)
+                    {
+                        foreach (var d in c.Find()) total += d["balance"].AsInt64;
+                    }
+                    else
+                    {
+                        for (int i = 0; i < n; i++) total += c.FindById(i)!["balance"].AsInt64;
+                    }
+                    if (total != 100L * n) Interlocked.Increment(ref violations);
+                    if (c.Count(Document.Parse("{ balance: { $gte: 0 } }")) != n) Interlocked.Increment(ref violations);
+                }
+                catch (FolioException) { Interlocked.Increment(ref errors); }
+                Interlocked.Increment(ref reads);
+            }
+        }, token)).ToList();
+
+        await Task.WhenAll(readers.Append(writer));
+        Assert.Equal(0, errors);
+        Assert.Equal(0, violations);
+        Assert.True(reads > 10, $"reads={reads}");
+        db.CheckIntegrity();
+    }
 }

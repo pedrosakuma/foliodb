@@ -51,11 +51,11 @@ internal sealed class Pager : IDisposable
     private Exception? _flushFailure;
     private ulong _chain;
     private uint _salt1, _salt2, _checkpointSeq;
-    // Readers register without the gate (Dekker-style): a reader increments _activeReaders and then checks
-    // _checkpointing; a checkpoint sets _checkpointing and then checks _activeReaders. Both are full fences, so at
-    // least one side sees the other. A reader that sees a checkpoint backs out and registers under the gate, which
-    // the checkpoint holds until it has reset the WAL.
-    private int _activeReaders;
+    // Readers register without the gate (Dekker-style): a reader enters _readers and then checks _checkpointing; a
+    // checkpoint sets _checkpointing and then checks _readers.Active. Both are full fences, so at least one side sees
+    // the other. A reader that sees a checkpoint backs out and registers under the gate, which the checkpoint holds
+    // until it has reset the WAL. The epochs also tell the cache when evicted pages can be reused.
+    private readonly ReaderEpoch _readers = new();
     private int _checkpointing;
     private volatile bool _disposed;
 
@@ -82,7 +82,7 @@ internal sealed class Pager : IDisposable
         PageSize = pageSize;
         _options = options;
         _frameSize = FrameHeaderSize + pageSize;
-        _cache = new PageCache(options.CacheSizePages);
+        _cache = new PageCache(options.CacheSizePages, _readers, pageSize);
     }
 
     public static Pager Open(string path, FolioOptions options)
@@ -142,21 +142,22 @@ internal sealed class Pager : IDisposable
 
     // ---------------------------------------------------------------- readers / snapshots
 
-    public long BeginRead()
+    /// <summary>Registers a snapshot reader; pass <paramref name="slot"/> to <see cref="EndRead"/>.</summary>
+    public long BeginRead(out int slot)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        Interlocked.Increment(ref _activeReaders);
+        slot = _readers.Enter();
         if (_disposed)
         {
-            Interlocked.Decrement(ref _activeReaders);
+            _readers.Exit(slot);
             throw new ObjectDisposedException(GetType().FullName);
         }
         if (Volatile.Read(ref _checkpointing) == 0) return Volatile.Read(ref _committedFrames);
-        Interlocked.Decrement(ref _activeReaders);
+        _readers.Exit(slot);
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            Interlocked.Increment(ref _activeReaders);
+            slot = _readers.Enter();
             return _committedFrames;
         }
     }
@@ -166,22 +167,19 @@ internal sealed class Pager : IDisposable
     /// <paramref name="seenSeq"/> is what the writer must wait for (<see cref="WaitDurable"/>) before it completes,
     /// even without changes of its own, so nothing it read can vanish after it returns.
     /// </summary>
-    public long BeginWrite(out long seenSeq)
+    public long BeginWrite(out long seenSeq, out int slot)
     {
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ThrowIfFlushFailed();
-            Interlocked.Increment(ref _activeReaders);
+            slot = _readers.Enter();
             seenSeq = _appendedSeq;
             return _writtenFrames;
         }
     }
 
-    public void EndRead()
-    {
-        Interlocked.Decrement(ref _activeReaders);
-    }
+    public void EndRead(int slot) => _readers.Exit(slot);
 
     public long WalFrameCount
     {
@@ -198,7 +196,7 @@ internal sealed class Pager : IDisposable
         long cacheKey = frame > 0 ? frame : -(long)pgno - 1;
         if (_cache.TryGet(cacheKey, out var data)) return data;
 
-        data = new byte[PageSize];
+        data = _cache.RentPage();
         if (frame > 0)
         {
             int n = RandomAccess.Read(_walHandle, data, FrameOffset(frame) + FrameHeaderSize);
@@ -206,7 +204,8 @@ internal sealed class Pager : IDisposable
         }
         else
         {
-            RandomAccess.Read(_dbHandle, data, (long)pgno * PageSize); // pages past EOF read as zeros
+            int n = RandomAccess.Read(_dbHandle, data, (long)pgno * PageSize);
+            if (n < PageSize) data.AsSpan(Math.Max(n, 0)).Clear(); // pages past EOF read as zeros
         }
         _cache.Add(cacheKey, data);
         return data;
@@ -426,7 +425,7 @@ internal sealed class Pager : IDisposable
     public bool TryCheckpoint()
     {
         // Readers block a checkpoint anyway: don't fsync under the write lock for nothing (it would serialize commits).
-        if (Volatile.Read(ref _activeReaders) > 0) return false;
+        if (_readers.Active > 0) return false;
         FlushWritten();
         lock (_gate)
         {
@@ -438,7 +437,7 @@ internal sealed class Pager : IDisposable
 
     private bool CheckpointLocked()
     {
-        if (Volatile.Read(ref _activeReaders) > 0) return false;
+        if (_readers.Active > 0) return false;
         if (_committedFrames == 0) return true;
 
         var pgnos = _walIndex.Keys.ToArray();
