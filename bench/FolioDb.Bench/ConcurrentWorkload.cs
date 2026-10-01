@@ -57,15 +57,23 @@ public static class ConcurrentWorkload
             throw new ArgumentException("Sharding, batching and fairness are separate experiments.");
         int seconds = args.Length > 0 ? int.Parse(args[0], CultureInfo.InvariantCulture) : 3;
         int repeats = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 3;
-        if (args.Length > 2 || seconds is < 1 or > 60 || repeats is < 1 or > 10)
-            throw new ArgumentException("Usage: --concurrency | --sharding | --batching | --fairness [seconds:1..60] [repeats:1..10]");
+        var fairnessMode = SynchronousMode.Full;
+        if (fairness && args.Length > 2)
+            fairnessMode = args[2] switch
+            {
+                "full" => SynchronousMode.Full,
+                "normal" => SynchronousMode.Normal,
+                _ => throw new ArgumentException("Fairness durability must be full or normal."),
+            };
+        if (args.Length > (fairness ? 3 : 2) || seconds is < 1 or > 60 || repeats is < 1 or > 10)
+            throw new ArgumentException("Usage: --concurrency | --sharding | --batching [seconds:1..60] [repeats:1..10] | --fairness [seconds] [repeats] [full|normal]");
         if (fairness) FifoAdmission.Verify();
         Console.WriteLine("# Closed-loop; dedicated threads; 10k docs; 1KB payload; hot 256 IDs; $inc one Int64, no secondary index.");
         Console.WriteLine("# AutoCheckpointFrames=1000; BusyTimeout=1s; sampled WAL peak every 50ms; fresh DB per trial.");
         Console.WriteLine("# Latency in microseconds; histogram upper bounds <=2% plus 0.02us; service includes commit/checkpoint.");
         if (sharding) Console.WriteLine("# Experimental integer-only id % shards routing; 1/2/4 independent files on same device; total cache=4096 pages; no cross-shard guarantees.");
         if (batching) Console.WriteLine("# Explicit batches of 1/8/32 updates per atomic transaction, single file; no request-arrival/batch-fill delay modeled.");
-        if (fairness) Console.WriteLine("# Full only; direct vs external FIFO vs integrated FIFO admission; 1s admission timeout.");
+        if (fairness) Console.WriteLine($"# {fairnessMode} only; direct vs external FIFO vs integrated FIFO admission; 1s admission timeout.");
         Console.WriteLine("# writes_s and writer_min/max count successful transactions; updates_s counts committed increments; write_* latency is per whole transaction.");
         Console.WriteLine("# " + System.Runtime.InteropServices.RuntimeInformation.FrameworkDescription
             + "; CPUs=" + Environment.ProcessorCount + "; temp=" + Path.GetTempPath());
@@ -77,7 +85,7 @@ public static class ConcurrentWorkload
         {
             int[] shardCounts = sharding ? [1, 2, 4] : [1];
             int[] batchSizes = batching ? [1, 8, 32] : [1];
-            SynchronousMode[] modes = fairness ? [SynchronousMode.Full] : [SynchronousMode.Full, SynchronousMode.Normal];
+            SynchronousMode[] modes = fairness ? [fairnessMode] : [SynchronousMode.Full, SynchronousMode.Normal];
             string[] admissions = fairness ? ["direct", "fifo", "integrated"] : ["direct"];
             var configurations = shardCounts.SelectMany(shards => batchSizes.SelectMany(batchSize =>
                 modes.SelectMany(mode => admissions.Select(fifo => (mode, shards, batchSize, fifo))))).ToArray();

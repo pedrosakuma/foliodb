@@ -100,6 +100,71 @@ public sealed class WriterAdmissionTests
     }
 
     [Fact]
+    public async Task ExpiredSpinningHeadPromotesSuccessorsInOrder()
+    {
+        // The first two waiters spin before parking; when the head expires, the queue must still be served in order.
+        var gate = new WriterLock(WriterAdmissionMode.Fifo);
+        Assert.True(gate.Wait(TimeSpan.Zero));
+        var order = new List<int>();
+        var tasks = new List<Task>();
+        try
+        {
+            var expired = Run(() => Assert.False(gate.Wait(TimeSpan.FromMilliseconds(50))));
+            Until(() => gate.WaitingCount == 1);
+            for (int i = 0; i < 3; i++)
+            {
+                int id = i;
+                tasks.Add(Run(() =>
+                {
+                    Assert.True(gate.Wait(TimeSpan.FromSeconds(10)));
+                    try { order.Add(id); }
+                    finally { gate.Release(); }
+                }));
+                Until(() => gate.WaitingCount == id + 2);
+            }
+            await expired.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            Assert.Equal(3, gate.WaitingCount);
+        }
+        finally { gate.Release(); }
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+        Assert.Equal([0, 1, 2], order);
+        Assert.Equal(0, gate.WaitingCount);
+    }
+
+    [Fact]
+    public void InterruptedWakeAfterHandoffStillWakesTheGrantedWaiter()
+    {
+        var gate = new WriterLock(WriterAdmissionMode.Fifo);
+        Assert.True(gate.Wait(TimeSpan.Zero));
+        using var acquired = new ManualResetEventSlim();
+        var waiter = new Thread(() =>
+        {
+            if (gate.Wait(Timeout.InfiniteTimeSpan)) acquired.Set();
+        }) { IsBackground = true };
+        waiter.Start();
+        Until(() => gate.WaitingCount == 1);
+        Thread.Sleep(50); // past the spin budget: the waiter is parked
+        int calls = 0;
+        gate.TestBeforeSignal = () => { if (Interlocked.Increment(ref calls) == 1) throw new ThreadInterruptedException(); };
+        Exception? pending = null;
+        var releaser = new Thread(() =>
+        {
+            gate.Release();
+            try { Thread.Sleep(1); }
+            catch (ThreadInterruptedException e) { pending = e; }
+        });
+        releaser.Start();
+        releaser.Join();
+        Assert.IsType<ThreadInterruptedException>(pending); // the interrupt is deferred, not swallowed
+        Assert.True(acquired.Wait(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken));
+        waiter.Join();
+        gate.TestBeforeSignal = null;
+        gate.Release();
+        Assert.True(gate.Wait(TimeSpan.Zero));
+        gate.Release();
+    }
+
+    [Fact]
     public async Task TimeoutReleaseRacesDoNotLeakOrDoubleAdmit()
     {
         var gate = new WriterLock(WriterAdmissionMode.Fifo);

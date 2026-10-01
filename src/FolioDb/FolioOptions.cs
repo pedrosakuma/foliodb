@@ -19,7 +19,11 @@ public enum WriterAdmissionMode
 {
     /// <summary>Existing semaphore-based admission; ordering is not guaranteed.</summary>
     Default,
-    /// <summary>Admit queued callers in FIFO order. May trade throughput for more even progress.</summary>
+    /// <summary>
+    /// Admit queued callers in FIFO order, handing the lock directly to the next one. The next two queued callers
+    /// spin briefly instead of blocking (at most two spinning threads per database), trading some CPU while
+    /// contended for even progress at throughput comparable to <see cref="Default"/>.
+    /// </summary>
     Fifo,
 }
 

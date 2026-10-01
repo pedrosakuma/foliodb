@@ -841,7 +841,8 @@ These results do not justify silently merging requests into one transaction or w
 ### Experimental FIFO writer admission
 
 ```sh
-dotnet run -c Release --project bench/FolioDb.Bench -- --fairness 3 3
+dotnet run -c Release --project bench/FolioDb.Bench -- --fairness 3 3          # Full
+dotnet run -c Release --project bench/FolioDb.Bench -- --fairness 3 3 normal   # Normal
 ```
 
 This compares direct `BeginTransaction()` with a **benchmark-only external FIFO gate**, on one file, `Full`
@@ -925,6 +926,39 @@ end in a timeout and are excluded from that percentile. The integrated and exter
 similar under contention, but shared-host variation remains substantial (including uncontended runs);
 these results do not establish exact overhead or a universal latency improvement. Default admission is unchanged
 unless the caller explicitly opts in.
+
+#### FIFO handoff with spinning successors
+
+The integrated FIFO originally used one monitor and `PulseAll`: on every release all waiters woke, and the lock
+then sat idle until the head was scheduled. Waking a blocked thread costs tens of microseconds on this host
+(WSL2/Hyper-V; measured ~31 us inside `Release` with 4 writers, versus 0.1 us uncontended), which is longer than a
+whole `Normal` update transaction (~30–40 us). The lock now:
+
+- hands itself **directly** to the queue head on release (no window where it is free, so no barging);
+- lets the **first two** waiters spin for up to ~200 us before parking on their own monitor (at most two spinning
+  threads per database; none on single-CPU machines);
+- has the releaser wake the new second waiter **after** the handoff, so its wake latency overlaps the new holder's
+  transaction instead of the next handoff. With only the head spinning, about half of all grants still found the
+  next waiter asleep; with two, about a fifth did.
+
+A wake that is interrupted after a grant is retried, and the interrupt is re-raised afterwards, so a granted
+waiter can't be left parked. Default (semaphore) admission is unchanged.
+
+`--fairness 3 1 normal`, before vs after, medians of two interleaved runs (updates/s):
+
+| Writers / readers | Default | Integrated FIFO before | Integrated FIFO after | Per-writer min/max after |
+|---|---:|---:|---:|---|
+| 1 / 0 | 26,858 | 25,034 | 26,795 | — |
+| 4 / 0 | 13,414 | 4,089 | 17,302 (4.2×) | 13,007 / 13,195 |
+| 4 / 4 | 8,857 | 3,100 | 10,096 (3.3×) | 7,752 / 7,786 |
+| 16 / 0 | 13,640 | 1,124 | 13,862 (12×) | 2,653 / 2,657 |
+| 16 / 4 | 8,711 | 910 | 7,999 (8.8×) | 1,620 / 1,625 |
+
+Default's per-writer spread in the same runs was 1,280 / 3,710 at 16 writers. In `Full` the fsync dominates
+and the change was within noise (0.84–1.11×). The cost is CPU while contended: in a 4-second 4-writer probe,
+user CPU time was ~2.5× Default's (about one extra core busy). An upper bound with all waiters spinning reached
+the single-writer rate (~30k updates/s with 4 writers) but burns a core per waiter, so it was not adopted;
+threads that do sleep resume on cold caches (their update work took ~28 us instead of ~11 us).
 
 ### Group commit (`Full`)
 
