@@ -67,6 +67,24 @@ public sealed class Collection
             return ids;
         }, atomic: items.Count <= 1);
 
+    /// <summary>
+    /// Replaces the document with <paramref name="id"/> by <paramref name="bytes"/>, serialized with that <c>_id</c>
+    /// as a top-level field. Same outcome as <c>ReplaceOne({_id: id}, replacement(), upsert)</c>; the
+    /// <see cref="Document"/> is only built when the stored <c>_id</c> is not byte-identical to the new one.
+    /// </summary>
+    internal UpdateResult ReplaceByIdSerialized(DocValue id, byte[] bytes, bool upsert, Func<Document> replacement) =>
+        Write(tx =>
+        {
+            var meta = upsert ? tx.GetOrCreateCollection(Name) : tx.GetCollection(Name);
+            if (meta is null) return new UpdateResult(0, 0, null);
+            if (!CollectionEngine.TryCopyById(tx, meta, id, out var idKey, out var stored))
+                return new UpdateResult(0, 0, upsert ? CollectionEngine.InsertSerialized(tx, meta, id, bytes) : (DocValue?)null);
+            var newBytes = CollectionEngine.StartsWithSameId(stored, bytes)
+                ? bytes
+                : UpdateApplier.ApplyReplacement(stored, replacement());
+            return new UpdateResult(1, CollectionEngine.Replace(tx, meta, idKey, stored, newBytes) ? 1 : 0, null);
+        }, atomic: true);
+
     /// <summary>Inserts all documents atomically (all or nothing when used outside an explicit transaction).</summary>
     public IReadOnlyList<DocValue> InsertMany(IEnumerable<Document> documents)
     {

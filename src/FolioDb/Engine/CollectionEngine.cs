@@ -381,6 +381,30 @@ internal static class CollectionEngine
             : null;
     }
 
+    /// <summary>Copies the encoded key and stored bytes of the document with <paramref name="id"/>, if any.</summary>
+    public static bool TryCopyById(EngineTx tx, CollectionMeta meta, DocValue id, out byte[] idKey, out byte[] bytes)
+    {
+        idKey = KeyEncoder.Encode(id);
+        if (new BTree(tx.Storage, meta.PrimaryRoot).TryGet(idKey, out var stored))
+        {
+            bytes = stored.ToArray();
+            return true;
+        }
+        bytes = [];
+        return false;
+    }
+
+    /// <summary>
+    /// True when <paramref name="replacement"/> starts with an <c>_id</c> byte-identical to the one in
+    /// <paramref name="stored"/>, i.e. it already is what a whole-document replacement would store.
+    /// </summary>
+    public static bool StartsWithSameId(ReadOnlySpan<byte> stored, ReadOnlySpan<byte> replacement)
+    {
+        if (replacement.Length < 9 || replacement[5] != 3 || !replacement.Slice(6, 3).SequenceEqual("_id"u8)) return false;
+        return new RawDocument(stored).TryGetField("_id"u8, out var a) && new RawDocument(replacement).TryGetField("_id"u8, out var b)
+            && a.Type == b.Type && a.Data.SequenceEqual(b.Data);
+    }
+
     /// <summary>
     /// Zero-copy point lookup. The view aliases transaction page memory (or, for documents spanning several overflow
     /// pages, one freshly assembled buffer); callers must finish with it before the transaction is mutated or completed.

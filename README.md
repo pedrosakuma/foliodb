@@ -409,7 +409,10 @@ write to the database; such writes throw `InvalidOperationException`, as in any 
 For writes it emits `WriteTo(T, DocumentWriter)`, which serializes the members straight into the stored format.
 Typed `Insert`/`InsertMany` use it (before the write transaction starts, like `ToDocument` did) and store exactly
 the bytes `Insert(ToDocument(x))` would, including a generated `ObjectId` written first when the entity has no
-`_id`. `ReplaceOne` still goes through `ToDocument`. Hand-written implementations inherit a default `WriteTo` that
+`_id`. Typed `Update` uses it too: it looks the document up by primary key and stores the new bytes as they are when
+they start with the stored `_id` (same type and bytes), which is exactly what `ReplaceOne({_id}, ToDocument(x))` would
+store; otherwise (an `_id` stored later in the document or with another numeric type, a top-level `$` field name, an
+`_id` that reads as an operator document, a serialization error) it falls back to that `Document` path. Hand-written implementations inherit a default `WriteTo` that
 writes `ToDocument(value)`; an override must write each field once (a repeated top-level `_id` is rejected).
 
 ### Options
@@ -1327,6 +1330,11 @@ a nested entity, 200,000 inserts in transactions of 1,000, commit excluded, inte
 | Time, index on `city` | ~2.87-2.96 µs | **~2.22-2.23 µs** |
 
 Allocation figures are reproducible; times are relative to a shared host.
+
+Typed `Update` (a whole-document replace by `_id`) takes the same route: one primary lookup, then the `WriteTo`
+bytes are stored directly, instead of `ToDocument`, a filter, a planned match and a re-serialization with the stored
+`_id`. Same entity shape, 20,000 updates per transaction: **2.6 KB → 1.05 KB** allocated per update without
+secondary indexes and **4.6 KB → 3.0 KB** with an index on `city`.
 
 ## Limitations
 

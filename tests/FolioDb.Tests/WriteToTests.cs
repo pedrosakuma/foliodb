@@ -16,6 +16,20 @@ public partial class Reentrant
     public int Nested => DocumentWriter.Serialize(new Outer.Nested { Value = Name }, out _).Length;
 }
 
+[FolioDocument]
+public partial class DocKeyed
+{
+    [FolioId] public Document Id { get; set; } = new();
+    public int N { get; set; }
+}
+
+[FolioDocument]
+public partial class Dollar
+{
+    public int Id { get; set; }
+    [FolioField("$x")] public int X { get; set; }
+}
+
 /// <summary>Hand-written WriteTo implementations, including invalid ones.</summary>
 public sealed class Scripted : IFolioDocument<Scripted>
 {
@@ -178,6 +192,86 @@ public class WriteToTests
         Assert.Equal(2, db.GetCollection<Person>("people").Count());
         Assert.Throws<DuplicateKeyException>(() => db.GetCollection<Person>("people").InsertMany([new Person { Id = 3 }, new Person { Id = 2 }]));
         Assert.Equal(2, db.GetCollection<Person>("people").Count());
+        db.CheckIntegrity();
+    }
+
+    private static string Outcome(Func<object?> action)
+    {
+        try { return "ok " + action(); }
+        catch (Exception e) { return e.GetType().Name + " " + e.Message; }
+    }
+
+    private static string Stored(Collection c) =>
+        string.Join("|", c.Find().Select(d => d.ToJson() + ":" + Convert.ToHexString(DocumentSerializer.Serialize(d))));
+
+    /// <summary>Update(T) must behave like ReplaceOne({_id}, ToDocument(entity), upsert): outcome and stored bytes.</summary>
+    private static void SameUpdate<T>(FolioDatabase db, string seed, T entity, bool upsert = false, string? index = null) where T : IFolioDocument<T>
+    {
+        var name = Guid.NewGuid().ToString("N");
+        var typed = db.GetCollection<T>("n" + name);
+        var reference = db.GetCollection("o" + name);
+        foreach (var c in new[] { typed.Untyped, reference })
+        {
+            if (index is not null) c.CreateIndex(index, unique: true);
+            foreach (var json in seed.Split(';', StringSplitOptions.RemoveEmptyEntries)) c.Insert(json);
+        }
+
+        var actual = Outcome(() => typed.Update(entity, upsert));
+        var expected = Outcome(() =>
+        {
+            var doc = T.ToDocument(entity);
+            if (!doc.TryGetValue("_id", out var id) || id.IsNull) throw new FolioException("Entity has no _id.");
+            var r = reference.ReplaceOne(new Document { ["_id"] = id }, doc, upsert);
+            return r.MatchedCount > 0 || r.UpsertedId is not null;
+        });
+        Assert.Equal(expected, actual);
+        Assert.Equal(Stored(reference), Stored(typed.Untyped));
+    }
+
+    [Fact]
+    public void Typed_updates_match_replace_one()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var ana = new Person { Id = 1, Name = "Ana", Age = 30, Tags = ["t"] };
+
+        SameUpdate(db, "", ana);
+        SameUpdate(db, "", ana, upsert: true);
+        SameUpdate(db, "{ _id: 2, Name: 'x' }", ana, upsert: true);
+        SameUpdate(db, "{ _id: 1, Name: 'x' }", ana);
+        SameUpdate(db, "{ Name: 'x', _id: 1 }", ana);
+        SameUpdate(db, "{ _id: { $numberLong: '1' }, Name: 'x' }", ana);
+        SameUpdate(db, "{ _id: 1.0, Name: 'x' }", ana, upsert: true);
+        SameUpdate(db, "{ _id: '1', Name: 'x' }", ana, upsert: true);
+        SameUpdate(db, "{ _id: 1, Name: 'Ana', yrs: 30, Key: { $uuid: '00000000-0000-0000-0000-000000000000' } }", ana);
+        SameUpdate(db, "{ _id: 1, Name: 'x' }; { _id: 2, Name: 'Ana' }", ana, index: "Name");
+        SameUpdate(db, "{ _id: 1, Name: 'x' }; { _id: 2, Name: 'y' }", ana, index: "Name");
+        SameUpdate(db, "{ _id: { X: 1, Y: 0 }, N: 1 }", new KeyedByPoint { Key = new Point { X = 1 }, N = 2 });
+        SameUpdate(db, "{ _id: 1 }", new Dollar { Id = 1, X = 2 }, upsert: true);
+        SameUpdate(db, "", new Address("s", "c"), upsert: true);
+        SameUpdate(db, "", new Wide(), upsert: true);
+        var longKey = new Wide { Places = new() { [new string('n', 300)] = new Address("s", "c") } };
+        SameUpdate(db, "", longKey);
+        SameUpdate(db, "", longKey, upsert: true);
+        SameUpdate(db, "", new Address("s", "c") { Zip = new string('z', 1) });
+        SameUpdate(db, "{ _id: 5 }", new DocKeyed { Id = Document.Parse("{ $eq: 5 }") });
+        SameUpdate(db, "", new DocKeyed { Id = Document.Parse("{ $eq: 5 }") }, upsert: true);
+        SameUpdate(db, "{ _id: 5 }", new DocKeyed { Id = Document.Parse("{ $x: 1 }") });
+        SameUpdate(db, "{ _id: { a: 1 } }", new DocKeyed { Id = Document.Parse("{ a: 1 }"), N = 2 });
+
+        // Unchanged replacement: matched but not modified, so Update still reports true.
+        var people = db.GetCollection<Person>("people");
+        Assert.True(people.Update(ana, upsert: true));
+        Assert.True(people.Update(ana));
+
+        using (var tx = db.BeginTransaction())
+        {
+            var p = tx.GetCollection<Person>("people");
+            Assert.True(p.Update(new Person { Id = 1, Name = "Bia" }));
+            Assert.False(p.Update(new Person { Id = 9 }));
+            Assert.Equal("Bia", p.FindById(1)!.Name);
+        }
+        Assert.Equal("Ana", people.FindById(1)!.Name);
         db.CheckIntegrity();
     }
 }

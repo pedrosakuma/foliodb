@@ -89,6 +89,30 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     /// <summary>Replaces the stored document with the same <c>_id</c>; inserts it when <paramref name="upsert"/> is set.</summary>
     public bool Update(T entity, bool upsert = false)
     {
+        // Serialized straight to the stored format: a replacement keeps the stored _id first, as WriteTo writes it.
+        // Serialization errors (long names, deep nesting), operator-like fields or ids and array ids keep the Document
+        // path, where they surface (or not, when nothing matches) exactly as before.
+        byte[]? bytes;
+        DocValue id;
+        bool operatorName;
+        try { bytes = DocumentWriter.SerializeReplacement(entity, out id, out operatorName); }
+        catch (FolioException) { return UpdateViaDocument(entity, upsert); }
+        if (bytes is null || id.IsNull) throw new FolioException("Entity has no _id.");
+        if (operatorName || id.Type == DocType.Array || IsOperatorDocument(id)) return UpdateViaDocument(entity, upsert);
+        var r = Untyped.ReplaceByIdSerialized(id, bytes, upsert, () => T.ToDocument(entity));
+        return r.MatchedCount > 0 || r.UpsertedId is not null;
+    }
+
+    // The filter {_id: id} reads such an id as an operator document ({$eq: 5}, {$x: 1}).
+    private static bool IsOperatorDocument(DocValue id)
+    {
+        if (id.Type != DocType.Document) return false;
+        foreach (var (key, _) in id.AsDocument) return key.StartsWith('$');
+        return false;
+    }
+
+    private bool UpdateViaDocument(T entity, bool upsert)
+    {
         var doc = T.ToDocument(entity);
         if (!doc.TryGetValue("_id", out var id) || id.IsNull)
             throw new FolioException("Entity has no _id.");

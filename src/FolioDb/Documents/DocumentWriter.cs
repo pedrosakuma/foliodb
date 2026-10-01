@@ -21,6 +21,7 @@ public sealed class DocumentWriter
     private bool _hasRootId;
     private DocValue _rootId;
     private int _pendingRootIdStart;
+    private bool _rootOperatorName;
     private bool _inUse;
 
     private DocumentWriter() { }
@@ -30,7 +31,17 @@ public sealed class DocumentWriter
     /// top-level <c>_id</c>, an <see cref="ObjectId"/> is generated and stored as the first field, as
     /// <see cref="Collection.Insert(Document)"/> does.
     /// </summary>
-    internal static byte[] Serialize<T>(T entity, out DocValue id) where T : IFolioDocument<T>
+    internal static byte[] Serialize<T>(T entity, out DocValue id) where T : IFolioDocument<T> =>
+        Serialize(entity, generateId: true, out id, out _)!;
+
+    /// <summary>
+    /// Serializes a replacement for <c>Collection&lt;T&gt;.Update</c>: no <c>_id</c> is generated (returns null when the
+    /// entity writes none), and <paramref name="rootOperatorName"/> reports a top-level field name starting with <c>$</c>.
+    /// </summary>
+    internal static byte[]? SerializeReplacement<T>(T entity, out DocValue id, out bool rootOperatorName) where T : IFolioDocument<T> =>
+        Serialize(entity, generateId: false, out id, out rootOperatorName);
+
+    private static byte[]? Serialize<T>(T entity, bool generateId, out DocValue id, out bool rootOperatorName) where T : IFolioDocument<T>
     {
         if (entity is null) throw new ArgumentNullException(nameof(entity));
         // A getter that serializes another entity on this thread gets its own writer.
@@ -46,17 +57,24 @@ public sealed class DocumentWriter
             w._hasRootId = false;
             w._rootId = default;
             w._pendingRootIdStart = -1;
+            w._rootOperatorName = false;
 
             T.WriteTo(entity, w);
             if (w._level != 0) throw new InvalidOperationException("WriteTo left a nested document or array open.");
             w._buf.WriteByte(0);
             w._buf.PatchInt32(0, w._buf.Length);
 
-            byte[] bytes;
+            rootOperatorName = w._rootOperatorName;
+            byte[]? bytes;
             if (w._hasRootId)
             {
                 id = w._rootId;
                 bytes = w._buf.ToArray();
+            }
+            else if (!generateId)
+            {
+                id = DocValue.Null;
+                bytes = null;
             }
             else
             {
@@ -188,6 +206,7 @@ public sealed class DocumentWriter
             string name = Encoding.UTF8.GetString(utf8Name);
             throw new FolioException($"Field name '{name[..Math.Min(32, name.Length)]}…' exceeds {DocumentSerializer.MaxNameBytes} UTF-8 bytes.");
         }
+        if (_level == 0 && utf8Name.Length > 0 && utf8Name[0] == (byte)'$') _rootOperatorName = true;
         _buf.WriteByte((byte)type);
         _buf.WriteByte((byte)utf8Name.Length);
         _buf.Write(utf8Name);
