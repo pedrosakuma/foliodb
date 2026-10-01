@@ -1515,6 +1515,28 @@ Of the 8-thread all-cached point read, CLOCK alone gave 2.0× and the `mark == 0
 `--concurrency` workload, readers-only runs went 2.8× faster; with writers, reads went 1.24-1.44× faster and read
 p99 dropped from 32-44 µs to 9-19 µs, with updates unchanged or better (1.0-1.4×, Full-mode runs are fsync-noisy).
 
+### Lock-free WAL index lookups
+
+Every page read with WAL frames in its snapshot looked up the page's frame list under the pager's gate lock, so
+readers serialized on it whenever the WAL was not empty, which is always the case with writers active. The index is
+now a `ConcurrentDictionary` of per-page frame arrays read without locks: only the single writer appends (it
+publishes a grown array before the new count, and readers load the count before the array), frames past a reader's
+mark are ignored by the search, and a checkpoint clears the index only while no reader holds a snapshot.
+
+Targeted probe: 50k documents with every page in the WAL (automatic checkpoints off), `FindById` from 8 threads,
+interleaved runs:
+
+| Scenario | Before | After |
+|---|---:|---:|
+| 8 readers | 620k/s (same as 1 reader) | **1.85M/s (3.0×)** |
+| 8 readers + 1 writer: reads | 510k/s | **1.44M/s (2.8×)** |
+| 8 readers + 1 writer: writer updates | 45-68k | **75-118k (~1.7×)** |
+| 1 reader, or writer alone | ≈ | ≈ |
+
+In the mixed `--concurrency` workload the result was within noise on a quiet host. On an oversubscribed host (load
+average 23-32), the scenarios with readers and writers read 2.4-4.5× faster, because a preempted thread no longer
+holds a lock every other reader needs.
+
 ### Memory-mapped reads: measured, not adopted
 
 With the same 151 MiB database and a 16 MiB cache (~9.5× smaller), a prototype that served cache misses from a

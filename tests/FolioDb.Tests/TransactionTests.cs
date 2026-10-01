@@ -234,4 +234,55 @@ public class TransactionTests
         Assert.True(reads > 10, $"reads={reads}");
         db.CheckIntegrity();
     }
+
+    [Fact]
+    public async Task Snapshots_stay_stable_while_the_wal_index_grows_without_checkpoints()
+    {
+        // No checkpoints: every page read goes through the WAL index while the writer keeps appending frames
+        // (and growing per-page frame lists) concurrently with lock-free lookups.
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 0, Synchronous = SynchronousMode.Off });
+        var accounts = db.GetCollection("accounts");
+        for (int i = 0; i < 50; i++) accounts.Insert(new Document { ["_id"] = i, ["balance"] = 100, ["version"] = 0 });
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        long violations = 0, reads = 0, transfers = 0;
+        var writer = Task.Run(() =>
+        {
+            var rnd = new Random(1);
+            while (!cts.IsCancellationRequested)
+            {
+                int from = rnd.Next(50), to = rnd.Next(50);
+                using var tx = db.BeginTransaction();
+                var c = tx.GetCollection("accounts");
+                c.UpdateOne(new Document { ["_id"] = from }, Document.Parse("{ $inc: { balance: -3, version: 1 } }"));
+                c.UpdateOne(new Document { ["_id"] = to }, Document.Parse("{ $inc: { balance: 3, version: 1 } }"));
+                tx.Commit();
+                transfers++;
+            }
+        }, TestContext.Current.CancellationToken);
+        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        {
+            long lastVersions = 0;
+            while (!cts.IsCancellationRequested)
+            {
+                using var snap = db.BeginSnapshot();
+                var first = snap.GetCollection("accounts").Find();
+                Thread.SpinWait(2000);
+                var second = snap.GetCollection("accounts").Find();
+                long versions = first.Sum(d => d["version"].AsInt64);
+                if (first.Count != 50 || first.Sum(d => d["balance"].AsInt64) != 5000) Interlocked.Increment(ref violations);
+                if (versions != second.Sum(d => d["version"].AsInt64) || versions < lastVersions) Interlocked.Increment(ref violations);
+                lastVersions = versions;
+                Interlocked.Increment(ref reads);
+            }
+        }, TestContext.Current.CancellationToken)).ToList();
+
+        await Task.WhenAll(readers.Append(writer));
+        Assert.Equal(0, violations);
+        Assert.True(transfers > 10, $"transfers={transfers}");
+        Assert.True(reads > 10, $"reads={reads}");
+        Assert.True(db.Checkpoint());
+        db.CheckIntegrity();
+    }
 }

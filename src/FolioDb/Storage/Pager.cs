@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.IO.Hashing;
 using System.Security.Cryptography;
 using Microsoft.Win32.SafeHandles;
@@ -37,7 +38,9 @@ internal sealed class Pager : IDisposable
     private readonly int _frameSize;
 
     private readonly Lock _gate = new();
-    private readonly Dictionary<uint, List<long>> _walIndex = new();
+    // Page number -> its WAL frames in ascending order. Read without locks: frames are only appended (by the single
+    // writer, under _gate) between checkpoints, and a checkpoint clears it only while no reader holds a snapshot.
+    private readonly ConcurrentDictionary<uint, FrameList> _walIndex = new();
     private long _committedFrames;   // durable and visible to readers
     private long _writtenFrames;     // appended to the WAL; visible to the writer
     // Frames ever appended / made durable. Monotonic (unlike frame numbers, which restart at each checkpoint).
@@ -176,13 +179,7 @@ internal sealed class Pager : IDisposable
     {
         long frame = 0;
         // Frame numbers start at 1, so an empty snapshot (mark 0) reads straight from the main file.
-        if (mark > 0)
-        {
-            lock (_gate)
-            {
-                if (_walIndex.TryGetValue(pgno, out var frames)) frame = LatestFrameAtOrBefore(frames, mark);
-            }
-        }
+        if (mark > 0 && _walIndex.TryGetValue(pgno, out var frames)) frame = frames.LatestAtOrBefore(mark);
 
         long cacheKey = frame > 0 ? frame : -(long)pgno - 1;
         if (_cache.TryGet(cacheKey, out var data)) return data;
@@ -201,21 +198,54 @@ internal sealed class Pager : IDisposable
         return data;
     }
 
-    private static long LatestFrameAtOrBefore(List<long> frames, long mark)
+    private void AppendFrame(uint pgno, long frame)
     {
-        int lo = 0, hi = frames.Count - 1;
-        long result = 0;
-        while (lo <= hi)
+        if (!_walIndex.TryGetValue(pgno, out var list)) _walIndex[pgno] = list = new FrameList();
+        list.Append(frame);
+    }
+
+    /// <summary>
+    /// Ascending WAL frame numbers of one page. Single writer appends; readers search without locks. The writer
+    /// publishes a grown array before the count, and a reader loads the count before the array, so the array it
+    /// sees always holds at least that many frames. Frames past a reader's mark are ignored by the search.
+    /// </summary>
+    private sealed class FrameList
+    {
+        private long[] _items = new long[2];
+        private int _count;
+
+        public long Last => _items[_count - 1];
+
+        public void Append(long frame)
         {
-            int mid = (lo + hi) >>> 1;
-            if (frames[mid] <= mark)
+            var items = _items;
+            if (_count == items.Length)
             {
-                result = frames[mid];
-                lo = mid + 1;
+                Array.Resize(ref items, items.Length * 2);
+                Volatile.Write(ref _items, items);
             }
-            else hi = mid - 1;
+            items[_count] = frame;
+            Volatile.Write(ref _count, _count + 1);
         }
-        return result;
+
+        public long LatestAtOrBefore(long mark)
+        {
+            int count = Volatile.Read(ref _count);
+            var items = Volatile.Read(ref _items);
+            int lo = 0, hi = count - 1;
+            long result = 0;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                if (items[mid] <= mark)
+                {
+                    result = items[mid];
+                    lo = mid + 1;
+                }
+                else hi = mid - 1;
+            }
+            return result;
+        }
     }
 
     private long FrameOffset(long frame) => WalHeaderSize + (frame - 1) * _frameSize;
@@ -274,8 +304,7 @@ internal sealed class Pager : IDisposable
             for (int i = 0; i < pages.Count; i++)
             {
                 uint pgno = pages[i].Key;
-                if (!_walIndex.TryGetValue(pgno, out var list)) _walIndex[pgno] = list = new List<long>(2);
-                list.Add(firstFrame + i);
+                AppendFrame(pgno, firstFrame + i);
                 _cache.Add(firstFrame + i, pages[i].Value);
             }
             _writtenFrames = firstFrame + pages.Count - 1;
@@ -390,8 +419,7 @@ internal sealed class Pager : IDisposable
             if (_activeReaders > 0) return false;
             if (_committedFrames == 0) return true;
 
-            var pgnos = new uint[_walIndex.Count];
-            _walIndex.Keys.CopyTo(pgnos, 0);
+            var pgnos = _walIndex.Keys.ToArray();
             Array.Sort(pgnos);
 
             // Latest image of each page, taken from the cache when still resident; runs of
@@ -406,7 +434,7 @@ internal sealed class Pager : IDisposable
                     run.Clear();
                 }
                 if (run.Count == 0) runStart = pgno;
-                run.Add(LatestCommittedImage(_walIndex[pgno][^1]));
+                run.Add(LatestCommittedImage(_walIndex[pgno].Last));
             }
             if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
 
@@ -493,8 +521,7 @@ internal sealed class Pager : IDisposable
             {
                 foreach (var (pgno, fr) in pending)
                 {
-                    if (!_walIndex.TryGetValue(pgno, out var list)) _walIndex[pgno] = list = new List<long>(2);
-                    list.Add(fr);
+                    AppendFrame(pgno, fr);
                 }
                 pending.Clear();
                 _committedFrames = _writtenFrames = f;
