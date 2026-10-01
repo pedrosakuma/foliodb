@@ -44,9 +44,10 @@ public class StorageTests
 
         var key = Key(4); // Exactly one full overflow page.
         for (int i = 0; i < 10; i++) reader.TryGet(key, out _);
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < 100; i++) reader.TryGet(key, out _);
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        long allocated = Allocations.Measure(() =>
+        {
+            for (int i = 0; i < 100; i++) reader.TryGet(key, out _);
+        });
         Assert.Equal(0, allocated);
     }
 

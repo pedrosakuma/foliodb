@@ -18,15 +18,17 @@ public class BorrowedReadTests
         Func<DocumentView, long> callback = static d => d.TryGetValue("n", out var n) ? n.AsInt64 : -1;
         for (int i = 0; i < 100; i++)
             foreach (var id in ids) Assert.True(reader.TryReadById(id, callback, out _));
-        long before = GC.GetAllocatedBytesForCurrentThread();
         long sum = 0;
-        for (int i = 0; i < 100; i++)
-            foreach (var id in ids)
-            {
-                reader.TryReadById(id, callback, out long n);
-                sum += n;
-            }
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        long allocated = Allocations.Measure(() =>
+        {
+            sum = 0;
+            for (int i = 0; i < 100; i++)
+                foreach (var id in ids)
+                {
+                    reader.TryReadById(id, callback, out long n);
+                    sum += n;
+                }
+        });
         Assert.Equal(7000, sum);
         Assert.Equal(0, allocated);
     }
