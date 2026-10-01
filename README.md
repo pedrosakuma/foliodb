@@ -658,6 +658,11 @@ integers, the raw 8/16-byte payload for doubles/decimals. Covered projections re
 entries without hints (written by older versions) fall back to reading the document. Documents fetched through an index
 reuse a B+Tree cursor path instead of descending from the root for every lookup.
 
+`NaN` and `±Infinity` follow MongoDB: every `NaN` payload is the same value (equal to itself, one `_id`), sorts after
+`null` and before `-Infinity`, but is in no numeric range. `$lt`/`$lte` a number never match `NaN`, `$gt`/`$lt: NaN`
+match nothing and `$gte`/`$lte: NaN` match only `NaN`. Index ranges for `$lt`/`$lte` start just above the `NaN` key, so
+scans, indexes (simple, compound, multikey, `_id`) and covered queries agree.
+
 Compound read path (`CompoundIndexBenchmarks`; 10k docs, 512-byte payload, 100 candidates per city,
 10 matches for `{city:42, age:{$gte:30,$lt:40}}`; five measured iterations on a shared host):
 

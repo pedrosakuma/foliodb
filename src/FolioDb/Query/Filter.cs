@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -72,6 +73,7 @@ internal sealed class FieldFilter : Filter
     private readonly DocType _typeFilter;
     private readonly Filter? _elemFilter;
     private readonly bool _elemIsValueFilter;
+    private readonly bool _isNaN;
 
     public FieldFilter(string path, FieldOp op, DocValue value = default, IReadOnlyList<DocValue>? values = null,
         Regex? regex = null, Filter? elemFilter = null, bool elemIsValueFilter = false)
@@ -90,6 +92,7 @@ internal sealed class FieldFilter : Filter
             case FieldOp.Lt:
             case FieldOp.Lte:
                 Key = KeyEncoder.Encode(value);
+                _isNaN = Key.AsSpan().SequenceEqual(KeyEncoder.NaNKey);
                 _matchesMissing = value.IsNull && op is FieldOp.Eq or FieldOp.Gte or FieldOp.Lte;
                 break;
             case FieldOp.In:
@@ -257,25 +260,10 @@ internal sealed class FieldFilter : Filter
             case FieldOp.Eq:
                 return Compare(v, Key!, out _) == 0;
             case FieldOp.Gt:
-            {
-                int c = Compare(v, Key!, out bool sameType);
-                return sameType && c > 0;
-            }
             case FieldOp.Gte:
-            {
-                int c = Compare(v, Key!, out bool sameType);
-                return sameType && c >= 0;
-            }
             case FieldOp.Lt:
-            {
-                int c = Compare(v, Key!, out bool sameType);
-                return sameType && c < 0;
-            }
             case FieldOp.Lte:
-            {
-                int c = Compare(v, Key!, out bool sameType);
-                return sameType && c <= 0;
-            }
+                return TestRange(v);
             case FieldOp.In:
             {
                 var buf = t_scratch ??= new ByteBuffer();
@@ -301,6 +289,28 @@ internal sealed class FieldFilter : Filter
                 return false;
         }
     }
+
+    /// <summary>
+    /// Ranges only match within the same type class. NaN, although its key sorts below every number, is in no
+    /// numeric range: <c>$gt</c>/<c>$lt</c> NaN match nothing and <c>$gte</c>/<c>$lte</c> NaN match only NaN.
+    /// </summary>
+    private bool TestRange(RawValue v)
+    {
+        int c = Compare(v, Key!, out bool sameType);
+        if (!sameType) return false;
+        if (_isNaN) return c == 0 && Op is FieldOp.Gte or FieldOp.Lte;
+        if (Key![0] == KeyEncoder.TagNumber && IsNaN(v)) return false;
+        return Op switch
+        {
+            FieldOp.Gt => c > 0,
+            FieldOp.Gte => c >= 0,
+            FieldOp.Lt => c < 0,
+            _ => c <= 0,
+        };
+    }
+
+    private static bool IsNaN(RawValue v) =>
+        v.Type == DocType.Double && double.IsNaN(BinaryPrimitives.ReadDoubleLittleEndian(v.Data));
 
     /// <summary>Compares the encoded form of <paramref name="v"/> with an encoded constant. Ranges only match within the same type class.</summary>
     private static int Compare(RawValue v, byte[] key, out bool sameType)

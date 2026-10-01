@@ -165,6 +165,13 @@ internal static class KeyEncoder
     // For a fixed d the pair (I, F) is monotonic in x and exact (decimals have at most 28 fractional digits),
     // so equal values share one key and memcmp order is the exact numeric order across all numeric types.
     public const int NumberKeyLength = 18;
+
+    /// <summary>
+    /// Key of every NaN: the smallest number key, so NaN sorts first. Range operators exclude it (it is only equal
+    /// to itself, as in MongoDB); see <see cref="Query.FieldFilter"/> and the query planner's range bounds.
+    /// </summary>
+    public static readonly byte[] NaNKey = Encode(double.NaN);
+
     public const int FractionalNumberKeyLength = NumberKeyLength + 16;
     private const byte NoFraction = 0x00;
     private const byte HasFraction = 0x01;

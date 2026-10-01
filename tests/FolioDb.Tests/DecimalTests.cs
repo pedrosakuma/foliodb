@@ -206,6 +206,70 @@ public class DecimalTests
     }
 
     [Fact]
+    public void NaN_sorts_first_but_is_in_no_numeric_range()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        DocValue otherNaN = BitConverter.Int64BitsToDouble(unchecked((long)0xFFF8_0000_0000_0001UL));
+        DocValue[] values = [double.NaN, double.NegativeInfinity, -1e308, 0, 5, 5.5m, double.PositiveInfinity, otherNaN, DocValue.Null, "a"];
+        string[] colls = ["scan", "simple", "asc", "desc", "ids"];
+        foreach (var name in colls)
+        {
+            var c = db.GetCollection(name);
+            if (name == "simple") c.CreateIndex("v");
+            if (name == "asc") c.CreateIndex(Document.Parse("{ g: 1, v: 1 }"));
+            if (name == "desc") c.CreateIndex(Document.Parse("{ g: 1, v: -1 }"));
+            for (int i = 0; i < values.Length; i++)
+                if (name != "ids" || i != 7) // every NaN is the same _id
+                    c.Insert(name == "ids" ? new Document { ["_id"] = values[i], ["i"] = i } : new Document { ["_id"] = i, ["g"] = 1, ["v"] = values[i] });
+        }
+
+        // Indexes into values. NaN matches only equality and $gte/$lte NaN; ranges never cross into strings or null.
+        var cases = new (string Filter, int[] Expected)[]
+        {
+            ("{ v: NaN }", [0, 7]),
+            ("{ v: { $ne: NaN } }", [1, 2, 3, 4, 5, 6, 8, 9]),
+            ("{ v: { $gt: NaN } }", []),
+            ("{ v: { $lt: NaN } }", []),
+            ("{ v: { $gte: NaN } }", [0, 7]),
+            ("{ v: { $lte: NaN } }", [0, 7]),
+            ("{ v: { $gte: NaN, $lte: NaN } }", [0, 7]),
+            ("{ v: { $gte: NaN, $lt: 5 } }", []),
+            ("{ v: { $lt: 0 } }", [1, 2]),
+            ("{ v: { $lte: -Infinity } }", [1]),
+            ("{ v: { $gte: -Infinity } }", [1, 2, 3, 4, 5, 6]),
+            ("{ v: { $gt: -1, $lte: 5 } }", [3, 4]),
+            ("{ v: { $lt: Infinity } }", [1, 2, 3, 4, 5]),
+            ("{ v: { $gt: 5 } }", [5, 6]),
+            ("{ v: { $in: [NaN, 0] } }", [0, 3, 7]),
+        };
+        foreach (var (filter, expected) in cases)
+            foreach (var name in colls)
+            {
+                var c = db.GetCollection(name);
+                var f = name == "ids" ? filter.Replace("{ v:", "{ _id:") : name is "asc" or "desc" ? filter.Replace("{ v:", "{ g: 1, v:") : filter;
+                var want = name == "ids" ? expected.Where(i => i != 7).ToArray() : expected;
+                var got = c.Find(f).Select(d => name == "ids" ? d["i"].AsInt32 : d["_id"].AsInt32).Order().ToArray();
+                Assert.True(want.SequenceEqual(got), $"{name} {f}: expected [{string.Join(",", want)}], got [{string.Join(",", got)}]");
+                Assert.Equal(want.Length, c.Count(f));
+                if (name != "scan" && !f.Contains("$ne")) Assert.DoesNotContain("COLLSCAN", c.Explain(f).ToString());
+            }
+
+        var multi = db.GetCollection("multi");
+        multi.CreateIndex("v");
+        multi.Insert(Document.Parse("{ _id: 1, v: [NaN, 3] }"));
+        multi.Insert(Document.Parse("{ _id: 2, v: [NaN] }"));
+        Assert.Equal([1], multi.Find("{ v: { $lt: 5 } }").Select(d => d["_id"].AsInt32));
+        Assert.Equal([1, 2], multi.Find("{ v: { $lte: NaN } }").Select(d => d["_id"].AsInt32).Order());
+        Assert.Empty(multi.Find("{ v: { $gt: NaN } }"));
+
+        Assert.Equal([8, 0, 7, 1, 2, 3, 4, 5, 6, 9],
+            db.GetCollection("scan").Find((Document?)null, new FindOptions { Sort = Document.Parse("{ v: 1, _id: 1 }") }).Select(d => d["_id"].AsInt32));
+        Assert.Equal("IXSCAN v_1 (-∞, 0)", db.GetCollection("simple").Explain("{ v: { $lt: 0 } }").ToString().Split('\n')[0].Replace(" covered", ""));
+        db.CheckIntegrity();
+    }
+
+    [Fact]
     public void Decimal_ids_are_exact_primary_keys()
     {
         using var tmp = new TempDb();

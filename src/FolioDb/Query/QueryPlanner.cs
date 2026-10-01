@@ -45,9 +45,14 @@ internal sealed class QueryPlan
         _ => Kind.ToString(),
     };
 
+    /// <summary>False when the lower bound is absent or only the exclusive NaN key that keeps NaN out of a numeric range.</summary>
+    internal bool HasLowerBound =>
+        Lower is not null && (LowerInclusive || !Lower.AsSpan().SequenceEqual(KeyEncoder.NaNKey)
+                              || (Upper is not null && Upper.AsSpan().SequenceEqual(KeyEncoder.NaNKey)));
+
     private string RangeText()
     {
-        string lo = Lower is null ? "(-∞" : (LowerInclusive ? "[" : "(") + DocJson.WriteValue(KeyEncoder.Decode(Lower, out _));
+        string lo = !HasLowerBound ? "(-∞" : (LowerInclusive ? "[" : "(") + DocJson.WriteValue(KeyEncoder.Decode(Lower, out _));
         string hi = Upper is null ? "+∞)" : DocJson.WriteValue(KeyEncoder.Decode(Upper, out _)) + (UpperInclusive ? "]" : ")");
         return lo + ", " + hi;
     }
@@ -89,7 +94,7 @@ internal static class QueryPlanner
             else if (f.Op is FieldOp.Gt or FieldOp.Gte or FieldOp.Lt or FieldOp.Lte && Indexable(f.Value))
             {
                 plan = BuildRange(conjuncts, f, index, primary);
-                score = plan.Lower is not null && plan.Upper is not null ? 60 : 50;
+                score = plan.HasLowerBound && plan.Upper is not null ? 60 : 50;
             }
 
             if (plan is not null && score > bestScore)
@@ -206,25 +211,22 @@ internal static class QueryPlanner
         {
             if (c is not FieldFilter f || f.Path != first.Path || f.Key is null || f.Key[0] != tag || !Indexable(f.Value)) continue;
             if (!combine && !ReferenceEquals(f, first)) continue;
-            switch (f.Op)
+            // NaN keys sort below every number but no numeric range holds NaN (see FieldFilter): $gt/$lt NaN is
+            // (NaN, NaN), $gte/$lte NaN is [NaN, NaN], and an upper bound on a number starts above NaN.
+            bool nan = f.Key.AsSpan().SequenceEqual(KeyEncoder.NaNKey);
+            bool upperOp = f.Op is FieldOp.Lt or FieldOp.Lte;
+            bool inc = f.Op is FieldOp.Gte or FieldOp.Lte;
+            if (nan)
             {
-                case FieldOp.Gt:
-                case FieldOp.Gte:
-                {
-                    bool inc = f.Op == FieldOp.Gte;
-                    int cmp = lower is null ? 1 : f.Key.AsSpan().SequenceCompareTo(lower);
-                    if (cmp > 0 || (cmp == 0 && !inc)) { lower = f.Key; lowerInc = inc; }
-                    break;
-                }
-                case FieldOp.Lt:
-                case FieldOp.Lte:
-                {
-                    bool inc = f.Op == FieldOp.Lte;
-                    int cmp = upper is null ? -1 : f.Key.AsSpan().SequenceCompareTo(upper);
-                    if (cmp < 0 || (cmp == 0 && !inc)) { upper = f.Key; upperInc = inc; }
-                    break;
-                }
+                Tighten(ref lower, ref lowerInc, f.Key, inc, lowerBound: true);
+                Tighten(ref upper, ref upperInc, f.Key, inc, lowerBound: false);
             }
+            else if (upperOp)
+            {
+                Tighten(ref upper, ref upperInc, f.Key, inc, lowerBound: false);
+                if (tag == KeyEncoder.TagNumber) Tighten(ref lower, ref lowerInc, KeyEncoder.NaNKey, false, lowerBound: true);
+            }
+            else Tighten(ref lower, ref lowerInc, f.Key, inc, lowerBound: true);
         }
 
         // Covered when every conjunct is a same-type bound on this field, i.e. all of them were folded into [lower, upper].
@@ -242,6 +244,14 @@ internal static class QueryPlanner
             Upper = upper,
             UpperInclusive = upperInc,
         };
+    }
+
+    /// <summary>Intersects a bound: keeps the higher lower bound (or the lower upper bound); exclusive wins on ties.</summary>
+    private static void Tighten(ref byte[]? bound, ref bool boundInc, byte[] key, bool inc, bool lowerBound)
+    {
+        int cmp = bound is null ? (lowerBound ? 1 : -1) : key.AsSpan().SequenceCompareTo(bound);
+        if (lowerBound ? cmp > 0 : cmp < 0) { bound = key; boundInc = inc; }
+        else if (cmp == 0 && !inc) boundInc = false;
     }
 
     /// <summary>Streams candidate documents for the plan (filter NOT applied). Visitor returns false to stop.</summary>
