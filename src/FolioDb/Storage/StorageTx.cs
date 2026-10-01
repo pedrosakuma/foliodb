@@ -11,6 +11,13 @@ internal sealed class StorageTx : IDisposable
     private readonly Pager _pager;
     private readonly long _mark;
     private readonly Dictionary<uint, byte[]>? _dirty;
+    // Clean page images already resolved at _mark. They are immutable and fixed for the snapshot, so repeated
+    // descents (root, interior pages) skip the pager's WAL index and LRU locks. Started only after a few pager
+    // reads, so short transactions allocate nothing, and bounded so long scans don't pin evicted pages.
+    private Dictionary<uint, byte[]>? _clean;
+    private int _pagerReads;
+    private const int CleanMemoAfterReads = 8;
+    private const int CleanMemoCapacity = 256;
     private readonly Action? _onDispose;
     private DbHeader _header;
     private bool _headerDirty;
@@ -52,8 +59,20 @@ internal sealed class StorageTx : IDisposable
     {
         ThrowIfFinished();
         if (_dirty is not null && _dirty.TryGetValue(pgno, out var d)) return d;
+        return ReadClean(pgno);
+    }
+
+    private byte[] ReadClean(uint pgno)
+    {
+        if (_clean is not null && _clean.TryGetValue(pgno, out var c)) return c;
         if (pgno >= _header.PageCount) throw new CorruptDatabaseException($"Page {pgno} is out of range ({_header.PageCount} pages).");
-        return _pager.ReadPage(pgno, _mark);
+        var page = _pager.ReadPage(pgno, _mark);
+        if (_clean is not null)
+        {
+            if (_clean.Count < CleanMemoCapacity) _clean[pgno] = page;
+        }
+        else if (++_pagerReads >= CleanMemoAfterReads) _clean = new Dictionary<uint, byte[]>(32);
+        return page;
     }
 
     /// <summary>Private, mutable copy of a page owned by this transaction.</summary>
@@ -62,7 +81,7 @@ internal sealed class StorageTx : IDisposable
         ThrowIfFinished();
         if (_dirty is null) throw new InvalidOperationException("Transaction is read-only.");
         if (_dirty.TryGetValue(pgno, out var d)) return d;
-        var copy = (byte[])_pager.ReadPage(pgno, _mark).Clone();
+        var copy = (byte[])(_clean is not null && _clean.TryGetValue(pgno, out var c) ? c : _pager.ReadPage(pgno, _mark)).Clone();
         _dirty[pgno] = copy;
         return copy;
     }
@@ -123,6 +142,7 @@ internal sealed class StorageTx : IDisposable
     {
         if (_finished) return;
         _finished = true;
+        _clean = null;
         _pager.EndRead();
         try
         {

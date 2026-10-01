@@ -1352,6 +1352,20 @@ gap, producing the same page bytes. Same workload (commit excluded, best of 12 r
 | Time, no secondary index | ~1.21-1.29 µs | **~0.92-1.03 µs** |
 | Time, index on `city` | ~3.87-4.22 µs | **~3.41-3.59 µs** |
 
+### Clean page reads inside a transaction
+
+Each update descends the primary tree and every touched index tree, so the root and interior pages are read again
+and again. A clean read went through the pager every time (gate lock, WAL index lookup, LRU cache lock), roughly
+9 times per update with the `city` index and 4 without. Since a transaction reads at a fixed snapshot mark and
+those page images are immutable, `StorageTx` now memoizes them: the memo starts after 8 pager reads (short
+transactions allocate nothing), holds at most 256 pages and is dropped when the transaction finishes. Dirty pages
+still take precedence. Same workload, interleaved A/B:
+
+| Per update | Before | After |
+|---|---:|---:|
+| Time, no secondary index | ~0.91-0.93 µs | **~0.77-0.83 µs** |
+| Time, index on `city` | ~3.18-3.34 µs | **~2.66-3.09 µs** |
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.
