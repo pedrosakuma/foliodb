@@ -14,6 +14,13 @@ namespace FolioDb.Storage;
 /// they started) and never block the single writer. Checkpoints copy the latest frames back into the main
 /// file and reset the WAL; they only run when no reader holds a snapshot.
 /// </para>
+/// <para>
+/// Group commit (<see cref="SynchronousMode.Full"/>): a commit appends its frames, becomes visible to the next writer
+/// (<c>_writtenFrames</c>) and releases the write lock before its fsync. One committer then flushes every frame
+/// written so far while the others wait for it (<see cref="WaitDurable"/>); readers only see durable frames
+/// (<c>_committedFrames</c>). A failed fsync poisons the pager: frames past the durable mark may or may not survive,
+/// so no later commit is acknowledged and the database must be reopened (recovery keeps a valid prefix).
+/// </para>
 /// </summary>
 internal sealed class Pager : IDisposable
 {
@@ -31,7 +38,14 @@ internal sealed class Pager : IDisposable
 
     private readonly Lock _gate = new();
     private readonly Dictionary<uint, List<long>> _walIndex = new();
-    private long _committedFrames;
+    private long _committedFrames;   // durable and visible to readers
+    private long _writtenFrames;     // appended to the WAL; visible to the writer
+    // Frames ever appended / made durable. Monotonic (unlike frame numbers, which restart at each checkpoint).
+    private long _appendedSeq;
+    private long _durableSeq;
+    private readonly object _flushGate = new();
+    private bool _flushing;
+    private Exception? _flushFailure;
     private ulong _chain;
     private uint _salt1, _salt2, _checkpointSeq;
     private int _activeReaders;
@@ -42,6 +56,13 @@ internal sealed class Pager : IDisposable
 
     /// <summary>Test hook: when set, the next commit writes only this many WAL bytes and then fails (torn write).</summary>
     internal int? TestTornWriteBytes;
+
+    /// <summary>Transactions appended to the WAL (diagnostics and tests).</summary>
+    internal long AppendedCommits { get { lock (_gate) return _appendedCommits; } }
+    private long _appendedCommits;
+
+    /// <summary>Test hook: runs on the flushing thread before it decides which frames its fsync covers.</summary>
+    internal Action? TestBeforeFlush;
 
     private Pager(string path, FileStream db, FileStream wal, int pageSize, FolioOptions options)
     {
@@ -123,6 +144,23 @@ internal sealed class Pager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Like <see cref="BeginRead"/>, but the writer also sees committed frames that are not yet durable.
+    /// <paramref name="seenSeq"/> is what the writer must wait for (<see cref="WaitDurable"/>) before it completes,
+    /// even without changes of its own, so nothing it read can vanish after it returns.
+    /// </summary>
+    public long BeginWrite(out long seenSeq)
+    {
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ThrowIfFlushFailed();
+            _activeReaders++;
+            seenSeq = _appendedSeq;
+            return _writtenFrames;
+        }
+    }
+
     public void EndRead()
     {
         lock (_gate) _activeReaders--;
@@ -130,7 +168,7 @@ internal sealed class Pager : IDisposable
 
     public long WalFrameCount
     {
-        get { lock (_gate) return _committedFrames; }
+        get { lock (_gate) return _writtenFrames; }
     }
 
     /// <summary>Returns the immutable image of <paramref name="pgno"/> as of snapshot <paramref name="mark"/>. Callers must not mutate it.</summary>
@@ -180,12 +218,19 @@ internal sealed class Pager : IDisposable
 
     // ---------------------------------------------------------------- commit
 
-    /// <summary>Appends a transaction's dirty pages to the WAL. Must only be called by the single writer.</summary>
-    public void Commit(IReadOnlyList<KeyValuePair<uint, byte[]>> pages, uint dbPageCount)
+    /// <summary>
+    /// Appends a transaction's dirty pages to the WAL. Must only be called by the single writer. Returns a sequence
+    /// number the caller must pass to <see cref="WaitDurable"/> after releasing the write lock (0: nothing to wait for).
+    /// </summary>
+    public long Commit(IReadOnlyList<KeyValuePair<uint, byte[]>> pages, uint dbPageCount)
     {
-        if (pages.Count == 0) return;
+        if (pages.Count == 0) return 0;
         long firstFrame;
-        lock (_gate) firstFrame = _committedFrames + 1;
+        lock (_gate)
+        {
+            ThrowIfFlushFailed();
+            firstFrame = _writtenFrames + 1;
+        }
 
         // Frame headers live in one small buffer; page images are written in place (gather write),
         // so a commit never copies its pages into a large contiguous frame buffer.
@@ -218,7 +263,7 @@ internal sealed class Pager : IDisposable
             throw new IOException("Simulated torn write.");
         }
         RandomAccess.Write(_walHandle, segments, offset);
-        if (_options.Synchronous == SynchronousMode.Full) _wal.Flush(flushToDisk: true);
+        bool groupCommit = _options.Synchronous == SynchronousMode.Full;
 
         lock (_gate)
         {
@@ -229,10 +274,81 @@ internal sealed class Pager : IDisposable
                 list.Add(firstFrame + i);
                 _cache.Add(firstFrame + i, pages[i].Value);
             }
-            _committedFrames = firstFrame + pages.Count - 1;
+            _writtenFrames = firstFrame + pages.Count - 1;
+            _appendedSeq += pages.Count;
+            _appendedCommits++;
+            if (!groupCommit)
+            {
+                // Normal/Off: durability is not per commit, so the frames are published right away.
+                _committedFrames = _writtenFrames;
+                Volatile.Write(ref _durableSeq, _appendedSeq);
+            }
             _chain = chain;
+            return groupCommit ? _appendedSeq : 0;
+        }
+    }
+
+    /// <summary>
+    /// Returns once the commit at <paramref name="seq"/> is durable and visible to readers. The first waiter becomes
+    /// the flusher and covers every frame written so far, so concurrent commits share one fsync. A checkpoint flushes
+    /// first and never overlaps a flush, so frame numbers do not restart under a flusher.
+    /// </summary>
+    public void WaitDurable(long seq)
+    {
+        if (seq <= 0 || Volatile.Read(ref _durableSeq) >= seq) return;
+        long upToSeq = 0, upToFrame = 0;
+        lock (_flushGate)
+        {
+            while (true)
+            {
+                // Durable first: a commit covered by an earlier successful flush must not report a later failure.
+                if (_durableSeq >= seq) return;
+                if (_flushFailure is not null) throw new FolioException("A previous WAL flush failed; reopen the database.", _flushFailure);
+                if (!_flushing) break;
+                Monitor.Wait(_flushGate);
+            }
+            _flushing = true;
         }
 
+        Exception? failure = null;
+        try
+        {
+            TestBeforeFlush?.Invoke();
+            // Frames appended before the fsync starts are covered by it, including other writers' commits.
+            lock (_gate) { upToSeq = _appendedSeq; upToFrame = _writtenFrames; }
+            _wal.Flush(flushToDisk: true);
+        }
+        catch (Exception e)
+        {
+            failure = e;
+        }
+
+        lock (_flushGate)
+        {
+            _flushing = false;
+            if (failure is null)
+            {
+                lock (_gate) _committedFrames = upToFrame;
+                Volatile.Write(ref _durableSeq, upToSeq);
+            }
+            else _flushFailure = failure;
+            Monitor.PulseAll(_flushGate);
+        }
+        if (failure is not null) throw new FolioException("WAL flush failed; reopen the database.", failure);
+    }
+
+    /// <summary>Makes every written frame durable. Caller must hold the write lock (no new frames).</summary>
+    private void FlushWritten()
+    {
+        long appended;
+        lock (_gate) appended = _appendedSeq;
+        WaitDurable(appended);
+    }
+
+    private void ThrowIfFlushFailed()
+    {
+        var failure = Volatile.Read(ref _flushFailure);
+        if (failure is not null) throw new FolioException("A previous WAL flush failed; reopen the database.", failure);
     }
 
     /// <summary>Chained frame checksum: XxHash64 of (frame header after the checksum, page), seeded with the previous one.</summary>
@@ -247,7 +363,11 @@ internal sealed class Pager : IDisposable
     /// <summary>Runs a checkpoint when the WAL exceeds the configured size. Caller must hold the write lock.</summary>
     public void MaybeAutoCheckpoint()
     {
-        if (_options.AutoCheckpointFrames > 0 && WalFrameCount >= _options.AutoCheckpointFrames) TryCheckpoint();
+        if (_options.AutoCheckpointFrames <= 0 || Volatile.Read(ref _flushFailure) is not null || WalFrameCount < _options.AutoCheckpointFrames)
+            return;
+        // A flush failure here is recorded (poisoning the pager); a commit reports it from WaitDurable, a rollback doesn't.
+        try { TryCheckpoint(); }
+        catch (FolioException) when (Volatile.Read(ref _flushFailure) is not null) { }
     }
 
     // ---------------------------------------------------------------- checkpoint
@@ -258,6 +378,9 @@ internal sealed class Pager : IDisposable
     /// </summary>
     public bool TryCheckpoint()
     {
+        // Readers block a checkpoint anyway: don't fsync under the write lock for nothing (it would serialize commits).
+        lock (_gate) if (_activeReaders > 0) return false;
+        FlushWritten();
         lock (_gate)
         {
             if (_activeReaders > 0) return false;
@@ -289,6 +412,7 @@ internal sealed class Pager : IDisposable
             WriteNewWalHeader();
             _walIndex.Clear();
             _committedFrames = 0;
+            _writtenFrames = 0;
             _cache.Clear();
             return true;
         }
@@ -369,7 +493,7 @@ internal sealed class Pager : IDisposable
                     list.Add(fr);
                 }
                 pending.Clear();
-                _committedFrames = f;
+                _committedFrames = _writtenFrames = f;
                 _chain = chain;
             }
         }
@@ -399,7 +523,13 @@ internal sealed class Pager : IDisposable
         }
         try
         {
-            if (!TryCheckpoint() && _options.Synchronous != SynchronousMode.Off) _wal.Flush(flushToDisk: true);
+            if (Volatile.Read(ref _flushFailure) is null && !TryCheckpoint() && _options.Synchronous != SynchronousMode.Off)
+            {
+                // Full: also waits for an in-flight group flush and publishes durability, so committers still
+                // waiting take the fast path instead of flushing a disposed stream.
+                if (_options.Synchronous == SynchronousMode.Full) FlushWritten();
+                else _wal.Flush(flushToDisk: true);
+            }
         }
         finally
         {

@@ -453,7 +453,7 @@ folio> .dump > backup.js
 |---|---|---|
 | Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader (public `DocumentView` wrappers), relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
 | Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
-| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
+| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync, shared by concurrent commits in `Full`: group commit). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
 | B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. Splits are balanced, except an insert past the last key of the rightmost leaf, which starts a new leaf (SQLite-style quick balance) so ascending keys fill pages. |
 | Catalog / engine | `Engine/*` | Collections and index metadata in a catalog tree; index maintenance on insert/update/delete; unique constraints. |
 | Query | `Query/*` | Filter compiler over raw documents, planner (`IDHACK` / `IXSCAN` / `COLLSCAN`), update applier. |
@@ -834,9 +834,9 @@ shared-host variability and the closed-loop limitations still apply.
 
 Explicit batching changes the atomicity unit: all updates commit or roll back together, and results should only
 be acknowledged after `Commit()` succeeds. It is suitable when the application already has a natural batch.
-It is **not automatic group commit** of independently submitted transactions and does not measure that mechanism.
-For unrelated requests, fair writer admission and eventual group commit remain separate research directions;
-these results do not justify silently merging requests into one transaction or weakening durability.
+It is **not automatic group commit** of independently submitted transactions and does not measure that mechanism
+(the numbers above predate the `Full` group commit described below, which shares fsyncs without merging transactions).
+These results do not justify silently merging requests into one transaction or weakening durability.
 
 ### Experimental FIFO writer admission
 
@@ -925,6 +925,43 @@ end in a timeout and are excluded from that percentile. The integrated and exter
 similar under contention, but shared-host variation remains substantial (including uncontended runs);
 these results do not establish exact overhead or a universal latency improvement. Default admission is unchanged
 unless the caller explicitly opts in.
+
+### Group commit (`Full`)
+
+In `Full`, a commit appends its WAL frames, **releases the writer lock** and only then waits for the fsync. The first
+waiter becomes the flusher and fsyncs every frame written so far; commits appended meanwhile wait for it and are
+covered by it (or by the next one). Each transaction is still separate and atomic: nothing is merged, and
+`Commit()` still returns only once that commit is durable.
+
+- Readers (snapshots) only see **durable** commits; the next writer sees appended-but-not-yet-durable state, so a
+  writer that read such state (even one that commits nothing or rolls back) waits for it before returning.
+- A failed fsync **poisons** the database: pending and later commits throw `FolioException` and the database must be
+  reopened (recovery keeps a valid prefix of the WAL). Rollbacks, and disposing an already-poisoned database, do not throw.
+- Checkpoints flush first and never overlap a flush; one is skipped early when readers would block it anyway, so
+  it doesn't fsync while holding the writer lock for nothing.
+- `Normal`/`Off` are unchanged (commits publish immediately).
+
+`--fairness` A/B (commit `fefe525` vs group commit), medians of four 3-second trials across interleaved runs on the
+shared WSL2 host; updates/s:
+
+| Writers / readers | Admission | Before | Group commit | Timeouts (all trials) |
+|---|---|---:|---:|---:|
+| 1 / 0 | Default | 350 | 321 | 0 → 0 |
+| 4 / 0 | Default | 282 | 571 (2.0×) | 17 → 0 |
+| 4 / 4 | Default | 284 | 415 (1.5×) | 18 → 0 |
+| 16 / 0 | Default | 355 | 1,391 (3.9×) | 163 → 30 |
+| 16 / 4 | Default | 343 | 1,584 (4.6×) | 150 → 0 |
+| 4 / 0 | Integrated FIFO | 185 | 513 (2.8×) | 6 → 0 |
+| 16 / 0 | Integrated FIFO | 258 | 1,457 (5.7×) | 0 → 0 |
+| 16 / 4 | Integrated FIFO | 214 | 1,492 (7.0×) | 0 → 0 |
+
+A single writer gains nothing (one fsync per commit either way; differences are within host noise). The external
+FIFO prototype holds its lease through `Commit()`, so it never has two commits in flight and stays ~1×. Individual
+trials showed multi-second commit stalls in both versions; instrumenting the flush showed each one matched a raw
+fsync taking 0.3–1.7 s on this host, not waiting inside the engine. Tests: `GroupCommitTests` (deterministic flush
+sharing, visibility, failure poisoning, rollback/dispose interplay, concurrent increments) and a crash test that
+`kill -9`s four concurrent writers and checks that every acknowledged insert survives (`kill -9` keeps the OS page
+cache, so it validates acknowledgment ordering and recovery, not the storage device's fsync).
 
 ### Diagnostic captures of writer admission
 

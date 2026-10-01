@@ -3,7 +3,10 @@ namespace FolioDb;
 /// <summary>Durability level for commits (mirrors SQLite's <c>PRAGMA synchronous</c> in WAL mode).</summary>
 public enum SynchronousMode
 {
-    /// <summary>fsync the WAL on every commit. Survives power loss.</summary>
+    /// <summary>
+    /// A commit returns only after its WAL frames are fsynced. Survives power loss. Concurrent commits share one fsync
+    /// (group commit): the writer lock is released before the fsync, and readers only see durable commits.
+    /// </summary>
     Full,
     /// <summary>fsync only at checkpoints. Survives process crashes; the last commits may be lost on power loss.</summary>
     Normal,

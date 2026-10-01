@@ -10,6 +10,7 @@ internal sealed class StorageTx : IDisposable
 {
     private readonly Pager _pager;
     private readonly long _mark;
+    private readonly long _seenSeq;
     private readonly Dictionary<uint, byte[]>? _dirty;
     // Clean page images already resolved at _mark. They are immutable and fixed for the snapshot, so repeated
     // descents (root, interior pages) skip the pager's WAL index and LRU locks. Started only after a few pager
@@ -37,7 +38,7 @@ internal sealed class StorageTx : IDisposable
         IsWritable = writable;
         _onDispose = onDispose;
         DeleteRebalance = deleteRebalance;
-        _mark = pager.BeginRead();
+        _mark = writable ? pager.BeginWrite(out _seenSeq) : pager.BeginRead();
         try
         {
             _header = DbHeader.Read(pager.ReadPage(0, _mark));
@@ -122,6 +123,7 @@ internal sealed class StorageTx : IDisposable
     {
         ThrowIfFinished();
         if (_dirty is null) throw new InvalidOperationException("Transaction is read-only.");
+        long durableAt = 0;
         try
         {
             if (HasChanges)
@@ -129,13 +131,15 @@ internal sealed class StorageTx : IDisposable
                 _header.ChangeCounter++;
                 _header.Write(WritePage(0));
                 var pages = _dirty.OrderBy(static kv => kv.Key).ToList();
-                _pager.Commit(pages, _header.PageCount);
+                durableAt = _pager.Commit(pages, _header.PageCount);
             }
         }
         finally
         {
             Finish();
         }
+        // After the write lock is released, so the next writer proceeds while this commit's fsync is shared.
+        _pager.WaitDurable(Math.Max(durableAt, _seenSeq));
     }
 
     private void Finish()
@@ -160,5 +164,14 @@ internal sealed class StorageTx : IDisposable
     }
 
     /// <summary>Disposing without commit rolls back (dirty pages are simply discarded).</summary>
-    public void Dispose() => Finish();
+    public void Dispose()
+    {
+        if (_finished) return;
+        Finish();
+        if (!IsWritable) return;
+        // A writer may have read another commit that is not durable yet: wait for it, so what was read cannot vanish
+        // after the rollback. A failed flush is reported by the next write or commit, not by a rollback.
+        try { _pager.WaitDurable(_seenSeq); }
+        catch (FolioException) { }
+    }
 }

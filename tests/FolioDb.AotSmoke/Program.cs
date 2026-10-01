@@ -6,6 +6,8 @@ using FolioDb;
 //
 //   FolioDb.AotSmoke                     run the end-to-end scenario
 //   FolioDb.AotSmoke crash-writer <path> insert forever, printing "committed N" after each durable commit
+//   FolioDb.AotSmoke crash-writers <path> <threads> concurrent inserts forever; thread t prints "ack t k" once
+//                    its _id t * 1e9 + k is durable (group commit)
 
 if (args is ["crash-writer", var crashPath])
 {
@@ -17,6 +19,23 @@ if (args is ["crash-writer", var crashPath])
         col.Insert(new Document { ["_id"] = n, ["payload"] = new string('x', (int)(n % 300)) });
         Console.WriteLine($"committed {n + 1}");
     }
+}
+
+if (args is ["crash-writers", var crashPath2, var threadsArg])
+{
+    using var db = FolioDatabase.Open(crashPath2, new FolioOptions { AutoCheckpointFrames = 200 });
+    var col = db.GetCollection("events");
+    var threads = Enumerable.Range(0, int.Parse(threadsArg)).Select(t => new Thread(() =>
+    {
+        long next = col.Count(new Document { ["_id"] = new Document { ["$gte"] = t * 1_000_000_000L, ["$lt"] = (t + 1) * 1_000_000_000L } });
+        for (long k = next; ; k++)
+        {
+            col.Insert(new Document { ["_id"] = t * 1_000_000_000L + k, ["payload"] = new string('x', (int)(k % 300)) });
+            Console.WriteLine($"ack {t} {k}");
+        }
+    })).ToList();
+    threads.ForEach(t => t.Start());
+    threads.ForEach(t => t.Join());
 }
 
 var path = Path.Combine(Path.GetTempPath(), $"folio-smoke-{Environment.ProcessId}.folio");
