@@ -38,29 +38,23 @@ public sealed class CheckpointCacheTests
     }
 
     [Fact]
-    public void Promotion_replaces_stale_main_file_images_and_drops_older_frames()
+    public void Removed_entries_free_their_slot_without_evicting_a_newer_entry_under_the_same_key()
     {
-        var cache = new PageCache(16);
-        static long Main(uint pgno) => -(long)pgno - 1;
-        cache.Add(Main(1), [1]);   // stale main-file image of page 1
-        cache.Add(Main(2), [2]);   // page 2 untouched by the WAL
-        cache.Add(Main(3), [3]);   // stale, and its latest frame is not cached
-        cache.Add(1, [10]);        // page 1, older frame
-        cache.Add(2, [11]);        // page 1, latest frame
-        cache.Add(3, [30]);        // page 3, older frame
-
-        cache.PromoteCheckpointed([(1u, 2L), (3u, 4L)], Main);
-
-        Assert.True(cache.TryGet(Main(1), out var p1));
-        Assert.Equal(11, p1[0]);
-        Assert.True(cache.TryGet(Main(2), out var p2));
-        Assert.Equal(2, p2[0]);
-        Assert.False(cache.TryGet(Main(3), out _));
-        for (long frame = 1; frame <= 4; frame++) Assert.False(cache.TryGet(frame, out _));
-        Assert.Equal(2, cache.Count);
-
-        // Freed slots are reused without exceeding capacity.
-        for (long k = 100; k < 140; k++) cache.Add(k, [0]);
-        Assert.Equal(16, cache.Count);
+        var cache = new PageCache(4);
+        cache.Add(1, [1]);
+        cache.Add(2, [2]);
+        cache.Remove(1);
+        Assert.False(cache.TryGet(1, out _));
+        cache.Add(3, [3]);
+        cache.Add(4, [4]);
+        cache.Add(1, [10]); // the ring still holds the removed entry for key 1
+        Assert.True(cache.TryGet(1, out var one));
+        Assert.Equal(10, one[0]);
+        // Sweeping the removed entry must not take the new one with it.
+        for (long k = 100; k < 103; k++) cache.Add(k, [0]);
+        Assert.True(cache.Count <= 4);
+        int mapped = 0;
+        foreach (long k in new long[] { 1, 2, 3, 4, 100, 101, 102 }) if (cache.TryGet(k, out _)) mapped++;
+        Assert.Equal(cache.Count, mapped);
     }
 }

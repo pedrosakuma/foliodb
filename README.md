@@ -148,8 +148,8 @@ on Unix it is created user-readable/writable only. A failed cleanup can leave th
 which can be removed manually after inspection.
 
 The copy holds one source read snapshot from catalog enumeration through the final output checkpoint. Writers may
-continue and the output contains exactly the state at that snapshot; source checkpoints return `false` while that
-snapshot is active, so its WAL can grow. Existing explicit source snapshots are allowed. The output keeps the source
+continue and the output contains exactly the state at that snapshot; source checkpoints cannot copy past that
+snapshot and return `false` while it is active, so its WAL can grow. Existing explicit source snapshots are allowed. The output keeps the source
 page size and format compatibility, serialised document bytes, collection names (including empty collections), index
 names/patterns/uniqueness, compound directions, and multikey/type hints. Primary trees are read in `_id` order and
 bulk-loaded; secondary entries are externally sorted and bulk-loaded. This removes freelist holes and B+Tree
@@ -455,7 +455,7 @@ folio> .dump > backup.js
 |---|---|---|
 | Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader (public `DocumentView` wrappers), relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
 | Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
-| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync, shared by concurrent commits in `Full`: group commit). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot (`mxFrame`). |
+| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync, shared by concurrent commits in `Full`: group commit). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot through read marks; checkpoints copy up to the oldest mark without blocking readers and restart the WAL once it drains. |
 | B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. Splits are balanced, except an insert past the last key of the rightmost leaf, which starts a new leaf (SQLite-style quick balance) so ascending keys fill pages. |
 | Catalog / engine | `Engine/*` | Collections and index metadata in a catalog tree; index maintenance on insert/update/delete; unique constraints. |
 | Query | `Query/*` | Filter compiler over raw documents, planner (`IDHACK` / `IXSCAN` / `COLLSCAN`), update applier. |
@@ -1604,9 +1604,44 @@ invalid. With a write-heavy workload checkpointing every 1,000 frames, readers k
 the cached image of each page's latest frame is re-keyed as that page's main-file image (which the checkpoint just
 wrote), and only older frames and stale main-file images are dropped. With the 151 MiB database fully cached, one
 writer (`Normal`) and one reader doing `FindById` (8 s, two interleaved runs), reads went from 22-26k/s to 32-38k/s
-(~1.45×) and writer p99 from 0.76-0.86 ms to 0.24-0.31 ms. Readers still wait while a checkpoint runs, since it
-holds the pager lock through the copy and fsync. Checkpoints also still need a moment with no active readers: with
-4 continuous readers none ran in 8 s and the WAL reached 1.1 GiB.
+(~1.45×) and writer p99 from 0.76-0.86 ms to 0.24-0.31 ms. Readers still waited while a checkpoint ran, and
+checkpoints needed a moment with no active readers: with 4 continuous readers none ran in 8 s and the WAL reached
+1.1 GiB. The next section removes both limits; the cache now keeps a copy of each copied page instead of re-keying.
+
+### Checkpoints that do not wait for readers
+
+Checkpoints now follow SQLite's read marks. Each snapshot registers the last WAL frame it may read (its mark) in one
+of 16 shared slots, or mark 0 when it only needs the main file. When every slot holds another mark, a reader shares
+the newest lower one, which only makes checkpoints copy less. A checkpoint is split in two:
+
+- **Backfill** copies to the main file every page whose latest frame is at or before the oldest active mark. A
+  reader with that mark or later has a WAL frame for each of those pages, so it never reads the regions being
+  overwritten. Readers are not blocked: a reader that would pick mark 0 during a backfill takes a WAL mark instead.
+  An older snapshot only limits how far the backfill goes, and the next checkpoint continues from there. Copied
+  pages that were cached are cached again as main-file images (a private copy); the rest are dropped.
+- **Restart** rewinds the WAL once everything is copied and no reader still uses a WAL mark. New readers take mark 0
+  once the backfill is complete, so continuous readers drain from the WAL by themselves. Cache keys for WAL frames
+  include a running base, so a restart does not touch the cache.
+
+An automatic checkpoint gives the readers a short wait budget that doubles after each failure (1 ms to 128 ms),
+and backs off by the checkpoint interval when it cannot finish. In `Normal`, the WAL is now fsynced before the main
+file is overwritten; previously a power loss in the middle of a checkpoint could leave main-file pages newer than a
+WAL that was not on disk. In `Full`, frames are already durable before readers can see them.
+
+Same 151 MiB database, fully cached, one `Normal` writer doing `$inc` by `_id` and continuous `FindById` readers
+(8 s, two interleaved runs):
+
+| Readers | Reads/s before → after | Max WAL before → after | Writer p99 before → after | Writer max before → after |
+|---:|---:|---:|---:|---:|
+| 0 | - | 4 MiB → 4 MiB | 0.23 ms → 0.26-0.34 ms | 118-169 ms → 142-157 ms |
+| 1 | 31-32k → **190-205k (~6×)** | 16-22 MiB → **4 MiB** | 0.23-0.25 ms → 0.24-0.29 ms | 359-491 ms → **160-170 ms** |
+| 4 | 553-571k → **754-772k (1.35×)** | 1.1 GiB → **12 MiB** | 0.66-0.69 ms → 1.05-1.08 ms | 78 ms → 142-150 ms |
+
+With 4 readers the old code never checkpointed, so its writer did no copying and ran 11.4-11.6k updates/s; now
+it checkpoints ~58 times in 8 s and runs ~2.5k/s, the same rate as with no readers. Without readers the extra WAL
+fsync costs up to a few percent. Writer stalls still come from the copy and the fsyncs, which the writer performs
+while holding the write lock. A snapshot kept open stops the backfill at its mark, as before, so the WAL grows
+while it lives; and readers whose snapshots keep overlapping for longer than ~128 ms can still postpone the restart.
 
 ### GC settings when the data does not fit in the cache
 

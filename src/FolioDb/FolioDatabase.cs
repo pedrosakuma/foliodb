@@ -100,7 +100,7 @@ public sealed class FolioDatabase : IDisposable
 
     public bool DropCollection(string name) => Write(tx => tx.DropCollection(name));
 
-    /// <summary>Copies the WAL into the main file. Returns false if readers are active or writer admission times out.</summary>
+    /// <summary>Copies the WAL into the main file and restarts it. Returns false if a reader still needs part of the WAL or writer admission times out.</summary>
     public bool Checkpoint()
     {
         ThrowIfDisposed();

@@ -1,4 +1,6 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Collections.Concurrent;
 using System.IO.Hashing;
 using System.Security.Cryptography;
@@ -12,8 +14,15 @@ namespace FolioDb.Storage;
 /// Commits append page images ("frames") to the WAL; the last frame of a transaction carries a commit marker.
 /// Every frame has a checksum chained to the previous frame, so recovery replays exactly the prefix of
 /// fully written, committed transactions. Readers pin a snapshot (the number of committed frames when
-/// they started) and never block the single writer. Checkpoints copy the latest frames back into the main
-/// file and reset the WAL; they only run when no reader holds a snapshot.
+/// they started) and never block the single writer.
+/// </para>
+/// <para>
+/// Checkpoints run in two steps and never block readers. Backfill copies the latest frame of each page up to a target
+/// into the main file, where the target is at most the oldest active snapshot (<see cref="ReadMarks"/>): every active
+/// reader then reads those pages from the WAL, never from the part of the main file being overwritten. Once everything
+/// is backfilled, new readers take mark 0 and read the main file only; when no reader uses a WAL snapshot any more, the
+/// WAL restarts (new salts, frame 1). Cache keys of WAL frames are absolute (<c>_walBase</c> + frame), so a restart
+/// does not have to touch the cache.
 /// </para>
 /// <para>
 /// Group commit (<see cref="SynchronousMode.Full"/>): a commit appends its frames, becomes visible to the next writer
@@ -39,11 +48,11 @@ internal sealed class Pager : IDisposable
 
     private readonly Lock _gate = new();
     // Page number -> its WAL frames in ascending order. Read without locks: frames are only appended (by the single
-    // writer, under _gate) between checkpoints, and a checkpoint clears it only while no reader holds a snapshot.
+    // writer, under _gate), and a restart clears it only while no reader uses a WAL snapshot.
     private readonly ConcurrentDictionary<uint, FrameList> _walIndex = new();
     private long _committedFrames;   // durable and visible to readers
     private long _writtenFrames;     // appended to the WAL; visible to the writer
-    // Frames ever appended / made durable. Monotonic (unlike frame numbers, which restart at each checkpoint).
+    // Frames ever appended / made durable. Monotonic (unlike frame numbers, which restart with the WAL).
     private long _appendedSeq;
     private long _durableSeq;
     private readonly object _flushGate = new();
@@ -51,12 +60,24 @@ internal sealed class Pager : IDisposable
     private Exception? _flushFailure;
     private ulong _chain;
     private uint _salt1, _salt2, _checkpointSeq;
-    // Readers register without the gate (Dekker-style): a reader enters _readers and then checks _checkpointing; a
-    // checkpoint sets _checkpointing and then checks _readers.Active. Both are full fences, so at least one side sees
-    // the other. A reader that sees a checkpoint backs out and registers under the gate, which the checkpoint holds
-    // until it has reset the WAL. The epochs also tell the cache when evicted pages can be reused.
-    private readonly ReaderEpoch _readers = new();
+    // Snapshot marks of active readers; the writer has none (it holds the write lock, which checkpoints also need).
+    private readonly ReadMarks _marks = new();
+    // Frames up to _backfilled are in the main file. _backfillTarget (>= _backfilled) is published before a backfill
+    // looks at the read marks; a reader registers its mark and then checks the target (both sides fence), so either the
+    // backfill sees the reader or the reader sees the target and retries with a newer mark.
+    private long _backfilled;
+    private long _backfillTarget;
+    // Frames of earlier WAL generations: cache keys of frames are _walBase + frame, unique across restarts.
+    private long _walBase;
+    // A restart sets _checkpointing, checks the read marks, resets the WAL state, bumps _walGen and clears the flag.
+    // A reader that read the state before checks both after registering, so it never keeps a mark of an old generation.
     private int _checkpointing;
+    private long _walGen;
+    // Auto-checkpoint backoff: after an attempt that could not finish, wait for this many appended frames.
+    private long _nextAutoAttemptSeq;
+    private int _autoFailures;
+    // Readers also register in epochs, which tell the cache when evicted pages can be reused.
+    private readonly ReaderEpoch _readers = new();
     private volatile bool _disposed;
 
     public int PageSize { get; }
@@ -71,6 +92,24 @@ internal sealed class Pager : IDisposable
 
     /// <summary>Test hook: runs on the flushing thread before it decides which frames its fsync covers.</summary>
     internal Action? TestBeforeFlush;
+
+    /// <summary>Test hook: runs after a backfill chose its target, before it writes anything.</summary>
+    internal Action? TestBeforeBackfillWrites;
+
+    /// <summary>Test hook: runs in <see cref="BeginRead"/> after the reader chose its mark, before it registers it.</summary>
+    internal Action? TestBeforeReadMark;
+
+    /// <summary>Test hook: runs after a backfill wrote its pages into the main file, before it fsyncs and publishes them.</summary>
+    internal Action? TestDuringBackfill;
+
+    /// <summary>WAL frames already copied into the main file.</summary>
+    internal long Backfilled => Volatile.Read(ref _backfilled);
+
+    /// <summary>Test hook: drops every cached WAL frame image, as if evicted.</summary>
+    internal void TestDropWalFramesFromCache()
+    {
+        foreach (long key in _cache.Keys) if (key >= 0) _cache.Remove(key);
+    }
 
     private Pager(string path, FileStream db, FileStream wal, int pageSize, FolioOptions options)
     {
@@ -146,29 +185,44 @@ internal sealed class Pager : IDisposable
     public long BeginRead(out int slot)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        slot = _readers.Enter();
+        int epochSlot = _readers.Enter();
         if (_disposed)
         {
-            _readers.Exit(slot);
+            _readers.Exit(epochSlot);
             throw new ObjectDisposedException(GetType().FullName);
         }
-        if (Volatile.Read(ref _checkpointing) == 0) return Volatile.Read(ref _committedFrames);
-        _readers.Exit(slot);
-        lock (_gate)
+        var spin = new SpinWait();
+        while (true)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            slot = _readers.Enter();
-            return _committedFrames;
+            long gen = Volatile.Read(ref _walGen);
+            long committed = Volatile.Read(ref _committedFrames);
+            long backfilled = Volatile.Read(ref _backfilled);
+            // Everything committed is in the main file: read it directly, so the WAL can restart under this reader.
+            long mark = committed == backfilled ? 0 : committed;
+            TestBeforeReadMark?.Invoke();
+            int markSlot = _marks.Enter(mark, out long joined);
+            long effective = joined == 0 ? backfilled : joined;
+            if (Volatile.Read(ref _checkpointing) == 0 && Volatile.Read(ref _walGen) == gen
+                && Volatile.Read(ref _backfillTarget) <= effective)
+            {
+                slot = epochSlot | ((markSlot + 1) << 8);
+                return mark;
+            }
+            _marks.Exit(markSlot);
+            spin.SpinOnce(sleep1Threshold: -1);
         }
     }
 
     /// <summary>
     /// Like <see cref="BeginRead"/>, but the writer also sees committed frames that are not yet durable.
     /// <paramref name="seenSeq"/> is what the writer must wait for (<see cref="WaitDurable"/>) before it completes,
-    /// even without changes of its own, so nothing it read can vanish after it returns.
+    /// even without changes of its own, so nothing it read can vanish after it returns. Caller must hold the write lock.
     /// </summary>
     public long BeginWrite(out long seenSeq, out int slot)
     {
+        // A fully backfilled WAL restarts as soon as no reader uses it, before this writer appends to it.
+        if (_writtenFrames > 0 && Volatile.Read(ref _backfilled) == _writtenFrames && Volatile.Read(ref _flushFailure) is null)
+            TryRestart(waitTicks: 0);
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
@@ -179,7 +233,12 @@ internal sealed class Pager : IDisposable
         }
     }
 
-    public void EndRead(int slot) => _readers.Exit(slot);
+    public void EndRead(int slot)
+    {
+        int markSlot = (slot >> 8) - 1;
+        if (markSlot >= 0) _marks.Exit(markSlot);
+        _readers.Exit(slot & 0xFF);
+    }
 
     public long WalFrameCount
     {
@@ -208,7 +267,7 @@ internal sealed class Pager : IDisposable
         // Frame numbers start at 1, so an empty snapshot (mark 0) reads straight from the main file.
         if (mark > 0 && _walIndex.TryGetValue(pgno, out var frames)) frame = frames.LatestAtOrBefore(mark);
 
-        long cacheKey = frame > 0 ? frame : MainFileKey(pgno);
+        long cacheKey = frame > 0 ? FrameKey(frame) : MainFileKey(pgno);
         if (_cache.TryGet(cacheKey, out var data)) return data;
 
         missed = true;
@@ -229,6 +288,8 @@ internal sealed class Pager : IDisposable
 
     private static long MainFileKey(uint pgno) => -(long)pgno - 1;
 
+    private long FrameKey(long frame) => Volatile.Read(ref _walBase) + frame;
+
     private void AppendFrame(uint pgno, long frame)
     {
         if (!_walIndex.TryGetValue(pgno, out var list)) _walIndex[pgno] = list = new FrameList();
@@ -244,8 +305,6 @@ internal sealed class Pager : IDisposable
     {
         private long[] _items = new long[2];
         private int _count;
-
-        public long Last => _items[_count - 1];
 
         public void Append(long frame)
         {
@@ -296,6 +355,7 @@ internal sealed class Pager : IDisposable
             ThrowIfFlushFailed();
             firstFrame = _writtenFrames + 1;
         }
+        if (firstFrame + pages.Count > ReadMarks.MaxMark) throw new FolioException("The WAL is too large; checkpoint the database.");
 
         // Frame headers live in one small buffer; page images are written in place (gather write),
         // so a commit never copies its pages into a large contiguous frame buffer.
@@ -336,7 +396,7 @@ internal sealed class Pager : IDisposable
             {
                 uint pgno = pages[i].Key;
                 AppendFrame(pgno, firstFrame + i);
-                _cache.Add(firstFrame + i, pages[i].Value);
+                _cache.Add(FrameKey(firstFrame + i), pages[i].Value);
             }
             _writtenFrames = firstFrame + pages.Count - 1;
             _appendedSeq += pages.Count;
@@ -424,82 +484,222 @@ internal sealed class Pager : IDisposable
         return hasher.GetCurrentHashAsUInt64();
     }
 
-    /// <summary>Runs a checkpoint when the WAL exceeds the configured size. Caller must hold the write lock.</summary>
+    /// <summary>
+    /// Runs a checkpoint when the WAL holds enough frames that are not in the main file yet. Waits briefly for readers
+    /// of older snapshots to finish (they are never blocked); after an attempt that could not finish, the next one waits
+    /// for another <see cref="FolioOptions.AutoCheckpointFrames"/> frames and may wait a little longer. Caller must hold
+    /// the write lock.
+    /// </summary>
     public void MaybeAutoCheckpoint()
     {
-        if (_options.AutoCheckpointFrames <= 0 || Volatile.Read(ref _flushFailure) is not null || WalFrameCount < _options.AutoCheckpointFrames)
+        int frames = _options.AutoCheckpointFrames;
+        if (frames <= 0 || Volatile.Read(ref _flushFailure) is not null || _writtenFrames - Volatile.Read(ref _backfilled) < frames)
             return;
+        long appended = Volatile.Read(ref _appendedSeq);
+        if (appended < _nextAutoAttemptSeq) return;
+        long waitTicks = Math.Min(Stopwatch.Frequency / 1000 << _autoFailures, Stopwatch.Frequency * MaxAutoWaitMs / 1000);
         // A flush failure here is recorded (poisoning the pager); a commit reports it from WaitDurable, a rollback doesn't.
-        try { TryCheckpoint(); }
+        try
+        {
+            if (Checkpoint(waitTicks)) _autoFailures = 0;
+            else
+            {
+                _autoFailures = Math.Min(_autoFailures + 1, 16);
+                _nextAutoAttemptSeq = appended + frames;
+            }
+        }
         catch (FolioException) when (Volatile.Read(ref _flushFailure) is not null) { }
     }
+
+    /// <summary>Longest an automatic checkpoint waits for readers of older snapshots (it doubles from 1 ms per failure).</summary>
+    internal const int MaxAutoWaitMs = 128;
 
     // ---------------------------------------------------------------- checkpoint
 
     /// <summary>
-    /// Copies committed WAL frames into the main file and resets the WAL. Returns false if readers are active.
-    /// Caller must hold the write lock (no concurrent WAL appends).
+    /// Copies committed WAL frames into the main file and restarts the WAL. Never waits for readers: returns false if a
+    /// reader's snapshot still needs the WAL (frames it allows are still copied). Caller must hold the write lock.
     /// </summary>
-    public bool TryCheckpoint()
+    public bool TryCheckpoint() => Checkpoint(waitTicks: 0);
+
+    private bool Checkpoint(long waitTicks)
     {
-        // Readers block a checkpoint anyway: don't fsync under the write lock for nothing (it would serialize commits).
-        if (_readers.Active > 0) return false;
-        FlushWritten();
+        long deadline = Stopwatch.GetTimestamp() + waitTicks;
+        if (_options.Synchronous == SynchronousMode.Full && _writtenFrames > Volatile.Read(ref _backfilled))
+        {
+            // A reader of the main file (mark 0) keeps anything from being copied: don't fsync under the write lock
+            // for nothing. Otherwise make every written frame durable and visible, so the backfill can cover them all.
+            var spin = new SpinWait();
+            while (_marks.MinActive() == 0)
+            {
+                if (Stopwatch.GetTimestamp() >= deadline) return false;
+                spin.SpinOnce();
+            }
+            FlushWritten();
+        }
+        if (!Backfill(deadline)) return false;
+        return TryRestart(Math.Max(0, deadline - Stopwatch.GetTimestamp()));
+    }
+
+    /// <summary>
+    /// Copies the latest frame (up to the oldest active snapshot) of every page into the main file. Returns true when
+    /// everything committed is in the main file. Readers keep running: each active one has a mark at or past the target,
+    /// so it reads these pages from the WAL, and none of them reads or caches their main-file images meanwhile.
+    /// </summary>
+    private bool Backfill(long deadline)
+    {
+        long prev = _backfilled;
+        long committed = Volatile.Read(ref _committedFrames);
+        if (committed <= prev) return true;
+
+        long target = committed;
+        var spin = new SpinWait();
+        while (true)
+        {
+            Interlocked.Exchange(ref _backfillTarget, target);
+            long min = _marks.MinActive();
+            if (min >= target) break;
+            // Readers of older snapshots usually finish quickly, and new ones start at the latest mark.
+            if (target == committed && Stopwatch.GetTimestamp() < deadline)
+            {
+                spin.SpinOnce();
+                continue;
+            }
+            // Mark 0 (main file only) and marks below prev belong to readers that need nothing past prev.
+            long lowered = Math.Max(min, prev);
+            if (lowered == prev)
+            {
+                Interlocked.Exchange(ref _backfillTarget, prev);
+                return false;
+            }
+            target = lowered;
+        }
+
+        // The main file must never hold a page whose WAL frame could still be lost (Full: committed frames are durable).
+        if (_options.Synchronous == SynchronousMode.Normal) _wal.Flush(flushToDisk: true);
+
+        TestBeforeBackfillWrites?.Invoke();
+        var pages = new List<(uint Pgno, long Frame)>();
+        foreach (var (pgno, frames) in _walIndex)
+        {
+            long frame = frames.LatestAtOrBefore(target);
+            if (frame > prev) pages.Add((pgno, frame));
+        }
+        pages.Sort(static (a, b) => a.Pgno.CompareTo(b.Pgno));
+
+        const int Chunk = 256;
+        var buffer = new byte[Math.Min(pages.Count, Chunk) * PageSize];
+        var run = new List<ReadOnlyMemory<byte>>();
+        for (int start = 0; start < pages.Count; start += Chunk)
+        {
+            int count = Math.Min(Chunk, pages.Count - start);
+            var images = new ReadOnlyMemory<byte>[count];
+            // Pages cached under their frame are hot: they get a private copy cached under their main-file key, for
+            // readers of mark 0. Cached arrays may be recycled once evicted, so copy them while registered in an epoch.
+            int epochSlot = _readers.Enter();
+            try
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    var (pgno, frame) = pages[start + i];
+                    if (_cache.TryGet(FrameKey(frame), out var cached))
+                    {
+                        var copy = new byte[PageSize];
+                        cached.CopyTo(copy, 0);
+                        images[i] = copy;
+                    }
+                    else
+                    {
+                        var image = buffer.AsMemory(i * PageSize, PageSize);
+                        if (RandomAccess.Read(_walHandle, image.Span, FrameOffset(frame) + FrameHeaderSize) != PageSize)
+                            throw new CorruptDatabaseException($"Short read of WAL frame {frame} during checkpoint.");
+                        images[i] = image;
+                    }
+                }
+            }
+            finally
+            {
+                _readers.Exit(epochSlot);
+            }
+
+            uint runStart = 0;
+            for (int i = 0; i < count; i++)
+            {
+                uint pgno = pages[start + i].Pgno;
+                if (run.Count > 0 && pgno != runStart + (uint)run.Count)
+                {
+                    RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
+                    run.Clear();
+                }
+                if (run.Count == 0) runStart = pgno;
+                run.Add(images[i]);
+            }
+            if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
+            run.Clear();
+
+            // Any main-file image cached earlier is stale now. No active reader looks these keys up (see above).
+            for (int i = 0; i < count; i++)
+            {
+                long key = MainFileKey(pages[start + i].Pgno);
+                if (MemoryMarshal.TryGetArray(images[i], out var segment) && segment.Array != buffer) _cache.Add(key, segment.Array!);
+                else _cache.Remove(key);
+            }
+        }
+
+        TestDuringBackfill?.Invoke();
+        if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
+        Volatile.Write(ref _backfilled, target);
+        return target == committed;
+    }
+
+    /// <summary>
+    /// Restarts a fully backfilled WAL once no reader uses a WAL snapshot (new readers already read the main file only).
+    /// Waits up to <paramref name="waitTicks"/> for such readers to finish. Caller must hold the write lock.
+    /// </summary>
+    private bool TryRestart(long waitTicks)
+    {
+        if (_writtenFrames == 0) return true;
+        if (Volatile.Read(ref _backfilled) != _writtenFrames) return false;
+        if (_marks.AnyWalReaders() && waitTicks > 0)
+        {
+            long deadline = Stopwatch.GetTimestamp() + waitTicks;
+            var spin = new SpinWait();
+            while (_marks.AnyWalReaders() && Stopwatch.GetTimestamp() < deadline) spin.SpinOnce();
+        }
+
         lock (_gate)
         {
+            // Full: a flusher publishing frames of this generation must have finished.
+            if (_durableSeq != _appendedSeq) return false;
             Interlocked.Exchange(ref _checkpointing, 1);
-            try { return CheckpointLocked(); }
-            finally { Volatile.Write(ref _checkpointing, 0); }
-        }
-    }
-
-    private bool CheckpointLocked()
-    {
-        if (_readers.Active > 0) return false;
-        if (_committedFrames == 0) return true;
-
-        var pgnos = _walIndex.Keys.ToArray();
-        Array.Sort(pgnos);
-
-        // Latest image of each page, taken from the cache when still resident; runs of
-        // consecutive page numbers go to the main file in a single gather write.
-        var run = new List<ReadOnlyMemory<byte>>();
-        uint runStart = 0;
-        foreach (uint pgno in pgnos)
-        {
-            if (run.Count > 0 && pgno != runStart + (uint)run.Count)
+            try
             {
-                RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
-                run.Clear();
+                if (_marks.AnyWalReaders()) return false;
+                _walBase += _writtenFrames;
+                _walIndex.Clear();
+                _committedFrames = _writtenFrames = 0;
+                _backfilled = _backfillTarget = 0;
+                Interlocked.Increment(ref _walGen);
             }
-            if (run.Count == 0) runStart = pgno;
-            run.Add(LatestCommittedImage(_walIndex[pgno].Last));
+            finally
+            {
+                Volatile.Write(ref _checkpointing, 0);
+            }
         }
-        if (run.Count > 0) RandomAccess.Write(_dbHandle, run, (long)runStart * PageSize);
 
-        if (_options.Synchronous != SynchronousMode.Off) _db.Flush(flushToDisk: true);
-
-        var latest = new List<(uint, long)>(pgnos.Length);
-        foreach (uint pgno in pgnos) latest.Add((pgno, _walIndex[pgno].Last));
-
-        _checkpointSeq++;
-        WriteNewWalHeader();
-        _walIndex.Clear();
-        _committedFrames = 0;
-        _writtenFrames = 0;
-        // Frame numbers restart, so frame-keyed entries must go; the latest image of each page is now its main-file
-        // image, which keeps the cache warm across checkpoints.
-        _cache.PromoteCheckpointed(latest, MainFileKey);
+        // Readers no longer touch the WAL file, and the writer lock keeps commits out until the new header is in place.
+        // If that fails, the in-memory state no longer matches the file: refuse further writes until reopened.
+        try
+        {
+            _checkpointSeq++;
+            WriteNewWalHeader();
+        }
+        catch (Exception e)
+        {
+            lock (_flushGate) _flushFailure ??= e;
+            throw new FolioException("Restarting the WAL failed; reopen the database.", e);
+        }
         return true;
-    }
-
-    private byte[] LatestCommittedImage(long frame)
-    {
-        if (_cache.TryGet(frame, out var cached)) return cached;
-        var page = new byte[PageSize];
-        if (RandomAccess.Read(_walHandle, page, FrameOffset(frame) + FrameHeaderSize) != PageSize)
-            throw new CorruptDatabaseException($"Short read of WAL frame {frame} during checkpoint.");
-        return page;
     }
 
     private void WriteNewWalHeader()

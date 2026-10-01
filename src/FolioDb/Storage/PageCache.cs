@@ -9,7 +9,7 @@ namespace FolioDb.Storage;
 /// With a <see cref="ReaderEpoch"/>, evicted page images are recycled instead of left to the GC: they wait in a limbo
 /// list until every reader that might still hold one has finished (see <see cref="ReaderEpoch"/>), then go to a small
 /// free pool that <see cref="RentPage"/> serves cache misses from. Images displaced by a newer copy under the same key,
-/// or dropped by <see cref="Clear"/>, are never recycled.
+/// or dropped by <see cref="Remove"/> or <see cref="Clear"/>, are never recycled.
 /// </para>
 /// </summary>
 internal sealed class PageCache
@@ -49,6 +49,8 @@ internal sealed class PageCache
     }
 
     internal int Count => _map.Count;
+
+    internal ICollection<long> Keys => _map.Keys;
 
     internal int PooledCount { get { lock (_lock) return _free.Count; } }
 
@@ -96,8 +98,8 @@ internal sealed class PageCache
                 if (victim is null) break;
                 if (!victim.Referenced)
                 {
-                    _map.TryRemove(victim.Key, out _);
-                    if (_epoch is not null) Retire(victim.Data);
+                    // A removed entry stays in the ring until swept; its image already went to the GC.
+                    if (_map.TryRemove(new KeyValuePair<long, Entry>(victim.Key, victim)) && _epoch is not null) Retire(victim.Data);
                     break;
                 }
                 victim.Referenced = false;
@@ -135,39 +137,12 @@ internal sealed class PageCache
         }
     }
 
-    /// <summary>
-    /// After a checkpoint copied the WAL into the main file and reset it: cached images of each page's latest frame
-    /// stay cached as that page's main-file image (<paramref name="mainFileKey"/>), and every other WAL frame entry,
-    /// plus any older main-file image of those pages, is dropped. Keys of WAL frames are positive; main-file keys
-    /// negative. Must run while no reader is registered; dropped images are left to the GC, never recycled.
-    /// </summary>
-    public void PromoteCheckpointed(IReadOnlyCollection<(uint Pgno, long LatestFrame)> pages, Func<uint, long> mainFileKey)
+    /// <summary>Drops the image cached under <paramref name="key"/>, if any; it is left to the GC, never recycled.</summary>
+    public void Remove(long key)
     {
         lock (_lock)
         {
-            foreach (var (pgno, _) in pages) _map.TryRemove(mainFileKey(pgno), out _);
-            var promoted = new Dictionary<long, long>(pages.Count);
-            foreach (var (pgno, frame) in pages) promoted[frame] = mainFileKey(pgno);
-            for (int i = 0; i < _ring.Length; i++)
-            {
-                var entry = _ring[i];
-                if (entry is null) continue;
-                if (entry.Key >= 0)
-                {
-                    _map.TryRemove(entry.Key, out _);
-                    if (promoted.TryGetValue(entry.Key, out long key))
-                    {
-                        var moved = new Entry(key, entry.Data) { Referenced = entry.Referenced };
-                        _ring[i] = moved;
-                        _map[key] = moved;
-                    }
-                    else _ring[i] = null;
-                }
-                else if (!_map.TryGetValue(entry.Key, out var current) || !ReferenceEquals(current, entry))
-                {
-                    _ring[i] = null; // a stale main-file image removed above
-                }
-            }
+            if (_map.TryRemove(key, out var entry)) entry.Referenced = false;
         }
     }
 
