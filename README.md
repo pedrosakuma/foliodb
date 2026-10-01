@@ -1375,6 +1375,14 @@ again, only when the leaf empties or delete rebalancing is on, and only then che
 inline cell builds it on the stack and takes the path-recording route only when the leaf is full. With the index
 on `city`: 1,527 → **1,214 B** per update, ~6% less time.
 
+### Single-key index diffs
+
+Measuring allocations by phase of a replace with the `city` index put 272 B in extracting old and new index keys
+(a key list and a pooled buffer each) and 136 B in diffing them. A simple index whose path holds no arrays yields at
+most one key per document, so the replace now reads both keys straight from the documents and compares them, with
+the same result (removed key, added key checked for size and uniqueness, rehinted key); arrays and compound indexes
+keep the general path. 1,214 → **974 B** per update, ~5-15% less time.
+
 ## Limitations
 
 - Single process per database file (exclusive file handles); concurrency is between threads of that process.

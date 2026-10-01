@@ -133,6 +133,21 @@ public class CollectionTests : IDisposable
     }
 
     [Fact]
+    public void Replacing_a_nested_value_with_an_array_of_documents_indexes_every_element()
+    {
+        _people.CreateIndex("address.zip");
+        _people.Insert("{ _id: 60, address: { zip: 'z1' } }");
+        _people.ReplaceOne(Document.Parse("{ _id: 60 }"), Document.Parse("{ address: [{ zip: 'z2' }, { zip: 'z3' }] }"));
+        Assert.DoesNotContain("COLLSCAN", _people.Explain("{ 'address.zip': 'z3' }"));
+        Assert.Equal(60, _people.Find("{ 'address.zip': 'z3' }").Single()["_id"].AsInt32);
+        Assert.Empty(_people.Find("{ 'address.zip': 'z1' }"));
+        _people.ReplaceOne(Document.Parse("{ _id: 60 }"), Document.Parse("{ address: { zip: 'z4' } }"));
+        Assert.Empty(_people.Find("{ 'address.zip': 'z3' }"));
+        Assert.Equal(60, _people.Find("{ 'address.zip': 'z4' }").Single()["_id"].AsInt32);
+        _db.CheckIntegrity();
+    }
+
+    [Fact]
     public void Unique_index_is_enforced_on_insert_update_and_creation()
     {
         _people.CreateIndex("name", unique: true);
@@ -140,6 +155,11 @@ public class CollectionTests : IDisposable
         Assert.Throws<DuplicateKeyException>(() => _people.UpdateOne("{ _id: 2 }", "{ $set: { name: 'Ana' } }"));
         Assert.Equal("Bruno", _people.FindById(2)!["name"].AsString);
         Assert.Equal(1, _people.UpdateOne("{ _id: 2 }", "{ $set: { name: 'Bruno' } }").MatchedCount); // same value is fine
+
+        // A field the stored document lacks is still checked when a replacement adds it.
+        _people.Insert("{ _id: 50 }");
+        Assert.Throws<DuplicateKeyException>(() => _people.ReplaceOne(Document.Parse("{ _id: 50 }"), Document.Parse("{ name: 'Ana' }")));
+        Assert.False(_people.FindById(50)!.ContainsKey("name"));
 
         Assert.Throws<DuplicateKeyException>(() => _people.CreateIndex("age", unique: true));
         Assert.DoesNotContain(_people.GetIndexes(), i => i.Field == "age");

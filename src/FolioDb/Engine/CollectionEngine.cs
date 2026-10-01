@@ -302,7 +302,8 @@ internal static class CollectionEngine
         if (newBytes.AsSpan().SequenceEqual(oldBytes)) return false;
         if (newBytes.Length > MaxDocumentSize) throw new FolioException($"Document exceeds the maximum size of {MaxDocumentSize} bytes.");
 
-        List<(IndexMeta Index, List<byte[]> Removed, List<IndexKey> Written, bool Multi)>? changes = null;
+        List<(IndexMeta Index, byte[][] Removed, IndexKey[] Written, bool Multi)>? changes = null;
+        ByteBuffer? scalarBuffer = null;
         byte[] idHint = [];
         bool idHintChanged = false;
         if (meta.Indexes.Count > 0)
@@ -315,9 +316,21 @@ internal static class CollectionEngine
             // Compound hints also record whether the fields are in index order, which a reorder can change.
             if (!idHintChanged && SameFields(oldBytes, newBytes, index.TopLevelFields)
                 && (index.Fields.Length == 1 || FieldsInOrder(oldBytes, index.Paths) == FieldsInOrder(newBytes, index.Paths))) continue;
-            var oldKeys = ExtractIndexKeys(oldBytes, index, out _);
-            var newKeys = ExtractIndexKeys(newBytes, index, out bool multi);
-            var (removed, written, addedCount) = DiffKeys(oldKeys, newKeys, idHintChanged);
+            byte[][] removed;
+            IndexKey[] written;
+            int addedCount;
+            bool multi = false;
+            scalarBuffer ??= new ByteBuffer(64);
+            if (index.IsSimple
+                && TryScalarKey(oldBytes, index.Paths[0], scalarBuffer, out var oldKey)
+                && TryScalarKey(newBytes, index.Paths[0], scalarBuffer, out var newKey))
+                (removed, written, addedCount) = DiffScalarKeys(oldKey, newKey, idHintChanged);
+            else
+            {
+                var oldKeys = ExtractIndexKeys(oldBytes, index, out _);
+                var newKeys = ExtractIndexKeys(newBytes, index, out multi);
+                (removed, written, addedCount) = DiffKeys(oldKeys, newKeys, idHintChanged);
+            }
             for (int i = 0; i < addedCount; i++)
             {
                 var k = written[i].Key;
@@ -327,6 +340,7 @@ internal static class CollectionEngine
             }
             (changes ??= new(meta.Indexes.Count)).Add((index, removed, written, multi));
         }
+        scalarBuffer?.Dispose();
 
         if (changes is null)
         {
@@ -359,7 +373,7 @@ internal static class CollectionEngine
     /// keys only in the old version are removed; written holds the keys only in the new version (the first
     /// <c>AddedCount</c> items) followed by kept keys whose hint changed (5 -> 5L, or a new <c>_id</c> type).
     /// </summary>
-    private static (List<byte[]> Removed, List<IndexKey> Written, int AddedCount) DiffKeys(List<IndexKey> oldKeys, List<IndexKey> newKeys, bool idHintChanged)
+    private static (byte[][] Removed, IndexKey[] Written, int AddedCount) DiffKeys(List<IndexKey> oldKeys, List<IndexKey> newKeys, bool idHintChanged)
     {
         var removed = new List<byte[]>(oldKeys.Count);
         foreach (var o in oldKeys)
@@ -379,7 +393,35 @@ internal static class CollectionEngine
                 }
             }
         }
-        return (removed, written, addedCount);
+        return ([.. removed], [.. written], addedCount);
+    }
+
+    /// <summary><see cref="DiffKeys"/> for documents that produce at most one key each (see <see cref="TryScalarKey"/>).</summary>
+    private static (byte[][] Removed, IndexKey[] Written, int AddedCount) DiffScalarKeys(IndexKey? oldKey, IndexKey? newKey, bool idHintChanged)
+    {
+        if (newKey is not { } n) return (oldKey is { } gone ? [gone.Key] : [], [], 0);
+        if (oldKey is not { } o) return ([], [n], 1);
+        if (!o.Key.AsSpan().SequenceEqual(n.Key)) return ([o.Key], [n], 1);
+        return ([], idHintChanged || !o.Hint.AsSpan().SequenceEqual(n.Hint) ? [n] : [], 0);
+    }
+
+    /// <summary>
+    /// The single key a simple index takes from <paramref name="doc"/> when no array lies on <paramref name="path"/>
+    /// (null when the field is missing), as <see cref="ExtractIndexKeys(ReadOnlySpan{byte}, FieldPath, out bool)"/>
+    /// would produce it. False when an array is reached, which can expand to several keys.
+    /// </summary>
+    private static bool TryScalarKey(ReadOnlySpan<byte> doc, FieldPath path, ByteBuffer buf, out IndexKey? key)
+    {
+        key = null;
+        var v = new RawValue(DocType.Document, new RawDocument(doc).Data);
+        foreach (var segment in path.Segments)
+        {
+            if (v.Type == DocType.Array) return false;
+            if (v.Type != DocType.Document || !v.AsDocument.TryGetField(segment, out v)) return true;
+        }
+        if (v.Type == DocType.Array) return false;
+        key = new IndexKey(Encode(buf, v), IndexHint.For(v));
+        return true;
     }
 
     private static int IndexOfKey(List<IndexKey> keys, byte[] key, int start)
