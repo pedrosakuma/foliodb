@@ -44,6 +44,10 @@ public static class Workload
 
     public static string Json(int i) =>
         $$"""{"_id":{{i}},"name":"user {{i}}","city":"{{Cities[i % Cities.Length]}}","age":{{i % 90}},"tags":["a","b"],"score":{{i * 0.5}}}""";
+
+    /// <summary>The same document without the array, so it maps to one relational row.</summary>
+    public static string FlatJson(int i) =>
+        $$"""{"_id":{{i}},"name":"user {{i}}","city":"{{Cities[i % Cities.Length]}}","age":{{i % 90}},"score":{{i * 0.5}}}""";
 }
 
 /// <summary>Bulk insert of 1,000 documents in a single transaction into a fresh database.</summary>
@@ -122,7 +126,8 @@ public class QueryBenchmarks
     private FolioDatabase _folio = null!;
     private FolioDb.Collection _folioUsers = null!;
     private SqliteConnection _sqlite = null!;
-    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!;
+    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!, _sqliteNameByCity = null!, _sqliteFlatByCity = null!;
+    private FolioDb.Collection _folioFlat = null!;
     private LiteDatabase _lite = null!;
     private ILiteCollection<BsonDocument> _liteUsers = null!;
     private int _next;
@@ -137,15 +142,19 @@ public class QueryBenchmarks
             var col = tx.GetCollection("users");
             col.CreateIndex("city");
             for (int i = 0; i < Workload.Documents; i++) col.Insert(FolioDb.Document.Parse(Workload.Json(i)));
+            var flat = tx.GetCollection("flat");
+            flat.CreateIndex("city");
+            for (int i = 0; i < Workload.Documents; i++) flat.Insert(FolioDb.Document.Parse(Workload.FlatJson(i)));
             tx.Commit();
         }
         _folio.Checkpoint();
         _folioUsers = _folio.GetCollection("users");
+        _folioFlat = _folio.GetCollection("flat");
 
         _sqlitePath = Workload.TempFile(".db");
         _sqlite = new SqliteConnection($"Data Source={_sqlitePath}");
         _sqlite.Open();
-        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city'));");
+        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city')); CREATE TABLE flat(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, age INTEGER NOT NULL, score REAL NOT NULL); CREATE INDEX flat_city ON flat(city);");
         using (var tx = _sqlite.BeginTransaction())
         {
             using var ins = _sqlite.CreateCommand();
@@ -158,14 +167,36 @@ public class QueryBenchmarks
                 pdata.Value = Workload.Json(i);
                 ins.ExecuteNonQuery();
             }
+            using var insFlat = _sqlite.CreateCommand();
+            insFlat.CommandText = "INSERT INTO flat(id, name, city, age, score) VALUES ($id, $name, $city, $age, $score)";
+            var fid = insFlat.Parameters.Add("$id", SqliteType.Integer);
+            var fname = insFlat.Parameters.Add("$name", SqliteType.Text);
+            var fcity = insFlat.Parameters.Add("$city", SqliteType.Text);
+            var fage = insFlat.Parameters.Add("$age", SqliteType.Integer);
+            var fscore = insFlat.Parameters.Add("$score", SqliteType.Real);
+            for (int i = 0; i < Workload.Documents; i++)
+            {
+                fid.Value = i;
+                fname.Value = "user " + i;
+                fcity.Value = Workload.Cities[i % Workload.Cities.Length];
+                fage.Value = i % 90;
+                fscore.Value = i * 0.5;
+                insFlat.ExecuteNonQuery();
+            }
             tx.Commit();
         }
+        _sqliteFlatByCity = _sqlite.CreateCommand();
+        _sqliteFlatByCity.CommandText = "SELECT id, name, city, age, score FROM flat WHERE city = $city";
+        _sqliteFlatByCity.Parameters.Add("$city", SqliteType.Text);
         _sqliteById = _sqlite.CreateCommand();
         _sqliteById.CommandText = "SELECT data FROM users WHERE id = $id";
         _sqliteById.Parameters.Add("$id", SqliteType.Integer);
         _sqliteByCity = _sqlite.CreateCommand();
         _sqliteByCity.CommandText = "SELECT data FROM users WHERE json_extract(data, '$.city') = $city";
         _sqliteByCity.Parameters.Add("$city", SqliteType.Text);
+        _sqliteNameByCity = _sqlite.CreateCommand();
+        _sqliteNameByCity.CommandText = "SELECT json_extract(data, '$.name') FROM users WHERE json_extract(data, '$.city') = $city";
+        _sqliteNameByCity.Parameters.Add("$city", SqliteType.Text);
 
         _litePath = Workload.TempFile(".db");
         _lite = new LiteDatabase($"Filename={_litePath};Connection=direct");
@@ -182,6 +213,8 @@ public class QueryBenchmarks
         _folio.Dispose();
         _sqliteById.Dispose();
         _sqliteByCity.Dispose();
+        _sqliteNameByCity.Dispose();
+        _sqliteFlatByCity.Dispose();
         _sqlite.Dispose();
         SqliteConnection.ClearAllPools();
         _lite.Dispose();
@@ -223,5 +256,76 @@ public class QueryBenchmarks
     }
 
     [Benchmark, BenchmarkCategory("IndexedEq")]
+    public int FolioDb_IndexedEq_VisitName()
+    {
+        int n = 0;
+        _folioUsers.Visit(new FolioDb.Document { ["city"] = Workload.Cities[NextId() % 100] }, v =>
+        {
+            v.TryGetValue("name", out var name);
+            _ = System.Text.Encoding.UTF8.GetString(name.AsUtf8String);
+            n++;
+            return true;
+        });
+        return n;
+    }
+
+    [Benchmark, BenchmarkCategory("IndexedEq")]
+    public int Sqlite_IndexedEq_Name()
+    {
+        _sqliteNameByCity.Parameters[0].Value = Workload.Cities[NextId() % 100];
+        using var r = _sqliteNameByCity.ExecuteReader();
+        int n = 0;
+        while (r.Read())
+        {
+            _ = r.GetString(0);
+            n++;
+        }
+        return n;
+    }
+
+    [Benchmark, BenchmarkCategory("IndexedEq")]
     public int LiteDb_IndexedEq() => _liteUsers.Find(LiteDB.Query.EQ("city", Workload.Cities[NextId() % 100])).Count();
+
+    [Benchmark, BenchmarkCategory("FlatEq")]
+    public int FolioDb_FlatEq_Find() => _folioFlat.Find(new FolioDb.Document { ["city"] = Workload.Cities[NextId() % 100] }).Count;
+
+    [Benchmark(Baseline = true), BenchmarkCategory("FlatEq")]
+    public int FolioDb_FlatEq_VisitAllFields()
+    {
+        int n = 0;
+        _folioFlat.Visit(new FolioDb.Document { ["city"] = Workload.Cities[NextId() % 100] }, v =>
+        {
+            // One forward pass over the fields, like reading the columns of a row.
+            foreach (var f in v)
+            {
+                switch (f.Value.Type)
+                {
+                    case FolioDb.DocType.String: _ = System.Text.Encoding.UTF8.GetString(f.Value.AsUtf8String); break;
+                    case FolioDb.DocType.Double: _ = f.Value.AsDouble; break;
+                    default: _ = f.Value.AsInt64; break;
+                }
+            }
+            n++;
+            return true;
+        });
+        return n;
+    }
+
+    [Benchmark, BenchmarkCategory("FlatEq")]
+    public int Sqlite_FlatEq_AllColumns()
+    {
+        _sqliteFlatByCity.Parameters[0].Value = Workload.Cities[NextId() % 100];
+        using var r = _sqliteFlatByCity.ExecuteReader();
+        int n = 0;
+        while (r.Read())
+        {
+            _ = r.GetInt64(0);
+            _ = r.GetString(1);
+            _ = r.GetString(2);
+            _ = r.GetInt64(3);
+            _ = r.GetDouble(4);
+            n++;
+        }
+        return n;
+    }
 }

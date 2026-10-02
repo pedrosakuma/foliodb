@@ -486,6 +486,25 @@ dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*'
 BenchmarkDotNet, short job, Linux x64, .NET 10 (indicative only). SQLite = Microsoft.Data.Sqlite storing JSON text
 with an index on `json_extract(data,'$.city')`, WAL + `synchronous=NORMAL`; LiteDB 5.0.21. FolioDb uses `SynchronousMode.Normal`.
 
+### Indexed equality: documents vs. rows
+
+`QueryBenchmarks` returns the 100 of 10k records that match an indexed `city` (2026-10-02). The JSON-text SQLite
+setup above is SQLite used as a document store. The `FlatEq` rows compare against a regular one-column-per-field
+table (`id, name, city, age, score`, index on `city`), with no array field, so both sides hold the same data.
+
+| Benchmark | Time | Allocated |
+|---|---:|---:|
+| FolioDb `Find` (full documents with `tags` array) | 88.4 µs | 74.2 KB |
+| SQLite `SELECT data` (JSON text, not parsed) | 87.0 µs | 19.9 KB |
+| FolioDb `Visit`, read `name` as string | **45.8 µs** | 5.6 KB |
+| SQLite `SELECT json_extract(data,'$.name')` | 140.5 µs | 4.4 KB |
+| FolioDb `FlatEq` `Find` (full flat documents) | 73.7 µs | 50.8 KB |
+| FolioDb `FlatEq` `Visit`, one pass over all 5 fields | **50.5 µs** | 9.5 KB |
+| SQLite `FlatEq` `SELECT id,name,city,age,score` | 131.4 µs | 8.3 KB |
+
+To read every field from `Visit`, enumerate the view once (`foreach (var f in view)`): each `TryGetValue` walks the
+fields from the start, so five lookups by name cost about 4-5× one pass.
+
 ### B+Tree occupancy under churn
 
 Issue #1 has a separate deterministic diagnostic entry point:
