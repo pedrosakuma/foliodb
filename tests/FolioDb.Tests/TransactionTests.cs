@@ -301,6 +301,7 @@ public class TransactionTests
         var writer = Task.Run(() =>
         {
             var rnd = new Random(1);
+            long previous = 0;
             while (!cts.IsCancellationRequested)
             {
                 int from = rnd.Next(10), to = rnd.Next(10);
@@ -311,7 +312,10 @@ public class TransactionTests
                     c.UpdateOne(new Document { ["_id"] = to }, Document.Parse("{ $inc: { balance: 1 } }"));
                     tx.Commit();
                 }
-                if (db.Pager.WalFrameCount == 0) Interlocked.Increment(ref checkpoints);
+                // A retired WAL file drops its frames from the count.
+                long wal = db.Pager.WalFrameCount;
+                if (wal < previous) Interlocked.Increment(ref checkpoints);
+                previous = wal;
             }
         }, token);
         var readers = Enumerable.Range(0, 4).Select(r => Task.Run(() =>

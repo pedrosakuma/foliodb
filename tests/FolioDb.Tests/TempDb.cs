@@ -16,6 +16,7 @@ public sealed class TempDb : IDisposable
         {
             File.Delete(Path);
             File.Delete(Path + "-wal");
+            File.Delete(Path + "-wal2");
         }
         catch (IOException) { }
     }

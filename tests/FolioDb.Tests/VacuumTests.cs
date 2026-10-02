@@ -60,6 +60,7 @@ public sealed class VacuumTests
         {
             File.Delete(output);
             File.Delete(output + "-wal");
+            File.Delete(output + "-wal2");
         }
     }
 
@@ -90,6 +91,7 @@ public sealed class VacuumTests
         {
             File.Delete(output);
             File.Delete(output + "-wal");
+            File.Delete(output + "-wal2");
         }
     }
 

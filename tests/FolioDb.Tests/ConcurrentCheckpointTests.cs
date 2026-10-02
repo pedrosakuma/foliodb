@@ -30,7 +30,7 @@ public sealed class ConcurrentCheckpointTests
 
         using var cts = new CancellationTokenSource();
         long violations = 0, reads = 0, restarts = 0, maxWal = 0;
-        var readers = Enumerable.Range(0, 4).Select(r => Task.Run(() =>
+        var readers = Enumerable.Range(0, 4).Select(r => Task.Factory.StartNew(() =>
         {
             while (!cts.IsCancellationRequested)
             {
@@ -44,11 +44,12 @@ public sealed class ConcurrentCheckpointTests
                 }
                 Interlocked.Increment(ref reads);
             }
-        }, token)).ToList();
+        }, token, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToList();
 
         var rnd = new Random(1);
         long previous = 0;
-        for (int n = 0; n < 1500; n++)
+        // Also keeps going until the readers got to run, for machines busy with other tests.
+        for (int n = 0; n < 1500 || (Interlocked.Read(ref reads) < 50 && n < 50_000); n++)
         {
             int from = rnd.Next(200), to = rnd.Next(200);
             using (var tx = db.BeginTransaction())
@@ -69,7 +70,10 @@ public sealed class ConcurrentCheckpointTests
         Assert.Equal(0, violations);
         Assert.True(reads > 50, $"reads={reads}");
         Assert.True(restarts >= 3, $"restarts={restarts} maxWal={maxWal}");
-        Assert.True(maxWal < 1500, $"maxWal={maxWal}");
+        // The writer never waits for the checkpointer, so how far the WAL grows depends on the machine; without
+        // restarts it would hold every frame written.
+        long total = db.Pager.WrittenFrames;
+        Assert.True(maxWal < total * 3 / 4, $"maxWal={maxWal} total={total}");
         db.CheckIntegrity();
     }
 
@@ -209,7 +213,7 @@ public sealed class ConcurrentCheckpointTests
         for (int i = 0; i < 300; i++) c.Insert(Doc(i, 0));
         Assert.True(db.Checkpoint());
         SetAll(c, 300, 1);
-        long mark = db.Pager.WalFrameCount;
+        long mark = db.Pager.WrittenFrames;
 
         using (var snap = db.BeginSnapshot())
         {
@@ -238,10 +242,11 @@ public sealed class ConcurrentCheckpointTests
         Assert.True(db.Checkpoint());
         SetAll(c, 300, 1);
         SetAll(c, 300, 2);
+        long backfilled = db.Pager.Backfilled;
 
         db.Pager.TestDuringBackfill = () => throw new IOException("Simulated crash during backfill.");
         Assert.Throws<IOException>(() => db.Checkpoint());
-        Assert.Equal(0, db.Pager.Backfilled);
+        Assert.Equal(backfilled, db.Pager.Backfilled);
         db.SimulateCrash();
 
         using var reopened = tmp.Open();
@@ -267,7 +272,7 @@ public sealed class ConcurrentCheckpointTests
         using (var snap = db.BeginSnapshot())
         {
             Assert.False(db.Checkpoint()); // fully backfilled, but the snapshot still reads the WAL
-            Assert.Equal(db.Pager.WalFrameCount, db.Pager.Backfilled);
+            Assert.Equal(db.Pager.WrittenFrames, db.Pager.Backfilled);
         }
         // New readers read the main file only now; the cache must not hand them the old images.
         AssertAll(c, 300, 1);
@@ -304,66 +309,51 @@ public sealed class ConcurrentCheckpointTests
     }
 
     [Fact]
-    public async Task A_full_set_of_read_marks_never_registers_a_reader_above_its_own_mark()
+    public void A_full_set_of_read_marks_joins_the_newest_lower_mark_and_adds_its_files()
     {
         var marks = new ReadMarks();
         var slots = new List<int>();
-        for (long m = 1; m <= ReadMarks.Slots; m++) slots.Add(marks.Enter(m * 10, out _));
-        // A WAL reader joins the newest lower mark, which protects more than it needs.
-        int lower = marks.Enter(55, out long joined);
-        Assert.Equal(50, joined);
+        for (long m = 1; m <= ReadMarks.Slots; m++) slots.Add(marks.Enter(m * 10, files: 1));
+        Assert.False(marks.AnyReading(2));
+        // No free slot: joins the newest mark below its own (protects more than it needs) and adds its file.
+        int lower = marks.Enter(55, files: 2);
+        Assert.Equal(slots[4], lower);
+        Assert.True(marks.AnyReading(2));
+        Assert.Equal(10, marks.MinActive());
+        // A reader never registers above its own mark: below every slot, it gets no slot and retries.
+        Assert.Equal(-1, marks.Enter(5, files: 0));
         marks.Exit(lower);
-        // A main-file reader cannot join any WAL mark (it would be counted as using the WAL) nor a mark above it,
-        // so it waits for a free slot.
-        var zero = Task.Run(() => (marks.Enter(0, out long j), j), TestContext.Current.CancellationToken);
-        await Task.Delay(50, TestContext.Current.CancellationToken);
-        Assert.False(zero.IsCompleted);
-        marks.Exit(slots[3]);
-        var (slot, j0) = await zero.WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
-        Assert.Equal(0, j0);
-        Assert.Equal(0, marks.MinActive());
-        marks.Exit(slot);
-        foreach (int s in slots.Where((_, i) => i != 3)) marks.Exit(s);
+        // The joined slot keeps the file until its last reader leaves.
+        Assert.True(marks.AnyReading(2));
+        marks.Exit(slots[4]);
+        Assert.False(marks.AnyReading(2));
+        foreach (int s in slots.Where((_, i) => i != 4)) marks.Exit(s);
         Assert.Equal(long.MaxValue, marks.MinActive());
+        Assert.False(marks.AnyReading(3));
     }
 
     [Fact]
-    public void Read_marks_track_the_oldest_snapshot_and_share_the_newest_slot_when_full()
+    public void Read_marks_track_the_oldest_snapshot_and_the_files_in_use()
     {
         var marks = new ReadMarks();
         Assert.Equal(long.MaxValue, marks.MinActive());
-        Assert.False(marks.AnyWalReaders());
-
-        int zero = marks.Enter(0, out long joined);
-        Assert.Equal(0, joined);
-        Assert.False(marks.AnyWalReaders());
-        Assert.Equal(0, marks.MinActive());
-        marks.Exit(zero);
-
-        var slots = new List<int>();
-        for (long m = 1; m <= ReadMarks.Slots; m++)
-        {
-            slots.Add(marks.Enter(m, out joined));
-            Assert.Equal(m, joined);
-        }
-        Assert.Equal(1, marks.MinActive());
-        Assert.True(marks.AnyWalReaders());
-        // Same mark: shares its slot. No free slot for a new mark: joins the newest snapshot.
-        int again = marks.Enter(5, out joined);
-        Assert.Equal(5, joined);
-        Assert.Equal(slots[4], again);
-        int newest = marks.Enter(100, out joined);
-        Assert.Equal(ReadMarks.Slots, joined);
-        Assert.Equal(slots[^1], newest);
-
-        marks.Exit(slots[0]);
-        Assert.Equal(2, marks.MinActive());
-        foreach (int s in slots.Skip(1)) marks.Exit(s);
-        Assert.Equal(5, marks.MinActive());
-        marks.Exit(again);
-        Assert.Equal(ReadMarks.Slots, marks.MinActive());
-        marks.Exit(newest);
+        int a = marks.Enter(7, files: 1);
+        int b = marks.Enter(7, files: 1);
+        Assert.Equal(a, b);
+        // Same mark, more files: a slot of its own (sharing would make the others look like readers of file 2).
+        int c = marks.Enter(7, files: 3);
+        Assert.NotEqual(a, c);
+        int d = marks.Enter(9, files: 0);
+        Assert.Equal(7, marks.MinActive());
+        Assert.True(marks.AnyReading(2));
+        marks.Exit(c);
+        Assert.False(marks.AnyReading(2));
+        Assert.True(marks.AnyReading(1));
+        marks.Exit(a);
+        marks.Exit(b);
+        Assert.False(marks.AnyReading(1));
+        Assert.Equal(9, marks.MinActive());
+        marks.Exit(d);
         Assert.Equal(long.MaxValue, marks.MinActive());
-        Assert.False(marks.AnyWalReaders());
     }
 }

@@ -360,7 +360,7 @@ public class StorageTests
         var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 0 });
         var col = db.GetCollection("c");
         col.Insert(new Document { ["_id"] = 1 });
-        long walAfterFirst = db.Pager.WalFileLength;
+        long walAfterFirst = new FileInfo(tmp.Path + "-wal").Length;
         col.Insert(new Document { ["_id"] = 2 });
         db.SimulateCrash();
 

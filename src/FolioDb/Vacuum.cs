@@ -62,6 +62,7 @@ internal static class Vacuum
             File.Move(stage, target, overwrite: false);
             published = true;
             DeleteOwned(stage + "-wal");
+            DeleteOwned(stage + "-wal2");
             source.TestVacuumStage?.Invoke(VacuumStage.Published);
         }
         finally
@@ -70,6 +71,7 @@ internal static class Vacuum
             {
                 DeleteOwned(stage);
                 DeleteOwned(stage + "-wal");
+                DeleteOwned(stage + "-wal2");
             }
         }
     }
@@ -77,8 +79,7 @@ internal static class Vacuum
     private static void ValidateDestination(string source, string destination)
     {
         string sourcePath = Path.GetFullPath(source);
-        string sourceWal = sourcePath + "-wal";
-        if (PathEquals(destination, sourcePath) || PathEquals(destination, sourceWal))
+        if (PathEquals(destination, sourcePath) || PathEquals(destination, sourcePath + "-wal") || PathEquals(destination, sourcePath + "-wal2"))
             throw new ArgumentException("Vacuum destination must not be the source database or its WAL.", nameof(destination));
         var entry = new FileInfo(destination);
         if (entry.Exists || Directory.Exists(destination) || entry.LinkTarget is not null)

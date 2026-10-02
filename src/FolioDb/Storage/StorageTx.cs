@@ -9,11 +9,11 @@ namespace FolioDb.Storage;
 internal sealed class StorageTx : IDisposable
 {
     private readonly Pager _pager;
-    private readonly long _mark;
+    private readonly ReadView _view;
     private readonly long _seenSeq;
     private readonly int _readerSlot;
     private readonly Dictionary<uint, byte[]>? _dirty;
-    // Clean page images already resolved at _mark. They are immutable and fixed for the snapshot, so repeated
+    // Clean page images already resolved at _view. They are immutable and fixed for the snapshot, so repeated
     // descents (root, interior pages) skip the pager's WAL index and LRU locks. Started only after a few pager
     // reads, so short transactions allocate nothing, and bounded so long scans don't pin evicted pages.
     private Dictionary<uint, byte[]>? _clean;
@@ -40,10 +40,10 @@ internal sealed class StorageTx : IDisposable
         IsWritable = writable;
         _onDispose = onDispose;
         DeleteRebalance = deleteRebalance;
-        _mark = writable ? pager.BeginWrite(out _seenSeq, out _readerSlot) : pager.BeginRead(out _readerSlot);
+        _view = writable ? pager.BeginWrite(out _seenSeq, out _readerSlot) : pager.BeginRead(out _readerSlot);
         try
         {
-            _header = DbHeader.Read(pager.ReadPage(0, _mark));
+            _header = DbHeader.Read(pager.ReadPage(0, _view));
         }
         catch
         {
@@ -75,7 +75,7 @@ internal sealed class StorageTx : IDisposable
     {
         if (_clean is not null && _clean.TryGetValue(pgno, out var c)) return c;
         if (pgno >= _header.PageCount) throw new CorruptDatabaseException($"Page {pgno} is out of range ({_header.PageCount} pages).");
-        var page = _pager.ReadPage(pgno, _mark, admit: _pagerMisses < _pager.ScanMissThreshold, out bool missed);
+        var page = _pager.ReadPage(pgno, _view, admit: _pagerMisses < _pager.ScanMissThreshold, out bool missed);
         if (missed) _pagerMisses++;
         if (_clean is not null)
         {
@@ -91,7 +91,7 @@ internal sealed class StorageTx : IDisposable
         ThrowIfFinished();
         if (_dirty is null) throw new InvalidOperationException("Transaction is read-only.");
         if (_dirty.TryGetValue(pgno, out var d)) return d;
-        var copy = (byte[])(_clean is not null && _clean.TryGetValue(pgno, out var c) ? c : _pager.ReadPage(pgno, _mark)).Clone();
+        var copy = (byte[])(_clean is not null && _clean.TryGetValue(pgno, out var c) ? c : _pager.ReadPage(pgno, _view)).Clone();
         _dirty[pgno] = copy;
         return copy;
     }

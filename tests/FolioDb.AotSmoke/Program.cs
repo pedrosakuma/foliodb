@@ -54,6 +54,7 @@ finally
 {
     File.Delete(path);
     File.Delete(path + "-wal");
+    File.Delete(path + "-wal2");
 }
 
 static void Check(bool condition, string what)
@@ -179,6 +180,7 @@ static void Run(string path)
         }
         File.Delete(compactPath);
         File.Delete(compactPath + "-wal");
+        File.Delete(compactPath + "-wal2");
     }
 
     // Reopen: durability through checkpoint on close.

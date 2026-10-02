@@ -41,7 +41,10 @@ public sealed class FolioOptions
     /// <summary>Maximum number of pages kept in the in-memory page cache (CLOCK eviction; hits are lock-free).</summary>
     public int CacheSizePages { get; init; } = 4096;
 
-    /// <summary>Automatically checkpoint when the WAL holds at least this many frames (0 disables).</summary>
+    /// <summary>
+    /// Frames per WAL file: once the active file holds this many, the writer switches to the other file and a background
+    /// thread checkpoints the full one (0 disables automatic checkpoints).
+    /// </summary>
     public int AutoCheckpointFrames { get; init; } = 1000;
 
     public SynchronousMode Synchronous { get; init; } = SynchronousMode.Full;

@@ -1,7 +1,7 @@
 # FolioDb
 
 An embedded, single-file **document database** for .NET, following the SQLite model:
-one file on disk (plus a `-wal` journal), ACID transactions, a paged B+Tree storage engine,
+one file on disk (plus two alternating `-wal`/`-wal2` journals), ACID transactions, a paged B+Tree storage engine,
 no server — but storing schemaless **documents** queried with a MongoDB-style language.
 
 Written from scratch in C# for **.NET 10**, fully **Native AOT** compatible (zero trimming/AOT warnings,
@@ -139,7 +139,7 @@ db.VacuumInto("app.compact.folio");
 
 `VacuumInto` is deliberately an **explicit copy**, not an in-place file swap. It preserves the source main file and
 WAL on success, cancellation, I/O failure, or process crash; it never renames, truncates, checkpoints, or deletes
-either source file. The destination must be absent and cannot name the source, its `-wal`, an existing file,
+either source file. The destination must be absent and cannot name the source, its `-wal`/`-wal2`, an existing file,
 directory, hard-link path, or symlink (including a dangling symlink). It is published only after a complete,
 checkpointed staging database has been closed, through a non-overwriting move. If publication loses a race to an
 existing destination, it fails without deleting that foreign entry. Before publication, any interrupted work is only
@@ -424,7 +424,7 @@ FolioDatabase.Open("app.folio", new FolioOptions
 {
     PageSize = 4096,                          // new databases only (1024..32768)
     CacheSizePages = 4096,
-    AutoCheckpointFrames = 1000,              // 0 = manual db.Checkpoint() only
+    AutoCheckpointFrames = 1000,              // frames per WAL file before switching; 0 = manual db.Checkpoint() only
     Synchronous = SynchronousMode.Full,       // Full | Normal | Off, as PRAGMA synchronous
     BusyTimeout = TimeSpan.FromSeconds(30),
 });
@@ -455,13 +455,13 @@ folio> .dump > backup.js
 |---|---|---|
 | Documents | `Documents/*` | `Document`/`DocValue` model, binary serializer, `RawDocument` zero-copy reader (public `DocumentView` wrappers), relaxed JSON (`ObjectId()`, `ISODate()`, single quotes). |
 | Key encoding | `KeyEncoder.cs` | Order-preserving, memcmp-comparable encoding of any value (type rank + big-endian/escaped payload), so B+Trees compare raw bytes. Numbers of every type share one exact encoding: nearest double + integer remainder (+ 128-bit fraction only for non-double-representable decimals), computed with `Int128` arithmetic. |
-| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync, shared by concurrent commits in `Full`: group commit). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot through read marks; checkpoints copy up to the oldest mark without blocking readers and restart the WAL once it drains. |
+| Pager + WAL | `Storage/Pager.cs`, `StorageTx.cs` | Fixed-size pages, page cache, WAL frames with salts + cumulative checksums; commit = commit frame (+ fsync, shared by concurrent commits in `Full`: group commit). Recovery replays only fully committed, checksum-valid frames. Readers pin a WAL snapshot through read marks. Two WAL files alternate: when the active one is full the writer switches to the other and a background thread copies the old one into the main file and retires it, without blocking readers or the writer (which is only slowed down if it outruns the copy). |
 | B+Tree | `Storage/BTree.cs` | Variable-length keys/values, overflow pages for large documents, copy-on-write via the transaction page set. Splits are balanced, except an insert past the last key of the rightmost leaf, which starts a new leaf (SQLite-style quick balance) so ascending keys fill pages. |
 | Catalog / engine | `Engine/*` | Collections and index metadata in a catalog tree; index maintenance on insert/update/delete; unique constraints. |
 | Query | `Query/*` | Filter compiler over raw documents, planner (`IDHACK` / `IXSCAN` / `COLLSCAN`), update applier. |
 
-File layout: page 1 holds the header (`FolioDb format 1`, page size, catalog root, freelist); the WAL file is
-`<db>-wal`. Both files are opened exclusively, so **one process** owns a database at a time
+File layout: page 1 holds the header (`FolioDb format 1`, page size, catalog root, freelist); the WAL is split
+over `<db>-wal` and `<db>-wal2`, used alternately. All files are opened exclusively, so **one process** owns a database at a time
 (any number of threads inside it).
 
 ## Native AOT
@@ -1642,6 +1642,41 @@ it checkpoints ~58 times in 8 s and runs ~2.5k/s, the same rate as with no reade
 fsync costs up to a few percent. Writer stalls still come from the copy and the fsyncs, which the writer performs
 while holding the write lock. A snapshot kept open stops the backfill at its mark, as before, so the WAL grows
 while it lives; and readers whose snapshots keep overlapping for longer than ~128 ms can still postpone the restart.
+
+### Two WAL files and a background checkpointer
+
+The checkpoints above still ran on the writer, holding the write lock: the copy and its fsyncs (~70 ms per 1,000
+frames here) became the writer's p99.9. Moving them to a background thread with a single WAL was measured first and
+rejected: the WAL could only restart once a background pass caught up with a writer that never stops (writes +5-19%,
+stalls 2× worse, WAL 3-4× larger). The WAL is now split over two files, as in SQLite's `wal2` branch:
+
+- The writer appends to the **active** file. Once it holds `AutoCheckpointFrames` frames and the other file is empty,
+  the writer **switches** (one small header write, no fsync) and continues there.
+- A **checkpointer thread** copies the **old** file into the main file (the same backfill, still limited by the
+  oldest read mark) and **retires** it once no snapshot reads it: a "retired" header, fsync, truncate. The last
+  reader of the old file wakes it.
+- Each file's header has two record slots written alternately, so a torn header write leaves the previous one.
+  Recovery replays the older active file, then the newer one only if its header names the older's sequence number
+  and the checksum chain continues exactly; otherwise its frames may depend on lost ones and are dropped. A
+  single-file WAL from the previous version is replayed and converted on open.
+- **Backpressure**: if the writer outruns the copy, every commit past one file's worth of frames waits 1-4 ms
+  (longer the further ahead it is) for the retire, and at six files' worth it waits until the old file is retired.
+  Without it, a writer at full speed on this disk grew the WAL to 500-850 MiB in 8 s; a single hard limit gave
+  stalls of up to 1.8 s. Snapshots that hold the old file back do not throttle the writer (the WAL grows as before).
+
+Same database and probe, `c7b7cec` → now, two interleaved runs per row. "Saturated" is a writer at full speed;
+"1,500/s" paces it below the copy rate:
+
+| Writer, readers | Writes/s | Writer p99 | Writer p99.9 | Writer max | Max WAL |
+|---|---:|---:|---:|---:|---:|
+| saturated, 0 | 1.8-2.4k → 2.7-2.8k | 0.4-0.5 ms → 1.5-1.7 ms | 112-169 ms → **8-12 ms** | 136-176 ms → **56-74 ms** | 4 → 11-21 MiB |
+| saturated, 4 | 1.9-2.5k → 2.4-2.8k | 1.1-2.0 ms → 2.2-2.7 ms | 107-120 ms → **5.6-7.6 ms** | 145-235 ms → **61-69 ms** | 8-16 → 17-21 MiB |
+| 1,500/s, 0 | = | ≈ | 117-127 ms → **6-8 ms** | 146-235 ms → **54-67 ms** | 4 → 7 MiB |
+| 1,500/s, 4 | = | ≈ | 108-142 ms → **3-9 ms** | 149-184 ms → **59-108 ms** | 4-8 → 7 MiB |
+
+Read throughput is unchanged within noise. The saturated p99 rises because throttled commits wait a few ms instead
+of a few commits paying ~100 ms each. The remaining max comes from the commit's own WAL writes competing with the
+copy's fsyncs on the same disk.
 
 ### GC settings when the data does not fit in the cache
 
