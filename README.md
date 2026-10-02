@@ -1464,6 +1464,21 @@ still take precedence. Same workload, interleaved A/B:
 | Time, no secondary index | ~0.91-0.93 µs | **~0.77-0.83 µs** |
 | Time, index on `city` | ~3.18-3.34 µs | **~2.66-3.09 µs** |
 
+### Read-only transactions memoize only interior pages
+
+An indexed equality query fetches each matching `_id` from the primary tree, and with ids spread across the tree
+every fetch lands on a different leaf. Read-only transactions used to put those leaves in the memo too, so a query
+of 100 documents spent most of its time growing the dictionary that would never be hit again. Read-only
+transactions now memoize only interior pages; writers still keep leaves, since an update reads a leaf and then
+rewrites it (dropping them slowed batched indexed updates by ~10%). `IndexedEq` (100 of 10k documents):
+
+| | Before | After |
+|---|---:|---:|
+| `Find`, BenchmarkDotNet | 94.6 µs / 83.3 KB | **88.6 µs / 74.2 KB** |
+| `Visit` with no-op callback, probe | ~54-59 µs / 12.9 KB | **~49-51 µs / 3.7 KB** |
+
+Point reads and update workloads are unchanged within noise.
+
 ### Index entry deletes and inserts without a path list
 
 Every changed index key is one B+Tree delete and one insert. Both used to allocate the list of interior pages on

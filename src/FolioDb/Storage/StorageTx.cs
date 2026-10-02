@@ -16,6 +16,7 @@ internal sealed class StorageTx : IDisposable
     // Clean page images already resolved at _view. They are immutable and fixed for the snapshot, so repeated
     // descents (root, interior pages) skip the pager's WAL index and LRU locks. Started only after a few pager
     // reads, so short transactions allocate nothing, and bounded so long scans don't pin evicted pages.
+    // Read-only transactions keep only interior pages (see ReadClean).
     private Dictionary<uint, byte[]>? _clean;
     private int _pagerReads;
     private int _pagerMisses;
@@ -77,6 +78,9 @@ internal sealed class StorageTx : IDisposable
         if (pgno >= _header.PageCount) throw new CorruptDatabaseException($"Page {pgno} is out of range ({_header.PageCount} pages).");
         var page = _pager.ReadPage(pgno, _view, admit: _pagerMisses < _pager.ScanMissThreshold, out bool missed);
         if (missed) _pagerMisses++;
+        // Read-only transactions memoize only interior pages: their leaves are visited once per lookup, and keeping
+        // them only grows the memo. Writers keep leaves too, since an update reads a leaf and then rewrites it.
+        if (_dirty is null && page[0] != BTree.InteriorType) return page;
         if (_clean is not null)
         {
             if (_clean.Count < CleanMemoCapacity) _clean[pgno] = page;
@@ -125,6 +129,8 @@ internal sealed class StorageTx : IDisposable
         _header.FreePageCount++;
         _headerDirty = true;
     }
+
+    internal IReadOnlyCollection<byte[]> MemoizedPages => _clean?.Values ?? (IReadOnlyCollection<byte[]>)[];
 
     public bool HasChanges => _dirty is { Count: > 0 } || _headerDirty;
 
