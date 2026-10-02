@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace FolioDb;
@@ -188,35 +189,57 @@ internal readonly ref struct RawValue
     /// <summary>Reads the value starting at <paramref name="data"/>[0] and returns the number of bytes consumed.</summary>
     public static RawValue Read(DocType type, ReadOnlySpan<byte> data, out int consumed)
     {
-        switch (type)
-        {
-            case DocType.Null: consumed = 0; return new(type, default);
-            case DocType.Boolean: consumed = 1; return new(type, data[..1]);
-            case DocType.Int32: consumed = 4; return new(type, data[..4]);
-            case DocType.Int64:
-            case DocType.Double:
-            case DocType.DateTime: consumed = 8; return new(type, data[..8]);
-            case DocType.ObjectId: consumed = ObjectId.Size; return new(type, data[..ObjectId.Size]);
-            case DocType.Decimal: consumed = 16; return new(type, data[..16]);
-            case DocType.String:
-            case DocType.Binary:
-            {
-                int n = BinaryPrimitives.ReadInt32LittleEndian(data);
-                if (n < 0) throw new CorruptDatabaseException("Negative length.");
-                consumed = 4 + n;
-                return new(type, data.Slice(4, n));
-            }
-            case DocType.Document:
-            case DocType.Array:
-            {
-                int n = BinaryPrimitives.ReadInt32LittleEndian(data);
-                if (n < 5) throw new CorruptDatabaseException("Invalid nested length.");
-                consumed = n;
-                return new(type, data[..n]);
-            }
-            default: throw new CorruptDatabaseException($"Unknown value type 0x{(byte)type:X2}.");
-        }
+        consumed = Measure(type, data, 0, out int length);
+        return new(type, data.Slice(consumed - length, length));
     }
+
+    // Payload size of fixed-size types indexed by type byte; -1 = length-prefixed, -2 = unknown.
+    private static ReadOnlySpan<sbyte> FixedSizes =>
+    [
+        -2, 8, -1, -1, -1, -1, -2, ObjectId.Size, 1, 8, 0, -2, -2, -2, -2, -2, 4, -2, 8, 16,
+    ];
+
+    /// <summary>
+    /// Bytes occupied by the value at <paramref name="data"/>[<paramref name="pos"/>]; the payload is its last
+    /// <paramref name="length"/> bytes. Returns plain integers so enumerators keep their state in registers.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static int Measure(DocType type, ReadOnlySpan<byte> data, int pos, out int length)
+    {
+        var sizes = FixedSizes;
+        int size = (byte)type < (uint)sizes.Length ? sizes[(byte)type] : -2;
+        if (size >= 0)
+        {
+            if ((uint)pos > (uint)data.Length || size > data.Length - pos) ThrowTruncated();
+            length = size;
+            return size;
+        }
+        return MeasureVariable(type, data, pos, out length);
+    }
+
+    private static int MeasureVariable(DocType type, ReadOnlySpan<byte> data, int pos, out int length)
+    {
+        if (type is DocType.String or DocType.Binary or DocType.Document or DocType.Array)
+        {
+            if ((uint)pos > (uint)data.Length || data.Length - pos < 4) ThrowTruncated();
+            int n = BinaryPrimitives.ReadInt32LittleEndian(data[pos..]);
+            if (type is DocType.String or DocType.Binary)
+            {
+                if (n < 0) throw new CorruptDatabaseException("Negative length.");
+                if (n > data.Length - pos - 4) ThrowTruncated();
+                length = n;
+                return 4 + n;
+            }
+            if (n < 5) throw new CorruptDatabaseException("Invalid nested length.");
+            if (n > data.Length - pos) ThrowTruncated();
+            length = n;
+            return n;
+        }
+        throw new CorruptDatabaseException($"Unknown value type 0x{(byte)type:X2}.");
+    }
+
+    // Same exception the span slicing used to raise for truncated values.
+    internal static void ThrowTruncated() => throw new ArgumentOutOfRangeException("data");
 }
 
 /// <summary>Zero-copy reader over a serialized document.</summary>
@@ -286,28 +309,36 @@ internal readonly ref struct RawDocument
     {
         private readonly ReadOnlySpan<byte> _data;
         private int _pos;
-        private Field _current;
+        private int _nameStart, _nameLength, _valueLength;
+        private DocType _type;
 
         public Enumerator(ReadOnlySpan<byte> data)
         {
             _data = data;
             _pos = 4;
-            _current = default;
         }
 
-        public readonly Field Current => _current;
+        public readonly Field Current => new(
+            _data.Slice(_nameStart, _nameLength),
+            new RawValue(_type, _data.Slice(_pos - _valueLength, _valueLength)));
 
         public bool MoveNext()
         {
-            if (_pos >= _data.Length - 1) return false;
-            var type = (DocType)_data[_pos];
+            var data = _data;
+            int pos = _pos;
+            if (pos >= data.Length - 1) return false;
+            var type = (DocType)data[pos];
             if (type == 0) return false;
-            int nameLen = _data[_pos + 1];
-            var name = _data.Slice(_pos + 2, nameLen);
-            int vpos = _pos + 2 + nameLen;
-            var value = RawValue.Read(type, _data[vpos..], out int consumed);
+            int nameLength = data[pos + 1];
+            int vpos = pos + 2 + nameLength;
+            // The name is checked before the value, so a truncated name wins over an invalid value.
+            if (vpos > data.Length) RawValue.ThrowTruncated();
+            int consumed = RawValue.Measure(type, data, vpos, out int valueLength);
+            _type = type;
+            _nameStart = pos + 2;
+            _nameLength = nameLength;
+            _valueLength = valueLength;
             _pos = vpos + consumed;
-            _current = new Field(name, value);
             return true;
         }
     }
@@ -348,24 +379,28 @@ internal readonly ref struct RawArray
     {
         private readonly ReadOnlySpan<byte> _data;
         private int _pos;
-        private RawValue _current;
+        private int _valueLength;
+        private DocType _type;
 
         public Enumerator(ReadOnlySpan<byte> data)
         {
             _data = data;
             _pos = 4;
-            _current = default;
         }
 
-        public readonly RawValue Current => _current;
+        public readonly RawValue Current => new(_type, _data.Slice(_pos - _valueLength, _valueLength));
 
         public bool MoveNext()
         {
-            if (_pos >= _data.Length - 1) return false;
-            var type = (DocType)_data[_pos];
+            var data = _data;
+            int pos = _pos;
+            if (pos >= data.Length - 1) return false;
+            var type = (DocType)data[pos];
             if (type == 0) return false;
-            _current = RawValue.Read(type, _data[(_pos + 1)..], out int consumed);
-            _pos += 1 + consumed;
+            int consumed = RawValue.Measure(type, data, pos + 1, out int valueLength);
+            _type = type;
+            _valueLength = valueLength;
+            _pos = pos + 1 + consumed;
             return true;
         }
     }

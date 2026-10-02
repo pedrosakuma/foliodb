@@ -1498,6 +1498,29 @@ rewrites it (dropping them slowed batched indexed updates by ~10%). `IndexedEq` 
 
 Point reads and update workloads are unchanged within noise.
 
+### Forward-only field readers
+
+The document and array enumerators now keep offsets, lengths and the type byte rather than storing a
+span-containing value struct for every element. `Current` constructs the borrowed spans when requested.
+Fixed-size payload lengths come from a small table; length-prefixed values use a separate checked path.
+`MoveNext` still validates names and payload bounds, including when callers only count or skip fields.
+The binary format, public API and allocation sizes are unchanged.
+
+Same-host BenchmarkDotNet before/after (2026-10-02; queries return 100 of 10k records):
+
+| Operation | Before | After |
+|---|---:|---:|
+| Enumerate a 5-field flat document, microbenchmark | 107 ns | **17.9 ns** |
+| `FlatEq` `Visit`, read all fields in one pass | 48.1 µs | **38.2 µs** |
+| `FlatEq` `Find`, materialize full documents | 65.3 µs | **57.1 µs** |
+| `IndexedEq` `Find`, including the `tags` array | 87.0 µs | **74.6 µs** |
+| `IndexedEq` `Visit`, read `name` | 40.3 µs | **34.4 µs** |
+| Borrowed scalar point read, implicit transaction, 128 B payload | 503 ns | **351 ns** |
+| Borrowed scalar point read, existing snapshot, 128 B payload | 380 ns | **251 ns** |
+
+The 8 KiB overflow-document BenchmarkDotNet run was noisy; an interleaved snapshot-read probe returned
+roughly 3.5–3.9 µs for both versions, so no improvement is claimed for that case.
+
 ### Index entry deletes and inserts without a path list
 
 Every changed index key is one B+Tree delete and one insert. Both used to allocate the list of interior pages on
