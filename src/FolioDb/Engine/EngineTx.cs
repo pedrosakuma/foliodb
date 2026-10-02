@@ -10,11 +10,21 @@ internal sealed class EngineTx : IDisposable
     private string? _cachedName;
     private CollectionMeta? _cachedMeta;
     private Dictionary<string, CollectionMeta?>? _catalogCache;
+    // Read-only transactions read the shared cache at _sharedGeneration (-1: their snapshot cannot use it); writers
+    // only invalidate it when they commit catalog changes.
+    private readonly CatalogCache? _shared;
+    private readonly long _sharedGeneration = -1;
+    private bool _catalogChanged;
 
     public StorageTx Storage { get; }
     public bool IsWritable => Storage.IsWritable;
 
-    public EngineTx(StorageTx storage) => Storage = storage;
+    public EngineTx(StorageTx storage, CatalogCache? shared = null, long sharedGeneration = -1)
+    {
+        Storage = storage;
+        _shared = shared;
+        if (!storage.IsWritable) _sharedGeneration = sharedGeneration;
+    }
 
     private BTree Catalog => new(Storage, Storage.CatalogRoot);
 
@@ -54,8 +64,15 @@ internal sealed class EngineTx : IDisposable
     public CollectionMeta? GetCollection(string name)
     {
         if (TryGetCached(name, out var cached)) return cached;
+        bool shared = _shared is not null && _sharedGeneration >= 0;
+        if (shared && _shared!.TryGet(name, _sharedGeneration, out var hit))
+        {
+            Cache(name, hit);
+            return hit;
+        }
         CollectionMeta? meta = null;
         if (Catalog.TryGet(CatalogKey(name), out var bytes)) meta = CollectionMeta.FromBytes(bytes);
+        if (shared && meta is not null) _shared!.Store(name, _sharedGeneration, meta);
         Cache(name, meta);
         return meta;
     }
@@ -73,6 +90,7 @@ internal sealed class EngineTx : IDisposable
     public void SaveCollection(CollectionMeta meta)
     {
         Catalog.Insert(CatalogKey(meta.Name), DocumentSerializer.Serialize(meta.ToDocument()), overwrite: true);
+        _catalogChanged = true;
         Cache(meta.Name, meta);
     }
 
@@ -83,6 +101,7 @@ internal sealed class EngineTx : IDisposable
         foreach (var idx in meta.Indexes) new BTree(Storage, idx.Root).Drop();
         new BTree(Storage, meta.PrimaryRoot).Drop();
         Catalog.Delete(CatalogKey(name));
+        _catalogChanged = true;
         Cache(name, null);
         return true;
     }
@@ -96,6 +115,23 @@ internal sealed class EngineTx : IDisposable
         return names;
     }
 
-    public void Commit() => Storage.Commit();
+    public void Commit()
+    {
+        if (!_catalogChanged || _shared is null)
+        {
+            Storage.Commit();
+            return;
+        }
+        // Until its frames are visible (after WaitDurable in Full mode), readers must not trust the cache.
+        _shared.BeginChange();
+        try
+        {
+            Storage.Commit();
+        }
+        finally
+        {
+            _shared.EndChange();
+        }
+    }
     public void Dispose() => Storage.Dispose();
 }

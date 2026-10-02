@@ -14,6 +14,9 @@ public sealed class FolioDatabase : IDisposable
     private readonly Pager _pager;
     private readonly WriterLock _writeLock;
     private readonly FolioOptions _options;
+    private readonly CatalogCache _catalog = new();
+    internal CatalogCache Catalog => _catalog;
+    internal Action? TestBeforeReadSnapshot;
     private int _disposed;
 
     private FolioDatabase(Pager pager, FolioOptions options)
@@ -41,7 +44,10 @@ public sealed class FolioDatabase : IDisposable
     internal EngineTx BeginRead()
     {
         ThrowIfDisposed();
-        return new EngineTx(new StorageTx(_pager, writable: false, deleteRebalance: _options.DeleteRebalance));
+        long generation = _catalog.Generation;
+        TestBeforeReadSnapshot?.Invoke();
+        var storage = new StorageTx(_pager, writable: false, deleteRebalance: _options.DeleteRebalance);
+        return new EngineTx(storage, _catalog, _catalog.Validate(generation));
     }
 
     internal EngineTx BeginWrite()
@@ -56,7 +62,7 @@ public sealed class FolioDatabase : IDisposable
                 _pager,
                 writable: true,
                 onDispose: () => _writeLock.Release(),
-                deleteRebalance: _options.DeleteRebalance));
+                deleteRebalance: _options.DeleteRebalance), _catalog);
         }
         catch
         {

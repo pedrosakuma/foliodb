@@ -1686,6 +1686,23 @@ frees pages (or upgrades an older format), so an in-place `$inc` logs 1 frame in
 `Normal`): writer p50 34-48 → 20-22 µs, p99.9 5.0-6.2 → 2.6-4.6 ms with no readers, about half the WAL switches;
 throughput and reads within noise. `Full` (fsync-bound at ~100 commits/s on this disk) is unchanged.
 
+### Shared catalog cache for implicit reads
+
+Every implicit read (outside a snapshot or transaction) used to look up its collection in the catalog B+Tree and
+decode its metadata (name, roots, indexes). Read-only transactions now share decoded metadata, validated by a sequence
+lock: a commit that changes the catalog marks itself in flight before its frames can become visible and ends once they
+are (commits can overlap, since the write lock is released before waiting for durability), and a reader uses the cache
+only if no such commit was in flight and none started or ended while it took its snapshot. Writers never read it (they
+mutate their metadata), and snapshots keep the catalog they started with. BenchmarkDotNet, same machine:
+
+| Benchmark | Before | After |
+|---|---:|---:|
+| `FindById`, collection with one index (QueryBenchmarks) | 2.48 µs, 1.38 KB | **1.06 µs**, 1.05 KB |
+| `FindById`, 128 B documents (PointReadBenchmarks) | 1,086 ns, 1,016 B | **639 ns**, 904 B |
+| Borrowed scalar read, 128 B | 862 ns, 328 B | **490 ns**, 216 B |
+
+Reads inside an existing snapshot (already cached per transaction) and multi-document queries are unchanged.
+
 ### GC settings when the data does not fit in the cache
 
 Before page recycling, disabling background GC in the host application (a process-wide setting) roughly doubled
