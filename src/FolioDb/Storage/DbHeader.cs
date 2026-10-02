@@ -14,7 +14,8 @@ internal struct DbHeader
     public uint FreeListHead;
     public uint FreePageCount;
     public uint CatalogRoot;
-    public ulong ChangeCounter;
+    public ulong ChangeCounter; // commits that changed the header (not every commit)
+    public int Version; // as read; Write upgrades it to FormatVersion
 
     public static DbHeader Read(ReadOnlySpan<byte> page)
     {
@@ -29,6 +30,7 @@ internal struct DbHeader
             FreePageCount = BinaryPrimitives.ReadUInt32LittleEndian(page[32..]),
             CatalogRoot = BinaryPrimitives.ReadUInt32LittleEndian(page[36..]),
             ChangeCounter = BinaryPrimitives.ReadUInt64LittleEndian(page[40..]),
+            Version = version,
         };
     }
 

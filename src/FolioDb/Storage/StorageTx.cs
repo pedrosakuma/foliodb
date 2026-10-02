@@ -137,8 +137,13 @@ internal sealed class StorageTx : IDisposable
         {
             if (HasChanges)
             {
-                _header.ChangeCounter++;
-                _header.Write(WritePage(0));
+                // Only when page allocation changed it (or to upgrade an older format): most commits (in-place updates)
+                // would otherwise log page 0 too, doubling their WAL frames.
+                if (_headerDirty || _header.Version != DbHeader.FormatVersion)
+                {
+                    _header.ChangeCounter++;
+                    _header.Write(WritePage(0));
+                }
                 var pages = _dirty.OrderBy(static kv => kv.Key).ToList();
                 durableAt = _pager.Commit(pages, _header.PageCount);
             }

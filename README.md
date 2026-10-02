@@ -1678,6 +1678,14 @@ Read throughput is unchanged within noise. The saturated p99 rises because throt
 of a few commits paying ~100 ms each. The remaining max comes from the commit's own WAL writes competing with the
 copy's fsyncs on the same disk.
 
+Profiling the saturated writer afterwards showed the checkpointer busy ~98% of the time, ~60% of it in the main
+file's fsync, whose cost grows with the number of (random) pages copied: `fdatasync`, larger batches and an adaptive
+throttle only moved the wait around. What does help is logging fewer pages per commit: page 0 (the header) used to be
+logged by every commit, only to bump a change counter nothing reads. It is now logged only when a commit allocates or
+frees pages (or upgrades an older format), so an in-place `$inc` logs 1 frame instead of 2 (interleaved A/B, 8 s,
+`Normal`): writer p50 34-48 → 20-22 µs, p99.9 5.0-6.2 → 2.6-4.6 ms with no readers, about half the WAL switches;
+throughput and reads within noise. `Full` (fsync-bound at ~100 commits/s on this disk) is unchanged.
+
 ### GC settings when the data does not fit in the cache
 
 Before page recycling, disabling background GC in the host application (a process-wide setting) roughly doubled

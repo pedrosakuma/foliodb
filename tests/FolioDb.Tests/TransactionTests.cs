@@ -407,4 +407,37 @@ public class TransactionTests
         Assert.True(reads > 10, $"reads={reads}");
         db.CheckIntegrity();
     }
+
+    [Fact]
+    public void An_in_place_update_does_not_log_the_header_page()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 0 });
+        var c = db.GetCollection("docs");
+        for (int i = 0; i < 100; i++) c.Insert(new Document { ["_id"] = i, ["v"] = 0 });
+        Assert.True(db.Checkpoint());
+        c.UpdateOne(new Document { ["_id"] = 7 }, Document.Parse("{ $inc: { v: 1 } }"));
+        Assert.Equal(1, db.Pager.WalFrameCount);
+    }
+
+    [Fact]
+    public void Commits_that_allocate_or_free_pages_still_persist_the_header()
+    {
+        using var tmp = new TempDb();
+        var db = tmp.Open(new FolioOptions { AutoCheckpointFrames = 0, Synchronous = SynchronousMode.Normal });
+        var c = db.GetCollection("docs");
+        Assert.True(db.Checkpoint());
+        for (int i = 0; i < 200; i++) c.Insert(new Document { ["_id"] = i, ["pad"] = new string('p', 500) });
+        for (int i = 0; i < 200; i += 2) c.DeleteOne(new Document { ["_id"] = i });
+        for (int i = 1; i < 200; i += 2) c.UpdateOne(new Document { ["_id"] = i }, Document.Parse("{ $set: { v: 1 } }"));
+        db.SimulateCrash();
+
+        using var reopened = tmp.Open();
+        var rc = reopened.GetCollection("docs");
+        Assert.Equal(100, rc.Count());
+        // Pages allocated after the recovery must not overwrite live ones.
+        for (int i = 200; i < 400; i++) rc.Insert(new Document { ["_id"] = i, ["pad"] = new string('q', 500) });
+        Assert.Equal(300, rc.Count());
+        reopened.CheckIntegrity();
+    }
 }

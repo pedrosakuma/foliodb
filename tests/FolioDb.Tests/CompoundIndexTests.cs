@@ -232,4 +232,25 @@ public sealed class CompoundIndexTests
         }
         Assert.Equal(3, BinaryPrimitives.ReadInt32LittleEndian(File.ReadAllBytes(tmp.Path).AsSpan(20)));
     }
+
+    [Fact]
+    public void AnyCommitUpgradesAVersionTwoHeader()
+    {
+        using var tmp = new TempDb();
+        using (var db = tmp.Open())
+        {
+            db.GetCollection("c").Insert("{_id:1,a:2}");
+            db.Checkpoint();
+        }
+        using (var file = File.OpenWrite(tmp.Path))
+        {
+            file.Position = 20;
+            Span<byte> version = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32LittleEndian(version, 2);
+            file.Write(version);
+        }
+        using (var db = tmp.Open())
+            db.GetCollection("c").UpdateOne(Document.Parse("{_id:1}"), Document.Parse("{$set:{a:3}}"));
+        Assert.Equal(3, BinaryPrimitives.ReadInt32LittleEndian(File.ReadAllBytes(tmp.Path).AsSpan(20)));
+    }
 }
