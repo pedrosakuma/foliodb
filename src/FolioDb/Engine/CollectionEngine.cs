@@ -42,7 +42,12 @@ internal static class CollectionEngine
     /// <remarks>Compound hints are the component hints followed by the <see cref="IndexHint.InOrder"/> flag.</remarks>
     internal static List<IndexKey> ExtractIndexKeys(ReadOnlySpan<byte> doc, IndexMeta index, out bool multiKey)
     {
-        if (index.IsSimple) return ExtractIndexKeys(doc, index.Paths[0], out multiKey);
+        if (index.IsSimple)
+        {
+            var simple = ExtractIndexKeys(doc, index.Paths[0], out multiKey);
+            if (simple.Count == 0 && index.IndexesMissing) simple.Add(s_missing);
+            return simple;
+        }
         multiKey = false;
         var fields = index.Fields;
         var parts = new List<IndexKey>[fields.Length];
@@ -323,8 +328,8 @@ internal static class CollectionEngine
             bool multi = false;
             scalarBuffer ??= new ByteBuffer(64);
             if (index.IsSimple
-                && TryScalarKey(oldBytes, index.Paths[0], scalarBuffer, out var oldKey)
-                && TryScalarKey(newBytes, index.Paths[0], scalarBuffer, out var newKey))
+                && TryScalarKey(oldBytes, index.Paths[0], index.IndexesMissing, scalarBuffer, out var oldKey)
+                && TryScalarKey(newBytes, index.Paths[0], index.IndexesMissing, scalarBuffer, out var newKey))
                 (removed, written, addedCount) = DiffScalarKeys(oldKey, newKey, idHintChanged);
             else
             {
@@ -408,12 +413,12 @@ internal static class CollectionEngine
 
     /// <summary>
     /// The single key a simple index takes from <paramref name="doc"/> when no array lies on <paramref name="path"/>
-    /// (null when the field is missing), as <see cref="ExtractIndexKeys(ReadOnlySpan{byte}, FieldPath, out bool)"/>
+    /// (null when the field is missing and the index does not index missing fields), as <see cref="ExtractIndexKeys(ReadOnlySpan{byte}, FieldPath, out bool)"/>
     /// would produce it. False when an array is reached, which can expand to several keys.
     /// </summary>
-    private static bool TryScalarKey(ReadOnlySpan<byte> doc, FieldPath path, ByteBuffer buf, out IndexKey? key)
+    private static bool TryScalarKey(ReadOnlySpan<byte> doc, FieldPath path, bool indexesMissing, ByteBuffer buf, out IndexKey? key)
     {
-        key = null;
+        key = indexesMissing ? s_missing : null;
         var v = new RawValue(DocType.Document, new RawDocument(doc).Data);
         foreach (var segment in path.Segments)
         {
@@ -541,6 +546,64 @@ internal static class CollectionEngine
         return n;
     }
 
+    private const int MaxTopN = 4096;
+
+    /// <summary>
+    /// Sorted read straight from a complete single-field index (see <see cref="IndexMeta.IndexesMissing"/>), stopping once
+    /// the limit is reached. Entries are ordered by (value, id), which is the sort order with scan-order ties; descending
+    /// walks backwards and so re-reverses each group of equal values to keep ties in id order.
+    /// </summary>
+    private static void FindOrdered(EngineTx tx, CollectionMeta meta, IndexMeta index, bool descending, Projection? projection, int skip, int limit, List<Document> result)
+    {
+        var fetch = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
+        var cur = new BTree(tx.Storage, index.Root).CreateCursor();
+        int skipped = 0;
+        bool Emit(ReadOnlySpan<byte> idKey)
+        {
+            if (!fetch.SeekExact(idKey)) throw new CorruptDatabaseException("Index references a missing document.");
+            if (skipped < skip)
+            {
+                skipped++;
+                return true;
+            }
+            var raw = new RawDocument(fetch.Value);
+            result.Add(projection is null ? raw.ToDocument() : projection.Apply(raw));
+            return result.Count < limit;
+        }
+
+        if (!descending)
+        {
+            for (bool ok = cur.SeekFirst(); ok; ok = cur.MoveNext())
+            {
+                var key = cur.Key;
+                if (!Emit(key[index.ValueLength(key)..])) return;
+            }
+            return;
+        }
+
+        var group = new List<byte[]>();
+        byte[]? groupValue = null;
+        bool Flush()
+        {
+            for (int i = group.Count - 1; i >= 0; i--)
+                if (!Emit(group[i])) return false;
+            group.Clear();
+            return true;
+        }
+        for (bool ok = cur.SeekLast(); ok; ok = cur.MovePrev())
+        {
+            var key = cur.Key;
+            int valueLength = index.ValueLength(key);
+            if (groupValue is null || !key[..valueLength].SequenceEqual(groupValue))
+            {
+                if (!Flush()) return;
+                groupValue = key[..valueLength].ToArray();
+            }
+            group.Add(key[valueLength..].ToArray());
+        }
+        Flush();
+    }
+
     public static List<Document> Find(EngineTx tx, CollectionMeta? meta, Filter filter, FindOptions? options)
     {
         var result = new List<Document>();
@@ -582,9 +645,16 @@ internal static class CollectionEngine
             return result;
         }
 
-        var rows = new List<(byte[][] Keys, int Seq, byte[] Bytes)>();
         long window = limit == int.MaxValue ? long.MaxValue : (long)skip + limit;
-        if (window <= 4096)
+        if (window <= MaxTopN && check is null && plan.Kind == PlanKind.FullScan && sort.SingleField is { } sortPath
+            && meta.Indexes.Find(i => i.IsSimple && i.IndexesMissing && !i.MultiKey && i.Field == sortPath) is { } ordered)
+        {
+            FindOrdered(tx, meta, ordered, sort.SingleDirection < 0, projection, skip, limit, result);
+            return result;
+        }
+
+        var rows = new List<(byte[][] Keys, int Seq, byte[] Bytes)>();
+        if (window <= MaxTopN)
         {
             // Bounded top-N: a max-heap of the best `window` rows (worst on top); only rows that enter copy their bytes.
             int k = (int)window, seq = 0;
@@ -721,7 +791,7 @@ internal static class CollectionEngine
         string baseName = name;
         for (int suffix = 2; meta.Indexes.Exists(i => i.Name == name); suffix++) name = baseName + "_" + suffix;
 
-        var index = new IndexMeta { Name = name, Fields = fields, Unique = unique, Root = BTree.Create(tx.Storage) };
+        var index = new IndexMeta { Name = name, Fields = fields, Unique = unique, Root = BTree.Create(tx.Storage), IndexesMissing = !unique && fields.Length == 1 && !fields[0].Descending };
         var tree = new BTree(tx.Storage, index.Root);
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
         var cur = primary.CreateCursor();
@@ -797,6 +867,7 @@ internal static class CollectionEngine
         IndexMeta template, CancellationToken cancellationToken)
     {
         using var sorted = new IndexSort();
+        var extractor = template.WithMissing();
         var primary = new BTree(source.Storage, sourceMeta.PrimaryRoot).CreateCursor();
         bool multiKey = false;
         for (bool ok = primary.SeekFirst(); ok; ok = primary.MoveNext())
@@ -805,7 +876,7 @@ internal static class CollectionEngine
             var idKey = primary.Key;
             var bytes = primary.Value;
             var idHint = IndexHint.ForId(bytes);
-            var keys = ExtractIndexKeys(bytes, template, out bool multi);
+            var keys = ExtractIndexKeys(bytes, extractor, out bool multi);
             multiKey |= multi;
             foreach (var (key, hint) in keys)
             {
@@ -841,6 +912,7 @@ internal static class CollectionEngine
             Unique = template.Unique,
             Root = builder.Finish(),
             MultiKey = multiKey,
+            IndexesMissing = extractor.IndexesMissing,
         };
     }
 
@@ -848,6 +920,7 @@ internal static class CollectionEngine
     {
         if (old is null) return false;
         using var sorted = new IndexSort();
+        var extractor = old.WithMissing();
         var primary = new BTree(tx.Storage, meta.PrimaryRoot).CreateCursor();
         bool multiKey = false;
         for (bool ok = primary.SeekFirst(); ok; ok = primary.MoveNext())
@@ -855,7 +928,7 @@ internal static class CollectionEngine
             var idKey = primary.Key;
             var bytes = primary.Value;
             var idHint = IndexHint.ForId(bytes);
-            var keys = ExtractIndexKeys(bytes, old, out bool multi);
+            var keys = ExtractIndexKeys(bytes, extractor, out bool multi);
             multiKey |= multi;
             foreach (var (key, hint) in keys)
             {
@@ -890,6 +963,7 @@ internal static class CollectionEngine
             Unique = old.Unique,
             Root = builder.Finish(),
             MultiKey = multiKey,
+            IndexesMissing = extractor.IndexesMissing,
         };
         meta.Indexes[meta.Indexes.IndexOf(old)] = replacement;
         tx.SaveCollection(meta);
@@ -904,6 +978,11 @@ internal sealed class SortSpec
     private readonly (byte[][] Segments, int Direction)[] _fields;
 
     private SortSpec((byte[][], int)[] fields) => _fields = fields;
+
+    /// <summary>Dotted path when sorting by exactly one field.</summary>
+    public string? SingleField => _fields.Length == 1 ? string.Join(".", _fields[0].Segments.Select(Encoding.UTF8.GetString)) : null;
+
+    public int SingleDirection => _fields[0].Direction;
 
     public static SortSpec? Parse(Document? sort)
     {

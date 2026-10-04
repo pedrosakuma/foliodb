@@ -1806,4 +1806,9 @@ of scope; the cache lock above was the actual bottleneck.
 | Top 10 by `age` (indexed) | 6.8 ms / 2.9 MB | 1.16 ms / 1.1 MB | 17 µs |
 
 Range scans (`age >= 88`, ~222 rows) already beat SQLite: 62 µs (Visit) / 110 µs (Find) vs 235 µs; count 4.3 vs 9.7 µs.
-Index-ordered scans with limit pushdown (the indexed top-N gap) remain open.
+
+Simple non-unique indexes created by this version also hold a null-keyed entry for documents missing the field (as sorts
+already treat them), so the index is a complete ordering. `Sort` + `Limit` on such a field (no filter) then walks the
+index (backwards for descending, re-reversing each equal-value group so ties stay in `_id` order) and stops at the limit:
+top 10 by `age` goes 1.16 ms → 8.7 µs (SQLite 16.6 µs). Older indexes and unique ones keep the heap path until
+`RebuildIndex` (or a vacuum) upgrades them.

@@ -933,6 +933,62 @@ internal readonly struct BTree
             return Settle();
         }
 
+        public bool SeekLast()
+        {
+            _stack.Clear();
+            DescendRightmost(_root);
+            return SettleBackward();
+        }
+
+        public bool MovePrev()
+        {
+            if (!IsValid) return false;
+            _index--;
+            return SettleBackward();
+        }
+
+        private void DescendRightmost(uint pg)
+        {
+            while (true)
+            {
+                var page = _tx.ReadPage(pg);
+                if (IsLeaf(page))
+                {
+                    _leaf = page;
+                    _index = Count(page) - 1;
+                    return;
+                }
+                int last = Count(page);
+                _stack.Add((pg, page, last));
+                pg = ChildAt(page, last);
+            }
+        }
+
+        private bool SettleBackward()
+        {
+            while (_index < 0)
+            {
+                while (true)
+                {
+                    if (_stack.Count == 0)
+                    {
+                        IsValid = false;
+                        return false;
+                    }
+                    var (pg, parent, idx) = _stack[^1];
+                    if (idx > 0)
+                    {
+                        _stack[^1] = (pg, parent, idx - 1);
+                        DescendRightmost(ChildAt(parent, idx - 1));
+                        break;
+                    }
+                    _stack.RemoveAt(_stack.Count - 1);
+                }
+            }
+            IsValid = true;
+            return true;
+        }
+
         private void DescendLeftmost(uint pg)
         {
             while (true)

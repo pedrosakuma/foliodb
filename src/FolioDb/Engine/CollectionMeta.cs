@@ -17,11 +17,25 @@ internal sealed class IndexMeta
     public bool MultiKey { get; set; }
 
     /// <summary>
+    /// Simple non-unique indexes created by this version also hold an entry (as null) for documents missing the field,
+    /// which is how sorts treat them. That makes the index a complete ordering of the collection. Legacy indexes
+    /// (and unique ones, where several missing fields would collide) do not.
+    /// </summary>
+    public bool IndexesMissing { get; init; }
+
+    /// <summary>
     /// A plain ascending single-field index. Its entries are <c>value ++ idKey</c> and documents missing the field are
     /// not indexed. Other (compound or descending) indexes store one component per field (descending components have
     /// their bytes inverted, which reverses their order because encodings are prefix-free), and index a document when
     /// at least one field is present (missing ones as null).
     /// </summary>
+    /// <summary>This index as (re)built by this version: simple non-unique indexes also index missing fields.</summary>
+    public IndexMeta WithMissing() => new()
+    {
+        Name = Name, Fields = Fields, Unique = Unique, Root = Root, MultiKey = MultiKey,
+        IndexesMissing = !Unique && IsSimple,
+    };
+
     public bool IsSimple => Fields.Length == 1 && !Fields[0].Descending;
 
     /// <summary>Indexed path for single-field indexes, comma-separated paths for compound ones.</summary>
@@ -155,6 +169,7 @@ internal sealed class IndexMeta
         d["unique"] = Unique;
         d["root"] = (long)Root;
         d["multiKey"] = MultiKey;
+        if (IndexesMissing) d["missing"] = true;
         return d;
     }
 
@@ -165,6 +180,7 @@ internal sealed class IndexMeta
         Unique = CollectionMeta.Field(d, "unique"u8).AsBoolean,
         Root = (uint)CollectionMeta.Field(d, "root"u8).AsInt64,
         MultiKey = CollectionMeta.Field(d, "multiKey"u8).AsBoolean,
+        IndexesMissing = d.TryGetValue("missing"u8, out var missing) && missing.AsBoolean,
     };
 }
 
