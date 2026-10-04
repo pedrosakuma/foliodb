@@ -23,6 +23,9 @@ internal sealed class IndexMeta
     /// </summary>
     public bool IndexesMissing { get; init; }
 
+    /// <summary>Opted out of indexing missing fields at creation (<c>sparse: true</c>); kept across rebuilds and vacuum.</summary>
+    public bool Sparse { get; init; }
+
     /// <summary>
     /// A plain ascending single-field index. Its entries are <c>value ++ idKey</c> and documents missing the field are
     /// not indexed. Other (compound or descending) indexes store one component per field (descending components have
@@ -32,8 +35,8 @@ internal sealed class IndexMeta
     /// <summary>This index as (re)built by this version: simple non-unique indexes also index missing fields.</summary>
     public IndexMeta WithMissing() => new()
     {
-        Name = Name, Fields = Fields, Unique = Unique, Root = Root, MultiKey = MultiKey,
-        IndexesMissing = !Unique && IsSimple,
+        Name = Name, Fields = Fields, Unique = Unique, Root = Root, MultiKey = MultiKey, Sparse = Sparse,
+        IndexesMissing = !Unique && IsSimple && !Sparse,
     };
 
     public bool IsSimple => Fields.Length == 1 && !Fields[0].Descending;
@@ -170,6 +173,7 @@ internal sealed class IndexMeta
         d["root"] = (long)Root;
         d["multiKey"] = MultiKey;
         if (IndexesMissing) d["missing"] = true;
+        if (Sparse) d["sparse"] = true;
         return d;
     }
 
@@ -181,6 +185,7 @@ internal sealed class IndexMeta
         Root = (uint)CollectionMeta.Field(d, "root"u8).AsInt64,
         MultiKey = CollectionMeta.Field(d, "multiKey"u8).AsBoolean,
         IndexesMissing = d.TryGetValue("missing"u8, out var missing) && missing.AsBoolean,
+        Sparse = d.TryGetValue("sparse"u8, out var sparse) && sparse.AsBoolean,
     };
 }
 

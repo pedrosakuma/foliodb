@@ -769,29 +769,31 @@ internal static class CollectionEngine
         }, withHints: true);
     }
 
-    public static string CreateIndex(EngineTx tx, CollectionMeta meta, string field, bool unique)
+    public static string CreateIndex(EngineTx tx, CollectionMeta meta, string field, bool unique, bool sparse = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(field);
-        return CreateIndex(tx, meta, new Document { [field] = 1 }, unique);
+        return CreateIndex(tx, meta, new Document { [field] = 1 }, unique, sparse);
     }
 
-    public static string CreateIndex(EngineTx tx, CollectionMeta meta, Document keys, bool unique)
+    // Sparse: simple non-unique indexes skip documents missing the field (cheaper writes) instead of indexing them as null, which disables index-ordered sorts. Ignored for unique, compound and descending indexes.
+    public static string CreateIndex(EngineTx tx, CollectionMeta meta, Document keys, bool unique, bool sparse = false)
     {
         var fields = IndexMeta.ParsePattern(keys);
+        sparse &= !unique && fields.Length == 1 && !fields[0].Descending;
         if (fields.Length == 1 && fields[0].Path == "_id") return "_id_";
         if (fields.Select(f => f.Path).Distinct().Count() != fields.Length) throw new FolioException("An index cannot contain the same field twice.");
 
         var existing = meta.Indexes.FirstOrDefault(i => i.SameFields(fields));
         if (existing is not null)
         {
-            if (existing.Unique != unique) throw new FolioException($"Index '{existing.Name}' already exists with different options.");
+            if (existing.Unique != unique || existing.Sparse != sparse) throw new FolioException($"Index '{existing.Name}' already exists with different options.");
             return existing.Name;
         }
         string name = IndexMeta.DefaultName(fields);
         string baseName = name;
         for (int suffix = 2; meta.Indexes.Exists(i => i.Name == name); suffix++) name = baseName + "_" + suffix;
 
-        var index = new IndexMeta { Name = name, Fields = fields, Unique = unique, Root = BTree.Create(tx.Storage), IndexesMissing = !unique && fields.Length == 1 && !fields[0].Descending };
+        var index = new IndexMeta { Name = name, Fields = fields, Unique = unique, Root = BTree.Create(tx.Storage), Sparse = sparse, IndexesMissing = !unique && fields.Length == 1 && !fields[0].Descending && !sparse };
         var tree = new BTree(tx.Storage, index.Root);
         var primary = new BTree(tx.Storage, meta.PrimaryRoot);
         var cur = primary.CreateCursor();
@@ -913,6 +915,7 @@ internal static class CollectionEngine
             Root = builder.Finish(),
             MultiKey = multiKey,
             IndexesMissing = extractor.IndexesMissing,
+            Sparse = template.Sparse,
         };
     }
 
@@ -964,6 +967,7 @@ internal static class CollectionEngine
             Root = builder.Finish(),
             MultiKey = multiKey,
             IndexesMissing = extractor.IndexesMissing,
+            Sparse = old.Sparse,
         };
         meta.Indexes[meta.Indexes.IndexOf(old)] = replacement;
         tx.SaveCollection(meta);

@@ -131,10 +131,10 @@ public sealed class Collection<T> where T : IFolioDocument<T>
     public long DeleteMany(Document? filter = null) => Untyped.DeleteMany(filter);
     public long DeleteMany(string? filter) => Untyped.DeleteMany(filter);
 
-    public string CreateIndex(string field, bool unique = false) => Untyped.CreateIndex(field, unique);
+    public string CreateIndex(string field, bool unique = false, bool sparse = false) => Untyped.CreateIndex(field, unique, sparse);
     public List<Document> Aggregate(IEnumerable<Document> pipeline) => Untyped.Aggregate(pipeline);
     public List<Document> Aggregate(string pipeline) => Untyped.Aggregate(pipeline);
-    public string CreateIndex(Document keys, bool unique = false) => Untyped.CreateIndex(keys, unique);
+    public string CreateIndex(Document keys, bool unique = false, bool sparse = false) => Untyped.CreateIndex(keys, unique, sparse);
     public bool DropIndex(string nameOrField) => Untyped.DropIndex(nameOrField);
     public bool DropIndex(Document keys) => Untyped.DropIndex(keys);
     public bool RebuildIndex(string nameOrField) => Untyped.RebuildIndex(nameOrField);

@@ -378,13 +378,17 @@ public sealed class Collection
 
     // ------------------------------------------------------------------ indexes
 
-    /// <summary>Creates (or returns the existing) secondary index on a field path such as <c>"address.city"</c>.</summary>
-    public string CreateIndex(string field, bool unique = false) =>
-        Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), field, unique), atomic: false);
+    /// <summary>
+    /// Creates (or returns the existing) secondary index on a field path such as <c>"address.city"</c>. By default simple
+    /// indexes also hold documents missing the field (as null), which lets <c>Sort</c> + <c>Limit</c> walk the index;
+    /// <paramref name="sparse"/> skips them, making writes cheaper for rarely present fields.
+    /// </summary>
+    public string CreateIndex(string field, bool unique = false, bool sparse = false) =>
+        Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), field, unique, sparse), atomic: false);
 
     /// <summary>Creates an ordered index key pattern, e.g. <c>{ customer: 1, total: -1 }</c>.</summary>
-    public string CreateIndex(Document keys, bool unique = false) =>
-        Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), keys, unique), atomic: false);
+    public string CreateIndex(Document keys, bool unique = false, bool sparse = false) =>
+        Write(tx => CollectionEngine.CreateIndex(tx, tx.GetOrCreateCollection(Name), keys, unique, sparse), atomic: false);
 
     public bool DropIndex(string nameOrField) => Write(tx =>
     {

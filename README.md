@@ -1812,3 +1812,7 @@ already treat them), so the index is a complete ordering. `Sort` + `Limit` on su
 index (backwards for descending, re-reversing each equal-value group so ties stay in `_id` order) and stops at the limit:
 top 10 by `age` goes 1.16 ms → 8.7 µs (SQLite 16.6 µs). Older indexes and unique ones keep the heap path until
 `RebuildIndex` (or a vacuum) upgrades them.
+
+Indexing missing fields costs writes on rarely present fields (measured on 100k docs with 10% having the field: inserts
+~+5–25%, `$set` on the field ~+8%). `CreateIndex("field", sparse: true)` (CLI: `{ sparse: true }`) skips them, restoring the
+old write cost; sorts on a sparse index use the heap path. The choice survives `RebuildIndex` and vacuum.

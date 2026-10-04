@@ -70,3 +70,61 @@ public class IndexOrderedSortTests
             Assert.Equal(plain.Find(f).Select(d => (long)d["_id"].AsInt64).Order(), c.Find(f).Select(d => (long)d["_id"].AsInt64).Order());
     }
 }
+
+public class SparseIndexTests
+{
+    private static long Entries(FolioDatabase db, string collection)
+    {
+        using var tx = db.BeginRead();
+        var meta = tx.GetCollection(collection)!;
+        return new FolioDb.Storage.BTree(tx.Storage, meta.Indexes[0].Root).Verify();
+    }
+
+    private static IEnumerable<Document> Docs() => Enumerable.Range(0, 1000).Select(i =>
+    {
+        var d = new Document { ["_id"] = i };
+        if (i % 4 != 0) d["v"] = i % 17;
+        return d;
+    });
+
+    [Fact]
+    public void Sparse_index_skips_missing_fields_keeps_results_and_survives_rebuild()
+    {
+        using var tmp = new TempDb();
+        using var db = tmp.Open();
+        var plain = db.GetCollection("plain");
+        var full = db.GetCollection("full");
+        var sparse = db.GetCollection("sparse");
+        plain.InsertMany(Docs());
+        full.CreateIndex("v");
+        sparse.CreateIndex("v", sparse: true);
+        full.InsertMany(Docs());
+        sparse.InsertMany(Docs());
+        Assert.Throws<FolioException>(() => sparse.CreateIndex("v"));
+        Assert.Equal("v_1", sparse.CreateIndex("v", sparse: true));
+
+        void Check()
+        {
+            foreach (int dir in new[] { 1, -1 })
+            {
+                var o = new FindOptions { Sort = new Document { ["v"] = dir }, Skip = 3, Limit = 25 };
+                var expect = plain.Find((Document?)null, o).Select(d => d["_id"]);
+                Assert.Equal(expect, full.Find((Document?)null, o).Select(d => d["_id"]));
+                Assert.Equal(expect, sparse.Find((Document?)null, o).Select(d => d["_id"]));
+            }
+            var f = new Document { ["v"] = new Document { ["$gte"] = 10 } };
+            Assert.Equal(plain.Count(f), sparse.Count(f));
+        }
+        Check();
+        sparse.UpdateMany(new Document { ["_id"] = new Document { ["$lt"] = 100 } }, new Document { ["$unset"] = new Document { ["v"] = 1 } });
+        plain.UpdateMany(new Document { ["_id"] = new Document { ["$lt"] = 100 } }, new Document { ["$unset"] = new Document { ["v"] = 1 } });
+        full.UpdateMany(new Document { ["_id"] = new Document { ["$lt"] = 100 } }, new Document { ["$unset"] = new Document { ["v"] = 1 } });
+        Check();
+        Assert.True(sparse.RebuildIndex("v_1"));
+        Check();
+
+        db.CheckIntegrity();
+        Assert.Equal(1000 - 100 - 225, Entries(db, "sparse"));
+        Assert.Equal(1000, Entries(db, "full"));
+    }
+}

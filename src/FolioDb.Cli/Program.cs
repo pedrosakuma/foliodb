@@ -373,7 +373,7 @@ internal sealed class Shell : IDisposable
             case "createIndex" or "ensureIndex":
             {
                 var keys = RequiredDoc(call, 0);
-                _out.WriteLine(col.CreateIndex(keys, Option(call, 1, "unique")));
+                _out.WriteLine(col.CreateIndex(keys, Option(call, 1, "unique"), Option(call, 1, "sparse")));
                 break;
             }
             case "dropIndex":
