@@ -1794,3 +1794,16 @@ of scope; the cache lock above was the actual bottleneck.
 - `TryReadById` and `Visit` are optional borrowed APIs; untyped `Find`, typed `Find` with sort or projection, and aggregation still materialize documents.
   Their scope guard detects same-thread reentrancy only (transactions and snapshots are single-threaded objects).
 - Maximum document size is bounded by `CollectionEngine.MaxDocumentSize`; index keys must fit in a page fraction.
+
+### Sorted queries with a limit
+
+`Find` with `Sort` and `Limit` (window ≤ 4096 rows) keeps only the best `skip + limit` rows in a bounded heap
+(ties keep scan order, as in the full sort) and copies only rows that enter it. 10k rows, `ORDER BY … LIMIT 10`:
+
+| Query | Before | After | SQLite |
+|---|---:|---:|---:|
+| Top 10 by `score` (no index) | 5.9 ms / 2.9 MB | 2.35 ms / 2.1 MB | 3.0 ms |
+| Top 10 by `age` (indexed) | 6.8 ms / 2.9 MB | 1.16 ms / 1.1 MB | 17 µs |
+
+Range scans (`age >= 88`, ~222 rows) already beat SQLite: 62 µs (Visit) / 110 µs (Find) vs 235 µs; count 4.3 vs 9.7 µs.
+Index-ordered scans with limit pushdown (the indexed top-N gap) remain open.

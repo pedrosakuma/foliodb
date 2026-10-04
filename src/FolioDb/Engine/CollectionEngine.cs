@@ -583,6 +583,28 @@ internal static class CollectionEngine
         }
 
         var rows = new List<(byte[][] Keys, int Seq, byte[] Bytes)>();
+        long window = limit == int.MaxValue ? long.MaxValue : (long)skip + limit;
+        if (window <= 4096)
+        {
+            // Bounded top-N: a max-heap of the best `window` rows (worst on top); only rows that enter copy their bytes.
+            int k = (int)window, seq = 0;
+            var heap = new PriorityQueue<(byte[][] Keys, int Seq, byte[] Bytes), (byte[][] Keys, int Seq)>(
+                Comparer<(byte[][] Keys, int Seq)>.Create((a, b) => sort.Compare(b.Keys, a.Keys) is var c and not 0 ? c : b.Seq.CompareTo(a.Seq)));
+            QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
+            {
+                var raw = new RawDocument(doc);
+                if (check is not null && !check.Matches(raw)) return true;
+                var keys = sort.KeysFor(raw);
+                int n = seq++;
+                if (heap.Count < k) heap.Enqueue((keys, n, raw.Data.ToArray()), (keys, n));
+                else if (k > 0 && heap.TryPeek(out var worst, out (byte[][] Keys, int Seq) _) && sort.Compare(keys, worst.Keys) < 0)
+                    heap.EnqueueDequeue((keys, n, raw.Data.ToArray()), (keys, n));
+                return true;
+            });
+            while (heap.Count > 0) rows.Add(heap.Dequeue());
+            rows.Reverse();
+        }
+        else
         QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
         {
             var raw = new RawDocument(doc);

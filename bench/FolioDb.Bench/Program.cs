@@ -126,7 +126,7 @@ public class QueryBenchmarks
     private FolioDatabase _folio = null!;
     private FolioDb.Collection _folioUsers = null!;
     private SqliteConnection _sqlite = null!;
-    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!, _sqliteNameByCity = null!, _sqliteFlatByCity = null!;
+    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!, _sqliteNameByCity = null!, _sqliteFlatByCity = null!, _sqliteRange = null!, _sqliteTopAge = null!, _sqliteTopScore = null!, _sqliteRangeCount = null!;
     private FolioDb.Collection _folioFlat = null!;
     private LiteDatabase _lite = null!;
     private ILiteCollection<BsonDocument> _liteUsers = null!;
@@ -144,6 +144,7 @@ public class QueryBenchmarks
             for (int i = 0; i < Workload.Documents; i++) col.Insert(FolioDb.Document.Parse(Workload.Json(i)));
             var flat = tx.GetCollection("flat");
             flat.CreateIndex("city");
+            flat.CreateIndex("age");
             for (int i = 0; i < Workload.Documents; i++) flat.Insert(FolioDb.Document.Parse(Workload.FlatJson(i)));
             tx.Commit();
         }
@@ -154,7 +155,7 @@ public class QueryBenchmarks
         _sqlitePath = Workload.TempFile(".db");
         _sqlite = new SqliteConnection($"Data Source={_sqlitePath}");
         _sqlite.Open();
-        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city')); CREATE TABLE flat(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, age INTEGER NOT NULL, score REAL NOT NULL); CREATE INDEX flat_city ON flat(city);");
+        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city')); CREATE TABLE flat(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, age INTEGER NOT NULL, score REAL NOT NULL); CREATE INDEX flat_city ON flat(city); CREATE INDEX flat_age ON flat(age);");
         using (var tx = _sqlite.BeginTransaction())
         {
             using var ins = _sqlite.CreateCommand();
@@ -188,6 +189,14 @@ public class QueryBenchmarks
         _sqliteFlatByCity = _sqlite.CreateCommand();
         _sqliteFlatByCity.CommandText = "SELECT id, name, city, age, score FROM flat WHERE city = $city";
         _sqliteFlatByCity.Parameters.Add("$city", SqliteType.Text);
+        _sqliteRange = _sqlite.CreateCommand();
+        _sqliteRange.CommandText = "SELECT id, name, city, age, score FROM flat WHERE age >= 88";
+        _sqliteTopAge = _sqlite.CreateCommand();
+        _sqliteTopAge.CommandText = "SELECT id, name, city, age, score FROM flat ORDER BY age DESC LIMIT 10";
+        _sqliteTopScore = _sqlite.CreateCommand();
+        _sqliteTopScore.CommandText = "SELECT id, name, city, age, score FROM flat ORDER BY score DESC LIMIT 10";
+        _sqliteRangeCount = _sqlite.CreateCommand();
+        _sqliteRangeCount.CommandText = "SELECT COUNT(*) FROM flat WHERE age >= 88";
         _sqliteById = _sqlite.CreateCommand();
         _sqliteById.CommandText = "SELECT data FROM users WHERE id = $id";
         _sqliteById.Parameters.Add("$id", SqliteType.Integer);
@@ -215,6 +224,10 @@ public class QueryBenchmarks
         _sqliteByCity.Dispose();
         _sqliteNameByCity.Dispose();
         _sqliteFlatByCity.Dispose();
+        _sqliteRange.Dispose();
+        _sqliteTopAge.Dispose();
+        _sqliteTopScore.Dispose();
+        _sqliteRangeCount.Dispose();
         _sqlite.Dispose();
         SqliteConnection.ClearAllPools();
         _lite.Dispose();
@@ -328,4 +341,63 @@ public class QueryBenchmarks
         }
         return n;
     }
+
+    private static FolioDb.Document AgeAtLeast88() => new() { ["age"] = new FolioDb.Document { ["$gte"] = 88 } };
+
+    private static int ReadRows(SqliteCommand cmd)
+    {
+        using var r = cmd.ExecuteReader();
+        int n = 0;
+        while (r.Read())
+        {
+            _ = r.GetInt64(0);
+            _ = r.GetString(1);
+            _ = r.GetString(2);
+            _ = r.GetInt64(3);
+            _ = r.GetDouble(4);
+            n++;
+        }
+        return n;
+    }
+
+    private static int VisitAll(FolioDb.Collection c, FolioDb.Document filter) => (int)c.Visit(filter, v =>
+    {
+        foreach (var f in v)
+        {
+            switch (f.Value.Type)
+            {
+                case FolioDb.DocType.String: _ = System.Text.Encoding.UTF8.GetString(f.Value.AsUtf8String); break;
+                case FolioDb.DocType.Double: _ = f.Value.AsDouble; break;
+                default: _ = f.Value.AsInt64; break;
+            }
+        }
+        return true;
+    });
+
+    [Benchmark(Baseline = true), BenchmarkCategory("Range")]
+    public int FolioDb_Range_Visit() => VisitAll(_folioFlat, AgeAtLeast88());
+
+    [Benchmark, BenchmarkCategory("Range")]
+    public int FolioDb_Range_Find() => _folioFlat.Find(AgeAtLeast88()).Count;
+
+    [Benchmark, BenchmarkCategory("Range")]
+    public int Sqlite_Range() => ReadRows(_sqliteRange);
+
+    [Benchmark(Baseline = true), BenchmarkCategory("RangeCount")]
+    public long FolioDb_RangeCount() => _folioFlat.Count(AgeAtLeast88());
+
+    [Benchmark, BenchmarkCategory("RangeCount")]
+    public long Sqlite_RangeCount() => Convert.ToInt64(_sqliteRangeCount.ExecuteScalar());
+
+    [Benchmark(Baseline = true), BenchmarkCategory("TopAge")]
+    public int FolioDb_TopAge_Find() => _folioFlat.Find((FolioDb.Document?)null, new FolioDb.FindOptions { Sort = new FolioDb.Document { ["age"] = -1 }, Limit = 10 }).Count;
+
+    [Benchmark, BenchmarkCategory("TopAge")]
+    public int Sqlite_TopAge() => ReadRows(_sqliteTopAge);
+
+    [Benchmark(Baseline = true), BenchmarkCategory("TopScore")]
+    public int FolioDb_TopScore_Find() => _folioFlat.Find((FolioDb.Document?)null, new FolioDb.FindOptions { Sort = new FolioDb.Document { ["score"] = -1 }, Limit = 10 }).Count;
+
+    [Benchmark, BenchmarkCategory("TopScore")]
+    public int Sqlite_TopScore() => ReadRows(_sqliteTopScore);
 }
