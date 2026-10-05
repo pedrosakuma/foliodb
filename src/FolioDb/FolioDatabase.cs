@@ -326,9 +326,10 @@ public sealed class Transaction : IDisposable
         ThrowIfUnusable();
         bool found;
         DocumentView view;
+        byte[]? rented;
         try
         {
-            found = CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out view);
+            found = CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out view, out rented);
         }
         catch
         {
@@ -348,6 +349,7 @@ public sealed class Transaction : IDisposable
         finally
         {
             _borrows--;
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         }
         return true;
     }
@@ -437,7 +439,7 @@ public sealed class Snapshot : IDisposable
         Func<DocumentView, TState, TResult> reader, [MaybeNullWhen(false)] out TResult result)
         where TState : allows ref struct
     {
-        if (!CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out var view))
+        if (!CollectionEngine.TryBorrowById(Engine, Engine.GetCollection(collection), id, out var view, out var rented))
         {
             result = default;
             return false;
@@ -450,6 +452,7 @@ public sealed class Snapshot : IDisposable
         finally
         {
             _borrows--;
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         }
         return true;
     }

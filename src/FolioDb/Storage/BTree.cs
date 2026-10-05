@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 
 namespace FolioDb.Storage;
@@ -390,8 +391,12 @@ internal readonly struct BTree
         }
     }
 
-    private static ReadOnlySpan<byte> ReadLeafValue(StorageTx tx, ReadOnlySpan<byte> page, int index)
+    private static ReadOnlySpan<byte> ReadLeafValue(StorageTx tx, ReadOnlySpan<byte> page, int index) =>
+        ReadLeafValue(tx, page, index, pooled: false, out _);
+
+    private static ReadOnlySpan<byte> ReadLeafValue(StorageTx tx, ReadOnlySpan<byte> page, int index, bool pooled, out byte[]? rented)
     {
+        rented = null;
         int off = Slot(page, index);
         int keyLen = BinaryPrimitives.ReadUInt16LittleEndian(page[off..]);
         int valLen = BinaryPrimitives.ReadInt32LittleEndian(page[(off + 3)..]);
@@ -403,14 +408,23 @@ internal readonly struct BTree
         // Like inline values, a single overflow page can be borrowed until the next mutation.
         if (valLen > 0 && valLen <= chunk) return tx.ReadPage(pg).AsSpan(4, valLen);
 
-        var result = new byte[valLen];
-        for (int pos = 0; pos < valLen; pos += chunk)
+        var result = pooled ? ArrayPool<byte>.Shared.Rent(valLen) : new byte[valLen];
+        try
         {
-            var op = tx.ReadPage(pg);
-            op.AsSpan(4, Math.Min(chunk, valLen - pos)).CopyTo(result.AsSpan(pos));
-            pg = BinaryPrimitives.ReadUInt32LittleEndian(op);
+            for (int pos = 0; pos < valLen; pos += chunk)
+            {
+                var op = tx.ReadPage(pg);
+                op.AsSpan(4, Math.Min(chunk, valLen - pos)).CopyTo(result.AsSpan(pos));
+                pg = BinaryPrimitives.ReadUInt32LittleEndian(op);
+            }
+            rented = pooled ? result : null;
+            return result.AsSpan(0, valLen);
         }
-        return result;
+        catch
+        {
+            if (pooled) ArrayPool<byte>.Shared.Return(result);
+            throw;
+        }
     }
 
     private void FreeCellOverflow(ReadOnlySpan<byte> page, int index)
@@ -423,8 +437,13 @@ internal readonly struct BTree
 
     // ------------------------------------------------------------------ public operations
 
-    public bool TryGet(ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value)
+    public bool TryGet(ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value) =>
+        TryGet(key, out value, pooled: false, out _);
+
+    /// <summary>The caller owns any rented overflow buffer until its value is no longer borrowed.</summary>
+    public bool TryGet(ReadOnlySpan<byte> key, out ReadOnlySpan<byte> value, bool pooled, out byte[]? rented)
     {
+        rented = null;
         uint pg = Root;
         while (true)
         {
@@ -432,7 +451,7 @@ internal readonly struct BTree
             if (IsLeaf(page))
             {
                 int i = LowerBound(page, key, out bool found);
-                value = found ? ReadLeafValue(_tx, page, i) : default;
+                value = found ? ReadLeafValue(_tx, page, i, pooled, out rented) : default;
                 return found;
             }
             pg = ChildAt(page, ChildIndex(page, key));

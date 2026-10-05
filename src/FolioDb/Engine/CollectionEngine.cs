@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text;
 using FolioDb.Query;
 using FolioDb.Storage;
@@ -479,14 +480,24 @@ internal static class CollectionEngine
 
     /// <summary>
     /// Zero-copy point lookup. The view aliases transaction page memory (or, for documents spanning several overflow
-    /// pages, one freshly assembled buffer); callers must finish with it before the transaction is mutated or completed.
+    /// pages, one rented buffer); callers must return the buffer after the callback, even when it throws.
     /// </summary>
-    public static bool TryBorrowById(EngineTx tx, CollectionMeta? meta, DocValue id, out DocumentView view)
+    public static bool TryBorrowById(EngineTx tx, CollectionMeta? meta, DocValue id, out DocumentView view, out byte[]? rented)
     {
-        if (meta is not null && new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.EncodeTemporary(id), out var bytes))
+        rented = null;
+        if (meta is not null && new BTree(tx.Storage, meta.PrimaryRoot).TryGet(KeyEncoder.EncodeTemporary(id), out var bytes, pooled: true, out rented))
         {
-            view = new DocumentView(new RawDocument(bytes));
-            return true;
+            try
+            {
+                view = new DocumentView(new RawDocument(bytes));
+                return true;
+            }
+            catch
+            {
+                if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+                rented = null;
+                throw;
+            }
         }
         view = default;
         return false;

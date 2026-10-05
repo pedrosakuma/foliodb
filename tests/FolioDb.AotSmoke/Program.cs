@@ -89,6 +89,16 @@ static void Run(string path)
         Check(overflow.TryReadById(1, "xxx".AsSpan(), static (d, prefix) =>
             d.TryGetValue("payload", out var p) && p.AsUtf8String.Length == 1024 && p.GetString().StartsWith(prefix), out bool prefixed) && prefixed, "borrowed overflow read");
         Check(!overflow.TryReadById(3, static d => 0, out _), "borrowed missing id");
+        overflow.Insert(new Document { ["_id"] = 3, ["payload"] = new string('x', 8192) });
+        overflow.Insert(new Document { ["_id"] = 4, ["payload"] = new string('y', 8192) });
+        Check(overflow.TryReadById(3, d =>
+        {
+            if (!d.TryGetValue("payload", out var outer)) return false;
+            bool inner = overflow.TryReadById(4, static v =>
+                v.TryGetValue("payload", out var p) && p.AsUtf8String.Length == 8192 && p.AsUtf8String[0] == (byte)'y',
+                out bool valid) && valid;
+            return inner && outer.AsUtf8String.Length == 8192 && outer.AsUtf8String[0] == (byte)'x';
+        }, out bool pooled) && pooled, "nested pooled overflow read");
         using (var tx = db.BeginTransaction())
         {
             var tc = tx.GetCollection("overflow");

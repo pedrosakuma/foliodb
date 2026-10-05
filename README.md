@@ -265,8 +265,10 @@ would see there, including uncommitted writes of the transaction.
   **not** doom an explicit transaction (a read cannot have mutated it). Lookup failures (e.g. corruption) doom it
   exactly like `FindById`. A completed transaction or disposed snapshot throws `InvalidOperationException`.
 - **Copies**: inline and single-overflow-page documents are read in place. A document spanning several overflow pages
-  (larger than page size − 4 bytes) is first assembled into one temporary buffer, exactly as for `FindById`; its
-  fields are still not materialized. Point lookups consume the id encoding directly from a per-thread buffer
+  (larger than page size − 4 bytes) is first assembled into one contiguous buffer; its fields are still not materialized.
+  `TryReadById` rents that buffer from a pool and returns it after the callback, even if it throws. Nested calls hold
+  separate buffers until their respective callbacks finish. `FindById` and cursor-based queries still allocate their
+  assembly buffers. Point lookups consume the id encoding directly from a per-thread buffer
   before invoking the callback. An auto-read call still allocates its read transaction and catalog metadata;
   a capturing (non-`static`) lambda allocates a closure. Buffer growth, page cache misses and caller-side
   construction of ids (for example boxing a fresh ObjectId or decimal into DocValue) may also allocate.
@@ -1822,3 +1824,14 @@ old write cost; sorts on a sparse index use the heap path. The choice survives `
 opposite direction, keeping ties in scan order); the planner prefers it over a simple index on the filter field when
 `skip + limit` ≤ 4096. 100 matching rows, top 10: 47 µs → 9.4 µs (SQLite 18 µs); the heap path remains the fallback.
 Multikey indexes never use it.
+
+### Pooled overflow buffers for borrowed point reads
+
+`TryReadById` uses a pooled buffer when a document spans several overflow pages. The buffer belongs to that call
+until its callback returns; nested calls rent separate buffers, and exceptions still return them. Inline and
+single-page overflow values remain zero-copy. This does not change the file format or the write path.
+
+For an 8 KiB payload, `PointReadBenchmarks` measures allocations of 8,472 -> 216 B per implicit read (-97.5%) and
+8,256 -> 0 B inside a warmed snapshot. An interleaved standalone probe measured median implicit-read times of
+1.76 -> 0.86 microseconds, but latency varies substantially on the shared host; the allocation reduction is the
+reliable gain. Pool misses may allocate. `FindById`, `Find` and `Visit` still use owned assembly buffers.

@@ -133,7 +133,7 @@ public sealed class Collection
     /// The view is only valid inside the callback; the scope cannot be mutated, committed, rolled back or disposed
     /// until the callback returns (such calls throw <see cref="InvalidOperationException"/>). Exceptions thrown by
     /// the callback propagate unchanged and do not doom an explicit transaction.
-    /// Documents spanning multiple overflow pages still require a temporary contiguous buffer.
+    /// Documents spanning multiple overflow pages use a pooled contiguous buffer, returned after the callback.
     /// </summary>
     public bool TryReadById<TResult>(DocValue id, Func<DocumentView, TResult> reader, [MaybeNullWhen(false)] out TResult result)
     {
@@ -161,13 +161,20 @@ public sealed class Collection
                 // Committed page images are immutable, so the implicit read transaction only needs to outlive the callback.
                 using (var tx = _db.BeginRead())
                 {
-                    if (!CollectionEngine.TryBorrowById(tx, tx.GetCollection(Name), id, out var view))
+                    if (!CollectionEngine.TryBorrowById(tx, tx.GetCollection(Name), id, out var view, out var rented))
                     {
                         result = default;
                         return false;
                     }
-                    result = reader(view, state);
-                    return true;
+                    try
+                    {
+                        result = reader(view, state);
+                        return true;
+                    }
+                    finally
+                    {
+                        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+                    }
                 }
         }
     }
