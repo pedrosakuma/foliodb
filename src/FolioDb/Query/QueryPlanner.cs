@@ -112,6 +112,24 @@ internal static class QueryPlanner
         return best ?? new QueryPlan { Kind = PlanKind.FullScan, Covered = ReferenceEquals(filter, Filter.All) };
     }
 
+    /// <summary>
+    /// A compound-index plan whose equality prefix is fixed by the filter and whose next component is
+    /// <paramref name="sortPath"/>, so the scan yields documents already ordered by that field (null when none exists). The sort field must be the last
+    /// component: later ones would break ties by their own values instead of by _id as the plan it replaces does.
+    /// </summary>
+    public static QueryPlan? PlanOrdered(CollectionMeta meta, Filter filter, string sortPath)
+    {
+        var conjuncts = filter is AndFilter and ? and.Children : [filter];
+        foreach (var index in meta.Indexes)
+        {
+            if (index.IsSimple || index.MultiKey) continue;
+            var plan = BuildCompound(conjuncts, index, out _);
+            if (plan is not null && plan.PrefixFields > 0 && plan.PrefixFields == index.Fields.Length - 1 && index.Fields[plan.PrefixFields].Path == sortPath)
+                return plan;
+        }
+        return null;
+    }
+
     private static IndexMeta? SimpleIndex(CollectionMeta meta, string path)
     {
         foreach (var index in meta.Indexes)
@@ -252,6 +270,71 @@ internal static class QueryPlanner
         int cmp = bound is null ? (lowerBound ? 1 : -1) : key.AsSpan().SequenceCompareTo(bound);
         if (lowerBound ? cmp > 0 : cmp < 0) { bound = key; boundInc = inc; }
         else if (cmp == 0 && !inc) boundInc = false;
+    }
+
+    /// <summary>
+    /// <see cref="Execute"/> for a <see cref="PlanKind.CompoundScan"/> in reverse index order. Entries sharing the same
+    /// value of the component after the prefix are still visited in forward order, so ties keep their scan order.
+    /// </summary>
+    public static void ExecuteCompoundReverse(StorageTx tx, CollectionMeta meta, QueryPlan plan, DocVisitor visitor)
+    {
+        var index = plan.Index!;
+        var range = plan.ComponentRange;
+        bool descending = index.Fields[plan.PrefixFields].Descending;
+        byte[] end = plan.Prefix;
+        if (range is not null && (descending ? range.Lower : range.Upper) is { } bound)
+            end = [.. end, .. descending ? IndexMeta.Inverted(bound) : bound];
+        var cur = new BTree(tx, index.Root).CreateCursor();
+        var fetch = new BTree(tx, meta.PrimaryRoot).CreateCursor();
+        var successor = Successor(end);
+        bool ok = successor is null || !cur.Seek(successor) ? cur.SeekLast() : cur.MovePrev();
+
+        var group = new List<byte[]>();
+        byte[]? groupKey = null;
+        bool Flush()
+        {
+            for (int i = group.Count - 1; i >= 0; i--)
+            {
+                if (!fetch.SeekExact(group[i])) throw new CorruptDatabaseException($"Index {index.Name} references a missing document.");
+                if (!visitor(group[i], fetch.Value)) return false;
+            }
+            group.Clear();
+            return true;
+        }
+        for (; ok && cur.Key.StartsWith(plan.Prefix); ok = cur.MovePrev())
+        {
+            var key = cur.Key;
+            int length = IndexMeta.ComponentLength(key[plan.Prefix.Length..], descending);
+            if (range is not null)
+            {
+                var component = key.Slice(plan.Prefix.Length, length);
+                int state = descending ? -RangeState(range, IndexMeta.Inverted(component)) : RangeState(range, component);
+                if (state < 0) break;
+                if (state > 0) continue;
+            }
+            var tie = key[..(plan.Prefix.Length + length)];
+            if (groupKey is null || !tie.SequenceEqual(groupKey))
+            {
+                if (!Flush()) return;
+                groupKey = tie.ToArray();
+            }
+            int valueLength = index.ValueLength(key, plan.PrefixFields, plan.Prefix.Length);
+            group.Add(key[valueLength..].ToArray());
+        }
+        Flush();
+    }
+
+    /// <summary>Smallest key greater than every key starting with <paramref name="prefix"/> (null when there is none).</summary>
+    private static byte[]? Successor(byte[] prefix)
+    {
+        for (int i = prefix.Length - 1; i >= 0; i--)
+            if (prefix[i] != 0xFF)
+            {
+                var next = prefix[..(i + 1)];
+                next[i]++;
+                return next;
+            }
+        return null;
     }
 
     /// <summary>Streams candidate documents for the plan (filter NOT applied). Visitor returns false to stop.</summary>

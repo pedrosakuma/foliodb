@@ -1816,3 +1816,9 @@ top 10 by `age` goes 1.16 ms → 8.7 µs (SQLite 16.6 µs). Older indexes and un
 Indexing missing fields costs writes on rarely present fields (measured on 100k docs with 10% having the field: inserts
 ~+5–25%, `$set` on the field ~+8%). `CreateIndex("field", sparse: true)` (CLI: `{ sparse: true }`) skips them, restoring the
 old write cost; sorts on a sparse index use the heap path. The choice survives `RebuildIndex` and vacuum.
+
+**Filtered sorts.** A compound index whose equality prefix the filter fixes and whose *last* component is the sort field
+(`{ city: 1, age: 1 }` for `{ city: X }` sorted by `age`) is walked in order and stops at the limit (backwards for the
+opposite direction, keeping ties in scan order); the planner prefers it over a simple index on the filter field when
+`skip + limit` ≤ 4096. 100 matching rows, top 10: 47 µs → 9.4 µs (SQLite 18 µs); the heap path remains the fallback.
+Multikey indexes never use it.

@@ -613,6 +613,24 @@ internal static class CollectionEngine
         var sort = SortSpec.Parse(options?.Sort);
         var projection = Projection.Parse(options?.Projection);
         var plan = QueryPlanner.Plan(meta, filter);
+        long window = limit == int.MaxValue ? long.MaxValue : (long)skip + limit;
+
+        // A compound index whose prefix the filter fixes and whose next component is the sort field yields rows in
+        // order: stop at the limit (forward) or walk it backwards (reverse), instead of sorting every match.
+        bool inOrder = false, reverse = false;
+        if (sort?.SingleField is { } sortField)
+        {
+            if (window <= MaxTopN && plan.Kind != PlanKind.PrimaryEq && !(plan.Kind == PlanKind.IndexEq && plan.Index!.Unique)
+                && QueryPlanner.PlanOrdered(meta, filter, sortField) is { } byPrefix)
+                plan = byPrefix;
+            if (plan.Kind == PlanKind.CompoundScan && !plan.Index!.MultiKey && plan.PrefixFields < plan.Index.Fields.Length
+                && plan.Index.Fields[plan.PrefixFields].Path == sortField)
+            {
+                bool forward = (sort.SingleDirection > 0) != plan.Index.Fields[plan.PrefixFields].Descending;
+                inOrder = forward || window <= MaxTopN;
+                reverse = !forward;
+            }
+        }
 
         if (sort is null && plan.Covered && projection is not null && plan.Kind == PlanKind.CompoundScan
             && projection.OnlyIncludes(plan.Index!.Fields.Select(f => f.Path)))
@@ -627,10 +645,10 @@ internal static class CollectionEngine
         }
 
         var check = plan.Covered ? null : filter;
-        if (sort is null)
+        if (sort is null || inOrder)
         {
             int skipped = 0;
-            QueryPlanner.Execute(tx.Storage, meta, plan, (_, doc) =>
+            DocVisitor visit = (_, doc) =>
             {
                 var raw = new RawDocument(doc);
                 if (check is not null && !check.Matches(raw)) return true;
@@ -641,11 +659,12 @@ internal static class CollectionEngine
                 }
                 result.Add(projection is null ? raw.ToDocument() : projection.Apply(raw));
                 return result.Count < limit;
-            });
+            };
+            if (reverse) QueryPlanner.ExecuteCompoundReverse(tx.Storage, meta, plan, visit);
+            else QueryPlanner.Execute(tx.Storage, meta, plan, visit);
             return result;
         }
 
-        long window = limit == int.MaxValue ? long.MaxValue : (long)skip + limit;
         if (window <= MaxTopN && check is null && plan.Kind == PlanKind.FullScan && sort.SingleField is { } sortPath
             && meta.Indexes.Find(i => i.IsSimple && i.IndexesMissing && !i.MultiKey && i.Field == sortPath) is { } ordered)
         {

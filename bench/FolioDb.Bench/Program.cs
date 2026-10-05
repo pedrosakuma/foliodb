@@ -126,7 +126,7 @@ public class QueryBenchmarks
     private FolioDatabase _folio = null!;
     private FolioDb.Collection _folioUsers = null!;
     private SqliteConnection _sqlite = null!;
-    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!, _sqliteNameByCity = null!, _sqliteFlatByCity = null!, _sqliteRange = null!, _sqliteTopAge = null!, _sqliteTopScore = null!, _sqliteRangeCount = null!;
+    private SqliteCommand _sqliteById = null!, _sqliteByCity = null!, _sqliteNameByCity = null!, _sqliteFlatByCity = null!, _sqliteRange = null!, _sqliteTopAge = null!, _sqliteTopScore = null!, _sqliteRangeCount = null!, _sqliteCityTopAge = null!;
     private FolioDb.Collection _folioFlat = null!;
     private LiteDatabase _lite = null!;
     private ILiteCollection<BsonDocument> _liteUsers = null!;
@@ -145,6 +145,7 @@ public class QueryBenchmarks
             var flat = tx.GetCollection("flat");
             flat.CreateIndex("city");
             flat.CreateIndex("age");
+            flat.CreateIndex(new FolioDb.Document { ["city"] = 1, ["age"] = 1 });
             for (int i = 0; i < Workload.Documents; i++) flat.Insert(FolioDb.Document.Parse(Workload.FlatJson(i)));
             tx.Commit();
         }
@@ -155,7 +156,7 @@ public class QueryBenchmarks
         _sqlitePath = Workload.TempFile(".db");
         _sqlite = new SqliteConnection($"Data Source={_sqlitePath}");
         _sqlite.Open();
-        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city')); CREATE TABLE flat(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, age INTEGER NOT NULL, score REAL NOT NULL); CREATE INDEX flat_city ON flat(city); CREATE INDEX flat_age ON flat(age);");
+        InsertBenchmarks.Exec(_sqlite, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE users(id INTEGER PRIMARY KEY, data TEXT NOT NULL); CREATE INDEX users_city ON users(json_extract(data, '$.city')); CREATE TABLE flat(id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT NOT NULL, age INTEGER NOT NULL, score REAL NOT NULL); CREATE INDEX flat_city ON flat(city); CREATE INDEX flat_age ON flat(age); CREATE INDEX flat_city_age ON flat(city, age);");
         using (var tx = _sqlite.BeginTransaction())
         {
             using var ins = _sqlite.CreateCommand();
@@ -195,6 +196,9 @@ public class QueryBenchmarks
         _sqliteTopAge.CommandText = "SELECT id, name, city, age, score FROM flat ORDER BY age DESC LIMIT 10";
         _sqliteTopScore = _sqlite.CreateCommand();
         _sqliteTopScore.CommandText = "SELECT id, name, city, age, score FROM flat ORDER BY score DESC LIMIT 10";
+        _sqliteCityTopAge = _sqlite.CreateCommand();
+        _sqliteCityTopAge.CommandText = "SELECT id, name, city, age, score FROM flat WHERE city = $city ORDER BY age DESC LIMIT 10";
+        _sqliteCityTopAge.Parameters.Add("$city", SqliteType.Text).Value = Workload.Cities[7];
         _sqliteRangeCount = _sqlite.CreateCommand();
         _sqliteRangeCount.CommandText = "SELECT COUNT(*) FROM flat WHERE age >= 88";
         _sqliteById = _sqlite.CreateCommand();
@@ -228,6 +232,7 @@ public class QueryBenchmarks
         _sqliteTopAge.Dispose();
         _sqliteTopScore.Dispose();
         _sqliteRangeCount.Dispose();
+        _sqliteCityTopAge.Dispose();
         _sqlite.Dispose();
         SqliteConnection.ClearAllPools();
         _lite.Dispose();
@@ -394,6 +399,12 @@ public class QueryBenchmarks
 
     [Benchmark, BenchmarkCategory("TopAge")]
     public int Sqlite_TopAge() => ReadRows(_sqliteTopAge);
+
+    [Benchmark(Baseline = true), BenchmarkCategory("CityTopAge")]
+    public int FolioDb_CityTopAge_Find() => _folioFlat.Find(new FolioDb.Document { ["city"] = Workload.Cities[7] }, new FolioDb.FindOptions { Sort = new FolioDb.Document { ["age"] = -1 }, Limit = 10 }).Count;
+
+    [Benchmark, BenchmarkCategory("CityTopAge")]
+    public int Sqlite_CityTopAge() => ReadRows(_sqliteCityTopAge);
 
     [Benchmark(Baseline = true), BenchmarkCategory("TopScore")]
     public int FolioDb_TopScore_Find() => _folioFlat.Find((FolioDb.Document?)null, new FolioDb.FindOptions { Sort = new FolioDb.Document { ["score"] = -1 }, Limit = 10 }).Count;
