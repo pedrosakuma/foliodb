@@ -36,7 +36,7 @@ public static class Workload
 
     public static void Delete(string path)
     {
-        foreach (var suffix in new[] { "", "-wal", "-shm", "-journal", "-log" })
+        foreach (var suffix in new[] { "", "-wal", "-wal2", "-shm", "-journal", "-log" })
             if (File.Exists(path + suffix)) File.Delete(path + suffix);
         var log = Path.ChangeExtension(path, null) + "-log" + Path.GetExtension(path);
         if (File.Exists(log)) File.Delete(log);

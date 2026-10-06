@@ -504,6 +504,29 @@ table (`id, name, city, age, score`, index on `city`), with no array field, so b
 | FolioDb `FlatEq` `Visit`, one pass over all 5 fields | **50.5 µs** | 9.5 KB |
 | SQLite `FlatEq` `SELECT id,name,city,age,score` | 131.4 µs | 8.3 KB |
 
+### WAL `FULL` durability: batch writes
+
+`FullDurabilityBenchmarks` writes 50,000 matching flat records (`id, name, city, age, score`, secondary index on
+`city`) in one transaction, then measures 50,000 updates to the unindexed `score` field in one transaction.
+Both connections use WAL + `synchronous=FULL`; each batch pays for one durable commit. Database opening is timed,
+while creating and copying the clean input files is outside the measurement. BenchmarkDotNet, 8 measurement
+iterations, Linux x64, .NET 10 (2026-10-06):
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*FullDurabilityBenchmarks*' --iterationCount 8 --warmupCount 3
+```
+
+| Operation | FolioDb | SQLite | Batch time: FolioDb / SQLite |
+|---|---:|---:|---:|
+| Insert (first run) | 2.89 µs/doc | 3.20 µs/doc | 144 / 160 ms |
+| Update unindexed field (first run) | 2.68 µs/doc | 1.97 µs/doc | 134 / 99 ms |
+
+The first run's insert confidence intervals overlap. A repeat while host load was high measured 9.08 vs 7.25 µs/doc
+and reversed the insert result; no stable insert winner is established. Both update runs favored SQLite (nominally
+1.36–1.44×), though their intervals overlapped under high load. Treat these as host-specific measurements, not a
+durability ranking across filesystems or hardware. The first run allocated about 2.1 KB per FolioDb insert and
+2.5 KB per update, versus 0.8 KB and 0.4 KB for the prepared SQLite statements.
+
 To read every field from `Visit`, enumerate the view once (`foreach (var f in view)`): each `TryGetValue` walks the
 fields from the start, so five lookups by name cost about 4-5× one pass.
 
