@@ -715,6 +715,46 @@ and a secondary index is only touched when its top-level field actually changed:
 | 4 KB (overflow) | 27.7 µs | 20.5 µs |
 | 64 KB (overflow) | 442 µs | 72 µs |
 
+### Update call and engine costs
+
+`FullDurabilityBenchmarks` compares the existing `FolioUpdate` loop with a variant that reuses one mutable `_id`
+filter and one `$set` document, while updating the same 50,000 records in one explicit `WAL + FULL` transaction.
+SQLite reuses its prepared command and parameters. BenchmarkDotNet, six target iterations and three warmups, Linux
+x64/.NET 10 JIT (2026-10-06):
+
+| Order | FolioDb, fresh inputs | FolioDb, reused inputs | SQLite prepared | FolioDb bytes/update, fresh → reused |
+|---|---:|---:|---:|---:|
+| Ascending | 3.227 µs | 2.578 µs | 2.044 µs | 2,525 → 1,901 B |
+| Descending | 3.102 µs | 2.609 µs | 1.935 µs | 2,525 → 1,901 B |
+| Shuffled | 3.304 µs | 3.304 µs | 2.910 µs | 2,525 → 1,901 B |
+
+Reusing the caller-owned inputs removes 624 B/update (about 25%) and reduced the mean in the ascending and descending
+runs, but not the shuffled run. This was one shared-host run with broad timing intervals; treat the allocation
+difference as the stronger result and the latency movement as indicative. It does not make the remaining comparison
+an apples-to-apples API benchmark: SQLite uses a prepared statement, while FolioDb still parses the filter and plans
+each `UpdateOne`.
+
+Reproduce the comparison with:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*FolioUpdate*' '*SqliteUpdate*' --iterationCount 6 --warmupCount 3
+```
+
+An allocation/CPU profile of 50,000 documents, one `city` index, reused filter/update documents, and one explicit
+transaction used `SynchronousMode.Normal` to keep commit outside the capture:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-update 75
+```
+
+In a 12-second diagnostic window, `UpdateApplier.TryPatch` was the dominant on-CPU method (9,945 of 9,990 running
+samples). This is the in-place scalar patch path, not full document serialization. The allocation sample's top type
+was `Collection`'s compiler-generated update closure; the call tree also attributed many allocation samples to
+`QueryPlanner.Execute`. Source inspection explains the paths: each `UpdateOne` reparses its filter, allocates the
+captured `Collection.Update` callback, replans/executes the query, and `CollectionEngine.Match` copies matching ID
+and document bytes into a list before mutation. These are concrete follow-up candidates, but profiling alone does
+not prove which is safe to remove or how much time each costs. No engine behavior was changed by this measurement.
+
 Read path (`ReadPathBenchmarks`; 10k docs, indexes on `city` and `age`; 100 hits per `city`, ~1,100 per age range):
 
 | Operation | Before | Covered / pushdown |

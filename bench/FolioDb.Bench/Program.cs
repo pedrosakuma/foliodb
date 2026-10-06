@@ -11,6 +11,8 @@ else if (args.Length > 0 && args[0] == "--profile-visit")
     VisitProfile.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--profile-find")
     FindProfile.Run(args[1..]);
+else if (args.Length > 0 && args[0] == "--profile-update")
+    UpdateProfile.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--fragmentation")
     FragmentationWorkload.Run(args[1..]);
 else if (args.Length > 0 && args[0] == "--index-maintenance")

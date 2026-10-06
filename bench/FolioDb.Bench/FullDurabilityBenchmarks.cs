@@ -12,6 +12,8 @@ public class FullDurabilityBenchmarks
     private string _emptyFolio = "", _populatedFolio = "", _emptySqlite = "", _populatedSqlite = "";
     private string _folioPath = "", _sqlitePath = "";
     private int[] _ids = [];
+    private readonly Document _reusedFilter = new() { ["_id"] = 0 };
+    private readonly Document _reusedSet = new() { ["$set"] = new Document { ["score"] = 0.0 } };
 
     [Params("Ascending", "Descending", "Shuffled")]
     public string Order { get; set; } = "";
@@ -118,6 +120,9 @@ public class FullDurabilityBenchmarks
     [IterationSetup(Target = nameof(FolioUpdate))]
     public void SetupFolioUpdate() => PrepareFolio(_populatedFolio);
 
+    [IterationSetup(Target = nameof(FolioUpdateReusedInputs))]
+    public void SetupFolioUpdateReusedInputs() => PrepareFolio(_populatedFolio);
+
     [IterationSetup(Target = nameof(SqliteUpdate))]
     public void SetupSqliteUpdate() => PrepareSqlite(_populatedSqlite);
 
@@ -178,6 +183,21 @@ public class FullDurabilityBenchmarks
         var collection = tx.GetCollection("docs");
         foreach (int i in _ids)
             collection.UpdateOne(new Document { ["_id"] = i }, new Document { ["$set"] = new Document { ["score"] = i * 0.25 } });
+        tx.Commit();
+    }
+
+    [Benchmark(OperationsPerInvoke = N), BenchmarkCategory("Update")]
+    public void FolioUpdateReusedInputs()
+    {
+        using var db = FolioDatabase.Open(_folioPath, new FolioOptions { Synchronous = SynchronousMode.Full });
+        using var tx = db.BeginTransaction();
+        var collection = tx.GetCollection("docs");
+        foreach (int i in _ids)
+        {
+            _reusedFilter["_id"] = i;
+            _reusedSet["$set"].AsDocument["score"] = i * 0.25;
+            collection.UpdateOne(_reusedFilter, _reusedSet);
+        }
         tx.Commit();
     }
 
