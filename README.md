@@ -1131,9 +1131,10 @@ captures gave Default 296 updates/s and 1,538 timeouts, versus FIFO 284 updates/
 single runs on a variable shared host with different durations and collector schedules, not a controlled estimate
 of profiler overhead or a reversal of the earlier throughput comparison.
 
-Next evidence-backed candidates are reducing full-read allocation/copying and experimenting with targeted FIFO
-wakeups instead of PulseAll. Neither was changed by this diagnostic task. Quantifying fsync versus scheduler
-waiting still requires a suitable off-CPU capture; these results alone do not justify changing durability.
+The full-read allocation lead is profiled below; it is dominated by constructing owned documents, with no low-risk
+engine change justified by that evidence. The remaining FIFO candidate is experimenting with targeted wakeups instead
+of PulseAll. Neither was changed by this diagnostic task. Quantifying fsync versus scheduler waiting still requires a
+suitable off-CPU capture; these results alone do not justify changing durability.
 
 ### Single-page overflow read allocation
 
@@ -1220,6 +1221,37 @@ are indicative, not latency guarantees or concurrency measurements.
 ```sh
 dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*VisitBenchmarks*' --job short
 ```
+
+### Materialized `Find` allocation profile
+
+`--profile-find` repeats a prepared-filter `Find` on the same 10,000-document data set used above; with
+`matches=1000`, every result contains a 1 KiB payload. It warms for three seconds, validates each result set, and
+prints the PID and load-window markers for a bounded diagnostic capture:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --profile-find 1000 90
+```
+
+The 15-second managed allocation sample attributed about 41.1 of 45.3 GB of estimated allocation bytes to
+`System.String`. In its call tree, `RawDocument.ToDocument` accounted for 421,686 of 424,786 allocation samples;
+`List<T>.AddWithResize` had 2,917. These are sampled weights, not an exact object census. A matching BenchmarkDotNet
+ShortRun with the same prepared filter on Linux x64/.NET 10 JIT (2026-10-06) measured:
+
+| Return path | Allocated per query |
+|---|---:|
+| `Find`, full documents | 2,376.77 KB |
+| `Find`, projection of `n` | 221.05 KB |
+| `Visit`, borrowed `n` | 1.04 KB |
+
+Reproduce the allocation comparison with:
+
+```sh
+dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*VisitBenchmarks.*Prepared*' --job short --join
+```
+
+The measured allocation is overwhelmingly the cost of returning independent documents and decoding their strings,
+not query planning or result-list growth. No engine-side change was retained: when callers only need a subset, use
+projection, `Visit`, or the typed `FromView` path instead of materializing every field.
 
 ### Read setup optimizations: key, catalog, prepared filter
 
