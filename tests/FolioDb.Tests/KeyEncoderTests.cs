@@ -74,6 +74,37 @@ public class KeyEncoderTests
     }
 
     [Fact]
+    public void Inverted_encoded_length_matches_original_without_materializing_a_copy()
+    {
+        var values = new[]
+        {
+            "null", "1", "-2.5", "'abc'", "'a\\u0000b'",
+            "{ a: [1, { b: 'x\\u0000y' }] }", "[[], [[]]]", "true",
+            "{ $binary: 'AAEC' }", "{ $oid: '000000000000000000000001' }",
+            "{ $date: '1970-01-01T00:00:00Z' }",
+        }.Select(DocJson.Parse).Append(DocValue.FromDecimal(1.25m));
+
+        foreach (var value in values)
+        {
+            var encoded = KeyEncoder.Encode(value);
+            var inverted = IndexMeta.Inverted(encoded);
+            var withSuffix = inverted.Concat(new byte[] { 0xA5, 0x5A }).ToArray();
+            Assert.Equal(encoded.Length, KeyEncoder.EncodedLengthInverted(withSuffix));
+            Assert.Equal(encoded.Length, IndexMeta.ComponentLength(withSuffix, descending: true));
+        }
+
+        var key = IndexMeta.Inverted(KeyEncoder.Encode(DocJson.Parse("{ a: [1, { b: 'x' }] }")));
+        int total = 0;
+        long allocated = Allocations.Measure(() =>
+        {
+            total = 0;
+            for (int i = 0; i < 1000; i++) total += IndexMeta.ComponentLength(key, descending: true);
+        });
+        Assert.Equal(1000 * key.Length, total);
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
     public void Random_values_sort_consistently_with_encoded_bytes()
     {
         var rnd = new Random(1234);

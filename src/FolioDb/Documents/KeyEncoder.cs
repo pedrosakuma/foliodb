@@ -24,6 +24,9 @@ internal static class KeyEncoder
 
     private const byte ItemMarker = 0x01;
     private const byte End = 0x00;
+    private const byte InvertedItemMarker = 0xFE;
+    private const byte InvertedFraction = 0xFE;
+    private const byte InvertedEnd = 0xFF;
 
     [ThreadStatic] private static ByteBuffer? t_a;
     [ThreadStatic] private static ByteBuffer? t_b;
@@ -411,6 +414,44 @@ internal static class KeyEncoder
         }
     }
 
+    /// <summary>Length of a component whose bytes have all been bitwise inverted for descending index order.</summary>
+    public static int EncodedLengthInverted(ReadOnlySpan<byte> key)
+    {
+        byte tag = (byte)~key[0];
+        switch (tag)
+        {
+            case TagNull: return 1;
+            case TagNumber: return key[17] == InvertedFraction ? FractionalNumberKeyLength : NumberKeyLength;
+            case TagObjectId: return 1 + ObjectId.Size;
+            case TagBoolean: return 2;
+            case TagDateTime: return 9;
+            case TagString:
+            case TagBinary: return 1 + EscapedLengthInverted(key[1..]);
+            case TagDocument:
+            {
+                int pos = 1;
+                while (key[pos] == InvertedItemMarker)
+                {
+                    pos++;
+                    pos += EscapedLengthInverted(key[pos..]);
+                    pos += EncodedLengthInverted(key[pos..]);
+                }
+                return pos + 1;
+            }
+            case TagArray:
+            {
+                int pos = 1;
+                while (key[pos] == InvertedItemMarker)
+                {
+                    pos++;
+                    pos += EncodedLengthInverted(key[pos..]);
+                }
+                return pos + 1;
+            }
+            default: throw new CorruptDatabaseException($"Invalid inverted key tag 0x{key[0]:X2}.");
+        }
+    }
+
     private static int EscapedLength(ReadOnlySpan<byte> data)
     {
         int pos = 0;
@@ -421,6 +462,19 @@ internal static class KeyEncoder
             pos += z;
             if (data[pos + 1] == 0x01) return pos + 2;
             pos += 2; // escaped 0x00 0xFF
+        }
+    }
+
+    private static int EscapedLengthInverted(ReadOnlySpan<byte> data)
+    {
+        int pos = 0;
+        while (true)
+        {
+            int z = data[pos..].IndexOf(InvertedEnd);
+            if (z < 0) throw new CorruptDatabaseException("Unterminated inverted key string.");
+            pos += z;
+            if (data[pos + 1] == InvertedItemMarker) return pos + 2;
+            pos += 2;
         }
     }
 

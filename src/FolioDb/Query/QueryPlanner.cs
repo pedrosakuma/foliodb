@@ -204,7 +204,7 @@ internal static class QueryPlanner
             {
                 int len = IndexMeta.ComponentLength(key[plan.Prefix.Length..], descending);
                 var component = key.Slice(plan.Prefix.Length, len);
-                int state = descending ? -RangeState(range, IndexMeta.Inverted(component)) : RangeState(range, component);
+                int state = descending ? -RangeStateInverted(range, component) : RangeState(range, component);
                 if (state > 0) break;
                 if (state < 0) continue;
             }
@@ -308,7 +308,7 @@ internal static class QueryPlanner
             if (range is not null)
             {
                 var component = key.Slice(plan.Prefix.Length, length);
-                int state = descending ? -RangeState(range, IndexMeta.Inverted(component)) : RangeState(range, component);
+                int state = descending ? -RangeStateInverted(range, component) : RangeState(range, component);
                 if (state < 0) break;
                 if (state > 0) continue;
             }
@@ -495,5 +495,34 @@ internal static class QueryPlanner
             if (c > 0 || (c == 0 && !plan.UpperInclusive)) return 1;
         }
         return 0;
+    }
+
+    /// <summary>Applies normal range bounds directly to bytes stored in inverted (descending) order.</summary>
+    private static int RangeStateInverted(QueryPlan plan, ReadOnlySpan<byte> value)
+    {
+        byte tag = (byte)~value[0];
+        if (tag != plan.TypeTag) return tag < plan.TypeTag ? -1 : 1;
+        if (plan.Lower is not null)
+        {
+            int c = CompareInvertedToOriginal(value, plan.Lower);
+            if (c < 0 || (c == 0 && !plan.LowerInclusive)) return -1;
+        }
+        if (plan.Upper is not null)
+        {
+            int c = CompareInvertedToOriginal(value, plan.Upper);
+            if (c > 0 || (c == 0 && !plan.UpperInclusive)) return 1;
+        }
+        return 0;
+    }
+
+    private static int CompareInvertedToOriginal(ReadOnlySpan<byte> inverted, ReadOnlySpan<byte> original)
+    {
+        int length = Math.Min(inverted.Length, original.Length);
+        for (int i = 0; i < length; i++)
+        {
+            int c = (byte)~inverted[i] - original[i];
+            if (c != 0) return c;
+        }
+        return inverted.Length.CompareTo(original.Length);
     }
 }

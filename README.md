@@ -538,6 +538,22 @@ hardware. A prior high-load ascending run even reversed which engine was faster 
 The first ascending run allocated about 2.1 KB per FolioDb insert and 2.5 KB per update, versus 0.8 KB and 0.4 KB
 for the prepared SQLite statements.
 
+### Descending compound-index range scans
+
+`DescendingIndexScanBenchmarks` counts 6,000 matches among 100,000 documents using `{group: 1, value: ±1}` and
+the filter `group = 7, 20 <= value < 80`. BenchmarkDotNet, 10 measurement iterations and 4 warmups, Linux x64,
+.NET 10 (2026-10-06):
+
+| Range component | Before direct inverted-key processing | After | Allocated after |
+|---|---:|---:|---:|
+| Ascending | 203.4 µs | 217.2 µs | 3.53 KB |
+| Descending | 786.2 µs | **196.3 µs** | **3.58 KB** |
+
+The initial descending scan allocated 284.88 KB per operation. Processing inverted component lengths and range
+bounds directly removes that per-entry temporary work; the measured descending scan is about 4× faster and allocates
+about 99% less. The ascending measurement is effectively a control and varied on the shared host, so the small
+difference there is not evidence of a regression.
+
 To read every field from `Visit`, enumerate the view once (`foreach (var f in view)`): each `TryGetValue` walks the
 fields from the start, so five lookups by name cost about 4-5× one pass.
 

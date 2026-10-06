@@ -111,16 +111,7 @@ internal sealed class IndexMeta
     /// <summary>Length of the component at the start of <paramref name="key"/>.</summary>
     public static int ComponentLength(ReadOnlySpan<byte> key, bool descending)
     {
-        if (!descending) return KeyEncoder.EncodedLength(key);
-        // Lengths are computed on the original bytes; keys are small (bounded by the page size).
-        byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(key.Length);
-        try
-        {
-            var span = rented.AsSpan(0, key.Length);
-            Invert(key, span);
-            return KeyEncoder.EncodedLength(span);
-        }
-        finally { System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
+        return descending ? KeyEncoder.EncodedLengthInverted(key) : KeyEncoder.EncodedLength(key);
     }
 
     public static void Invert(ReadOnlySpan<byte> source, Span<byte> destination)
