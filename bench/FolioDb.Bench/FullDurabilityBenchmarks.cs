@@ -11,6 +11,10 @@ public class FullDurabilityBenchmarks
     private const int N = 50000;
     private string _emptyFolio = "", _populatedFolio = "", _emptySqlite = "", _populatedSqlite = "";
     private string _folioPath = "", _sqlitePath = "";
+    private int[] _ids = [];
+
+    [Params("Ascending", "Descending", "Shuffled")]
+    public string Order { get; set; } = "";
 
     private static Document Doc(int i) => new()
     {
@@ -31,6 +35,18 @@ public class FullDurabilityBenchmarks
     [GlobalSetup]
     public void Setup()
     {
+        _ids = Enumerable.Range(0, N).ToArray();
+        if (Order == "Descending") Array.Reverse(_ids);
+        else if (Order == "Shuffled")
+        {
+            var random = new Random(0xF0110);
+            for (int i = _ids.Length - 1; i > 0; i--)
+            {
+                int j = random.Next(i + 1);
+                (_ids[i], _ids[j]) = (_ids[j], _ids[i]);
+            }
+        }
+
         _emptyFolio = Workload.TempFile(".folio");
         _populatedFolio = Workload.TempFile(".folio");
         _emptySqlite = Workload.TempFile(".sqlite");
@@ -123,7 +139,7 @@ public class FullDurabilityBenchmarks
         using var db = FolioDatabase.Open(_folioPath, new FolioOptions { Synchronous = SynchronousMode.Full });
         using var tx = db.BeginTransaction();
         var collection = tx.GetCollection("docs");
-        for (int i = 0; i < N; i++) collection.Insert(Doc(i));
+        foreach (int i in _ids) collection.Insert(Doc(i));
         tx.Commit();
     }
 
@@ -142,7 +158,7 @@ public class FullDurabilityBenchmarks
         var city = command.Parameters.Add("$city", SqliteType.Text);
         var age = command.Parameters.Add("$age", SqliteType.Integer);
         var score = command.Parameters.Add("$score", SqliteType.Real);
-        for (int i = 0; i < N; i++)
+        foreach (int i in _ids)
         {
             id.Value = i;
             name.Value = "user " + i;
@@ -160,7 +176,7 @@ public class FullDurabilityBenchmarks
         using var db = FolioDatabase.Open(_folioPath, new FolioOptions { Synchronous = SynchronousMode.Full });
         using var tx = db.BeginTransaction();
         var collection = tx.GetCollection("docs");
-        for (int i = 0; i < N; i++)
+        foreach (int i in _ids)
             collection.UpdateOne(new Document { ["_id"] = i }, new Document { ["$set"] = new Document { ["score"] = i * 0.25 } });
         tx.Commit();
     }
@@ -177,7 +193,7 @@ public class FullDurabilityBenchmarks
         command.CommandText = "UPDATE docs SET score=$score WHERE id=$id";
         var id = command.Parameters.Add("$id", SqliteType.Integer);
         var score = command.Parameters.Add("$score", SqliteType.Real);
-        for (int i = 0; i < N; i++)
+        foreach (int i in _ids)
         {
             id.Value = i;
             score.Value = i * 0.25;

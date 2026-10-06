@@ -508,24 +508,35 @@ table (`id, name, city, age, score`, index on `city`), with no array field, so b
 
 `FullDurabilityBenchmarks` writes 50,000 matching flat records (`id, name, city, age, score`, secondary index on
 `city`) in one transaction, then measures 50,000 updates to the unindexed `score` field in one transaction.
-Both connections use WAL + `synchronous=FULL`; each batch pays for one durable commit. Database opening is timed,
-while creating and copying the clean input files is outside the measurement. BenchmarkDotNet, 8 measurement
-iterations, Linux x64, .NET 10 (2026-10-06):
+Both connections use WAL + `synchronous=FULL`; each batch pays for one durable commit. `Order` is ascending,
+descending, or deterministic shuffled IDs (the same sequence on both engines). Database opening is timed, while
+creating and copying the clean input files is outside the measurement. BenchmarkDotNet, 8 measurement iterations,
+Linux x64, .NET 10 (2026-10-06):
 
 ```sh
 dotnet run -c Release --project bench/FolioDb.Bench -- --filter '*FullDurabilityBenchmarks*' --iterationCount 8 --warmupCount 3
 ```
 
-| Operation | FolioDb | SQLite | Batch time: FolioDb / SQLite |
-|---|---:|---:|---:|
-| Insert (first run) | 2.89 µs/doc | 3.20 µs/doc | 144 / 160 ms |
-| Update unindexed field (first run) | 2.68 µs/doc | 1.97 µs/doc | 134 / 99 ms |
+The earlier insert/update measurements used ascending IDs. Two additional order runs produced these per-operation
+means; error bars are wide on this shared host, especially for FolioDb descending/shuffled inserts:
 
-The first run's insert confidence intervals overlap. A repeat while host load was high measured 9.08 vs 7.25 µs/doc
-and reversed the insert result; no stable insert winner is established. Both update runs favored SQLite (nominally
-1.36–1.44×), though their intervals overlapped under high load. Treat these as host-specific measurements, not a
-durability ranking across filesystems or hardware. The first run allocated about 2.1 KB per FolioDb insert and
-2.5 KB per update, versus 0.8 KB and 0.4 KB for the prepared SQLite statements.
+| Operation and ID order | FolioDb | SQLite |
+|---|---:|---:|
+| Insert ascending | 2.94–3.26 µs | 3.17–3.73 µs |
+| Insert descending | 3.45–4.63 µs | 4.25 µs |
+| Insert shuffled | 4.03–5.17 µs | 4.69–4.70 µs |
+| Update ascending | 3.02–3.07 µs | 1.89–1.93 µs |
+| Update descending | 2.99–3.73 µs | 1.96–2.09 µs |
+| Update shuffled | 3.25–3.63 µs | 2.44–3.30 µs |
+
+FolioDb's ascending insert path benefits from a right-edge B+Tree append optimization that leaves full pages packed;
+descending and shuffled keys require ordinary splits. The measurements suggest non-ascending inserts cost more on
+both engines, but the host noise and overlapping intervals do not establish which engine is more order-sensitive.
+The shuffled-update measurements also vary substantially, particularly for SQLite, so update-order effects remain
+inconclusive. This is a storage-order sensitivity comparison, not a general durability ranking across filesystems or
+hardware. A prior high-load ascending run even reversed which engine was faster for inserts, underlining the noise.
+The first ascending run allocated about 2.1 KB per FolioDb insert and 2.5 KB per update, versus 0.8 KB and 0.4 KB
+for the prepared SQLite statements.
 
 To read every field from `Visit`, enumerate the view once (`foreach (var f in view)`): each `TryGetValue` walks the
 fields from the start, so five lookups by name cost about 4-5× one pass.
